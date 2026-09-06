@@ -13,12 +13,19 @@ strings, one request -> one reply.
     "<transport_name>"                    -> "ACCEPTED" | "ERROR: <reason>"
     "motor_tweak forward|reverse <step>"  -> "ACCEPTED" | "ERROR: <reason>"
     "pump <op>"                           -> "ACCEPTED" | "ERROR: <reason>"
-    "make_sample <slot>"                  -> "ACCEPTED" | "ERROR: <reason>"
+    "make_sample <slot> [sample id]"      -> "ACCEPTED" | "ERROR: <reason>"
     "unload_sample"                       -> "ACCEPTED" | "ERROR: <reason>"
     "set_flowcell <1|2>"                  -> "OK" | "ERROR: <reason>"
     "get_state"                           -> "<JSON snapshot>"
     "set_location <what> <value>"         -> "OK" | "ERROR: <reason>"
+    "reset_carousel"                      -> "OK" | "ERROR: <reason>"
     "teach_carousel_slot <n>"             -> "OK" | "ERROR: <reason>"
+    "set_sample_id <slot> <sample id>"    -> "OK" | "ERROR: <reason>"
+    "get_sample_id <slot>"                -> "<sample id>" | "unknown" | "ERROR: <reason>"
+    "clear_sample_id <slot>"              -> "OK" | "ERROR: <reason>"
+
+A sample ID is the rest of the line, so it may contain spaces; runs of
+whitespace in it collapse to one. Every other argument is a single token.
 """
 
 from . import state as _state
@@ -115,13 +122,23 @@ UNLOAD_SAMPLE = "unload_sample"
 SET_FLOWCELL = "set_flowcell"
 GET_STATE = "get_state"
 SET_LOCATION = "set_location"
+
+# -- carousel slot inventory -------------------------------------------------
+# The carousel is a consumable: a fixed number of slots, each spent once a
+# sample has been mixed in it, and the whole thing swapped out when full. Its
+# geometry (size, step) is configuration, not a command -- see config.py.
 TEACH_CAROUSEL_SLOT = "teach_carousel_slot"
+RESET_CAROUSEL = "reset_carousel"
+SET_SAMPLE_ID = "set_sample_id"
+GET_SAMPLE_ID = "get_sample_id"
+CLEAR_SAMPLE_ID = "clear_sample_id"
 
 FLOWCELL_IDS = _state.FLOWCELL_IDS               # (1, 2)
 LOCATION_KEYS = _state.LOCATION_KEYS             # mixer_head, flowcell_1, flowcell_2
 MIXER_LOCATIONS = _state.MIXER_LOCATIONS
 FC_LOCATIONS = _state.FC_LOCATIONS
 UNKNOWN = _state.UNKNOWN
+MAX_SAMPLE_ID_LEN = _state.MAX_SAMPLE_ID_LEN
 WHAT_MIXER_HEAD = _state.WHAT_MIXER_HEAD
 WHAT_FLOWCELL_1 = _state.WHAT_FLOWCELL_1
 WHAT_FLOWCELL_2 = _state.WHAT_FLOWCELL_2
@@ -170,8 +187,14 @@ def pump_command(op):
     return "%s %s" % (PUMP, op)
 
 
-def make_sample_command(slot):
-    """Build the wire command to run the full make-a-sample sequence."""
+def make_sample_command(slot, sample_id=None):
+    """Build the wire command to run the full make-a-sample sequence.
+
+    ``sample_id`` tags the slot the sample is mixed in; when it is omitted (or
+    blank) the server assigns a timestamp ID, so a used slot is never
+    anonymous."""
+    if sample_id and str(sample_id).strip():
+        return "%s %s %s" % (MAKE_SAMPLE, slot, str(sample_id).strip())
     return "%s %s" % (MAKE_SAMPLE, slot)
 
 
@@ -198,3 +221,24 @@ def set_location_command(what, location):
 def teach_carousel_slot_command(slot):
     """Build the wire command to record the current motor position as ``slot``."""
     return "%s %s" % (TEACH_CAROUSEL_SLOT, slot)
+
+
+def reset_carousel_command():
+    """Build the wire command to replace the carousel: drop the taught
+    reference position and every sample ID."""
+    return RESET_CAROUSEL
+
+
+def set_sample_id_command(slot, sample_id):
+    """Build the wire command to tag ``slot`` with ``sample_id``, marking it used."""
+    return "%s %s %s" % (SET_SAMPLE_ID, slot, str(sample_id).strip())
+
+
+def get_sample_id_command(slot):
+    """Build the wire command to read back ``slot``'s sample ID."""
+    return "%s %s" % (GET_SAMPLE_ID, slot)
+
+
+def clear_sample_id_command(slot):
+    """Build the wire command to drop ``slot``'s sample ID, marking it unused."""
+    return "%s %s" % (CLEAR_SAMPLE_ID, slot)

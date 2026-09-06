@@ -137,10 +137,14 @@ class PALmixerServer:
         if name == cmd.TEACH_CAROUSEL_SLOT:
             if len(args) != 1:
                 return "ERROR: usage: %s <slot>" % cmd.TEACH_CAROUSEL_SLOT
+            # Both checked before the motor read, so a bad slot or an
+            # unconfigured step says so instead of reporting whatever the
+            # hardware read had to say.
             try:
-                slot = int(args[0])
-            except ValueError:
-                return "ERROR: slot must be an integer, got %r" % args[0]
+                slot = state.validate_slot(args[0])
+                state.require_carousel_step()
+            except ValueError as e:
+                return "ERROR: %s" % e
             if self.simulate:
                 position = float(slot)  # arbitrary, distinct per slot; no real motor to read
             else:
@@ -149,6 +153,44 @@ class PALmixerServer:
                 except Exception as e:
                     return "ERROR: could not read motor position: %s" % e
             state.teach_carousel_slot(slot, position)
+            return "OK"
+
+        if name == cmd.RESET_CAROUSEL:
+            if args:
+                return "ERROR: %s takes no arguments" % cmd.RESET_CAROUSEL
+            state.reset_carousel()
+            return "OK"
+
+        # The sample ID is the rest of the line, so it may contain spaces.
+        # Rejoining the split args normalises internal whitespace, which is
+        # what state.set_sample_id would do anyway.
+        if name == cmd.SET_SAMPLE_ID:
+            if len(args) < 2:
+                return "ERROR: usage: %s <slot> <sample id>" % cmd.SET_SAMPLE_ID
+            try:
+                state.set_sample_id(args[0], " ".join(args[1:]))
+            except ValueError as e:
+                return "ERROR: %s" % e
+            return "OK"
+
+        if name == cmd.GET_SAMPLE_ID:
+            if len(args) != 1:
+                return "ERROR: usage: %s <slot>" % cmd.GET_SAMPLE_ID
+            try:
+                sample_id = state.get_sample_id(args[0])
+            except ValueError as e:
+                return "ERROR: %s" % e
+            # An unused slot is a fact, not an error -- report it with the
+            # vocabulary's first-class "unknown", as the locations do.
+            return sample_id if sample_id else state.UNKNOWN
+
+        if name == cmd.CLEAR_SAMPLE_ID:
+            if len(args) != 1:
+                return "ERROR: usage: %s <slot>" % cmd.CLEAR_SAMPLE_ID
+            try:
+                state.clear_sample_id(args[0])
+            except ValueError as e:
+                return "ERROR: %s" % e
             return "OK"
 
         return None
@@ -246,19 +288,23 @@ class PALmixerServer:
             return (lambda: self._run_pump(op)), label
 
         if name == cmd.MAKE_SAMPLE:
-            if len(args) != 1:
-                raise ValueError("usage: %s <slot>" % cmd.MAKE_SAMPLE)
+            if not args:
+                raise ValueError("usage: %s <slot> [sample id]" % cmd.MAKE_SAMPLE)
             try:
                 slot = int(args[0])
             except ValueError:
                 raise ValueError("slot must be an integer, got %r" % args[0])
+            # Assigned here rather than deep in the workflow so the ID the slot
+            # will be tagged with appears in the ACCEPTED log line and in every
+            # MQTT motion payload for the run.
+            sample_id = " ".join(args[1:]) if len(args) > 1 else state.new_sample_id()
             self._require_positions(self.workflows.stations_for_make_sample())
             try:
-                self.workflows._check_make_sample(slot)
+                self.workflows._check_make_sample(slot, sample_id)
             except WorkflowError as e:
                 raise ValueError(str(e))
-            label = "%s %s" % (cmd.MAKE_SAMPLE, slot)
-            return (lambda: self.workflows.make_sample(slot)), label
+            label = "%s %s (%s)" % (cmd.MAKE_SAMPLE, slot, sample_id)
+            return (lambda: self.workflows.make_sample(slot, sample_id)), label
 
         if name == cmd.UNLOAD_SAMPLE:
             if args:

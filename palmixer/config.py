@@ -11,12 +11,21 @@ Sections:
     mqtt  {host, port, prefix, beamline}        -- telemetry (pub/sub)
     robot {name, ip, ur12idb_path}              -- UR robot + camera
     motor {pv}                                  -- EPICS motor PV base
+    carousel {size, step}                       -- carousel geometry
 
 Env overrides (take precedence over the JSON):
     PALMIXER_ZMQ_HOST   PALMIXER_ZMQ_PORT
     PALMIXER_MQTT_HOST  PALMIXER_MQTT_PORT
     PALMIXER_ROBOT_IP   PALMIXER_UR12IDB_PATH
     PALMIXER_MOTOR_PV
+    PALMIXER_CAROUSEL_SIZE  PALMIXER_CAROUSEL_STEP
+
+The carousel section describes the *hardware*: how many slots the carousel has
+and how far the motor moves between two adjacent ones. Both defaults here are
+0, meaning "not configured" -- a wrong step would drive the carousel to the
+wrong slot, so an absent one refuses the move instead of guessing. What is in
+each slot right now (the taught reference position and the sample IDs) is
+live state and lives in palmixer/palmixer_state.ini, not here.
 """
 
 import json
@@ -36,6 +45,7 @@ _DEFAULTS = {
         "ur12idb_path": "/home/beams15/S12STAFF/python_codes/UR_12idb",
     },
     "motor": {"pv": "12idb:m6"},
+    "carousel": {"size": 0, "step": 0.0},
 }
 
 
@@ -75,6 +85,10 @@ def _merged():
         cfg["robot"]["ur12idb_path"] = env("PALMIXER_UR12IDB_PATH")
     if env("PALMIXER_MOTOR_PV"):
         cfg["motor"]["pv"] = env("PALMIXER_MOTOR_PV")
+    if env("PALMIXER_CAROUSEL_SIZE"):
+        cfg["carousel"]["size"] = env("PALMIXER_CAROUSEL_SIZE")
+    if env("PALMIXER_CAROUSEL_STEP"):
+        cfg["carousel"]["step"] = env("PALMIXER_CAROUSEL_STEP")
     return cfg
 
 

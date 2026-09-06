@@ -36,6 +36,7 @@ Edit `json/palmixer_config.json`, or override with environment variables:
 | `PALMIXER_ROBOT_IP` | UR3 robot / camera IP or hostname |
 | `PALMIXER_UR12IDB_PATH` | Path to the `UR_12idb` checkout (importable `robot12idb`) |
 | `PALMIXER_MOTOR_PV` | EPICS motor PV base (default `12idb:m6`) |
+| `PALMIXER_CAROUSEL_SIZE` / `PALMIXER_CAROUSEL_STEP` | Carousel geometry: slot count, and motor travel between adjacent slots (see below) |
 
 ## Running
 
@@ -90,12 +91,20 @@ that call. See the docstring in `_winenv.py`.
 | `mixer2cleaningstation` etc. (8 names) | worker | Run the matching `PAL12idb` transport function |
 | `motor_tweak forward\|reverse <step>` | worker | Tweak `12idb:m6` by `step` |
 | `pump mix\|clean_mixer\|draw_to_flowcell\|aspirate_from_flowcell\|wash_flowcell` | worker | Run a pump operation (placeholder) |
-| `make_sample <slot>` | worker | Full mix-and-load sequence (see below) |
+| `make_sample <slot> [sample id]` | worker | Full mix-and-load sequence (see below), tagging `<slot>` with the sample ID -- a timestamp ID is assigned if none is given |
 | `unload_sample` | worker | Full return-and-wash sequence (see below) |
 | `set_flowcell <1\|2>` | fast | Change which flowcell the transport functions and workflows act on -- a "Flowcell in Use" selector sending this lives on all three GUI tabs, kept in sync with each other from `get_state`/the tracking topic |
 | `get_state` | fast | JSON tracking snapshot (see below) |
 | `set_location <mixer_head\|flowcell_1\|flowcell_2> <value>` | fast | Reconcile a tracked location after manual intervention |
-| `teach_carousel_slot <n>` | fast | Record the motor's current `.RBV` as carousel slot `n` |
+| `teach_carousel_slot <n>` | fast | Record the motor's current `.RBV` as carousel slot `n`, locating **every** slot (see below) |
+| `set_sample_id <slot> <sample id>` | fast | Tag `slot` with a sample ID, marking it used. Overwrites any existing ID |
+| `get_sample_id <slot>` | fast | That slot's sample ID, or `unknown` if it is unused |
+| `clear_sample_id <slot>` | fast | Drop the slot's sample ID, marking it unused again |
+| `reset_carousel` | fast | Replace the carousel: clear every sample ID **and** the taught reference position |
+
+Every argument is a single whitespace-delimited token except a sample ID,
+which is the rest of the line and may contain spaces (runs of whitespace in it
+collapse to one).
 
 "worker" commands run on the server's single background worker thread and
 reply `ACCEPTED` / `ERROR: <reason>` immediately, with the actual
@@ -193,7 +202,9 @@ moving anything:
 |---|---|
 | Mixer head location | `mixer_station`, `mixer_cleaning_station`, or `unknown` |
 | Flowcell 1 / flowcell 2 location (independent) | `sample_table`, `cleaning_station`, `gripper` (transient, mid-workflow), or `unknown` |
-| Carousel position | a slot number, taught to an absolute motor position |
+| Carousel position | the slot last moved to |
+| Carousel reference | one taught `(slot, motor position)`, from which every slot's position is derived |
+| Carousel sample IDs | the sample ID held in each used slot |
 | Flowcell in use | `1` or `2` |
 
 `unknown` is a first-class state, not an error -- a fresh install, or any
@@ -209,20 +220,77 @@ the Experiment tab) or as part of a workflow.
 ```json
 {"mixer_head": "mixer_cleaning_station", "flowcell_1": "cleaning_station",
  "flowcell_2": "unknown", "flowcell_in_use": 1, "carousel_slot": 3,
- "carousel_slots": {"1": 0.0, "2": 45.0, "3": 90.0}}
+ "carousel_slots": {"1": 0.0, "2": 30.0, "3": 60.0}, "carousel_size": 3,
+ "carousel_step": 30.0, "carousel_reference": [1, 0.0],
+ "carousel_samples": {"1": "BSA 5 mg/ml", "3": "S20260906-142530"},
+ "carousel_full": false}
 ```
+
+`carousel_size` and `carousel_step` are echoed from the config so a client does
+not need to read it. `carousel_slots` is **derived** from `carousel_reference`
+and the step, so it is either empty (nothing taught) or complete. It and
+`carousel_samples` are keyed by slot number; JSON makes those keys strings.
 
 The same snapshot is published, retained, on MQTT topic
 `aps12/<beamline>/palmixer/tracking` on every change, so a GUI connecting
 mid-run sees the current picture immediately.
 
-### Teaching carousel slots
+### The carousel: slots, sample IDs, and replacing it
 
-There is no slot-to-position table shipped -- teach it once per install:
-drive the carousel motor to a slot with the Experiment tab's forward/reverse
-tweak buttons, then use the Automation tab's "Teach current position as this
-slot" button (`teach_carousel_slot <n>`) to record the current position as
-slot `n`. `make_sample <slot>` then drives there with an absolute move.
+The carousel is a consumable. It holds a fixed number of slots, each slot is
+spent once a sample has been mixed in it, and when they are all used the whole
+carousel is swapped for a fresh one. The Automation tab's Carousel panel is
+that inventory: the slot count, a table of what each slot holds, and the
+controls below.
+
+**Geometry is configuration.** How many slots the carousel has and how far the
+motor travels between two adjacent ones are properties of the hardware, so they
+live in `json/palmixer_config.json`, not in a command:
+
+```json
+"carousel": { "size": 12, "step": 30.0 }
+```
+
+Both default to `0`, meaning "not configured" -- a wrong `step` would drive the
+carousel to the wrong slot, so an absent one refuses the move rather than
+guessing. `step` is in the motor's engineering units and may be negative, for a
+carousel whose slot numbering runs against the motor's positive direction.
+`PALMIXER_CAROUSEL_SIZE` / `PALMIXER_CAROUSEL_STEP` override them. Slot numbers
+are bounded to `1..size`.
+
+**Teaching is one slot, not all of them.** Because the slots are evenly spaced,
+only one has to be located: drive the motor to any slot with the Experiment
+tab's forward/reverse tweak buttons, then use "Teach Position"
+(`teach_carousel_slot <n>`) to record it. That one reference plus `step` gives
+every other slot -- `slot n = reference + (n - reference_slot) * step` -- and
+`make_sample <slot>` drives there with an absolute move. Teaching a second slot
+does not extend a table; it *replaces* the reference, re-locating the whole
+carousel. The Automation tab's slot table shows the resulting positions, which
+is the quickest way to catch a wrong `step`.
+
+A reference for a slot outside the configured size (a differently-sized
+carousel was configured since) reads as untaught rather than being trusted.
+
+**Sample IDs.** A slot is "used" exactly when it holds a sample ID -- the two
+are the same fact, so they cannot disagree about whether a slot is spent.
+`make_sample <slot> [sample id]` tags the slot the moment its `mix` step
+succeeds, because mixing is what consumes the vial: a later step failing does
+not un-consume it, and the record does not depend on the run finishing. Omit
+the ID and a timestamp one (`S20260906-142530`) is assigned, so a used slot is
+never anonymous. `set_sample_id` / `get_sample_id` / `clear_sample_id` read and
+write the same tags outside a run. Mixing into an already-used slot is allowed
+and overwrites its ID.
+
+**Replacing it.** `carousel_full` goes true once every slot is used. It is
+advisory, not a block -- re-mixing a used slot stays legal -- but it is
+surfaced in the tracking snapshot, in red on the Automation tab, and in the
+`make_sample` completion detail. Swap in a fresh carousel, then
+`reset_carousel` (the tab's **Replace Carousel (Reset)** button, behind a
+confirmation). That clears the sample IDs **and the taught reference**, since a
+replacement carousel is not guaranteed to seat where the old one did -- so one
+slot must be taught again before the next sample. The geometry is configuration
+and is untouched; a physically different carousel means editing
+`json/palmixer_config.json` and restarting the server.
 
 ## Automation workflows
 
@@ -234,13 +302,14 @@ the position-not-configured guard described above (which checks whether the
 stations involved have been taught at all), so an unconfigured install is
 caught before an out-of-place flowcell is.
 
-**`make_sample <slot>`**: mixer2cleaningstation (if needed) -> rotate
-carousel to `<slot>` -> mixer2mixingstation -> pump mix ->
-mixer2cleaningstation -> pump clean_mixer (fired on a background thread, not
-awaited) -> ready_flowcell_to_draw -> pump draw_to_flowcell (blocks until
-clean_mixer finishes, since pump ops serialize on one lock) ->
-load_sample_to_beam. Requires the flowcell in use to be at its cleaning
-station and the target slot to be taught.
+**`make_sample <slot> [sample id]`**: mixer2cleaningstation (if needed) ->
+rotate carousel to `<slot>` -> mixer2mixingstation -> pump mix (**slot tagged
+with the sample ID here**) -> mixer2cleaningstation -> pump clean_mixer (fired
+on a background thread, not awaited) -> ready_flowcell_to_draw -> pump
+draw_to_flowcell (blocks until clean_mixer finishes, since pump ops serialize
+on one lock) -> load_sample_to_beam. Requires the flowcell in use to be at its
+cleaning station, the slot to be within the configured carousel size, and the
+carousel to have been located (one taught reference).
 
 **`unload_sample`**: mixer2cleaningstation (if needed) -> return_sample ->
 pump aspirate_from_flowcell -> wash_flowcell_after_return -> pump

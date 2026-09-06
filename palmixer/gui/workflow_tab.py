@@ -9,8 +9,9 @@ tracking MQTT topic) via update_state().
 """
 
 from PyQt5.QtWidgets import (
-    QComboBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QAbstractItemView, QComboBox, QGridLayout, QGroupBox, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .. import commands as cmd
@@ -23,6 +24,9 @@ class WorkflowTab(QWidget):
         self._send_command = send_command
         self._all_buttons = []
         self._tracking_labels = {}
+        # Last snapshot's slot -> sample ID table, so switching slots can show
+        # that slot's ID without a round trip to the server.
+        self._samples = {}
 
         self.flowcell = FlowcellSelector(send_command)
 
@@ -36,24 +40,98 @@ class WorkflowTab(QWidget):
 
     # -- carousel -----------------------------------------------------------
     def _build_carousel_group(self):
+        """The carousel's slot inventory: how big it is, what each slot holds,
+        and the controls for teaching, tagging, and replacing it."""
         box = QGroupBox("Carousel")
-        layout = QHBoxLayout()
-        layout.addWidget(QLabel("Slot:"))
+        outer = QVBoxLayout()
+
+        # Row 1: the geometry (read-only -- it is configuration, see config.py),
+        # how much of the carousel is spent, and replacing it wholesale.
+        size_row = QHBoxLayout()
+        self._geometry_label = QLabel("")
+        size_row.addWidget(self._geometry_label)
+        self._used_label = QLabel("")
+        size_row.addWidget(self._used_label)
+        size_row.addStretch(1)
+
+        reset_btn = QPushButton("Replace Carousel (Reset)")
+        reset_btn.clicked.connect(self._on_reset_carousel)
+        size_row.addWidget(reset_btn)
+        self._all_buttons.append(reset_btn)
+        outer.addLayout(size_row)
+
+        # Row 2: the per-slot controls.
+        slot_row = QHBoxLayout()
+        slot_row.addWidget(QLabel("Slot:"))
         self.slot_box = QSpinBox()
-        self.slot_box.setRange(1, 99)
-        layout.addWidget(self.slot_box)
+        self.slot_box.setRange(1, 1)
+        self.slot_box.valueChanged.connect(self._on_slot_changed)
+        slot_row.addWidget(self.slot_box)
 
-        teach_btn = QPushButton("Teach Current Position as This Slot")
-        teach_btn.clicked.connect(self._on_teach_slot)
-        layout.addWidget(teach_btn)
-        self._all_buttons.append(teach_btn)
+        slot_row.addWidget(QLabel("Sample ID:"))
+        self.sample_id_edit = QLineEdit()
+        self.sample_id_edit.setMaxLength(cmd.MAX_SAMPLE_ID_LEN)
+        self.sample_id_edit.setPlaceholderText("(blank -> timestamp ID assigned on mix)")
+        slot_row.addWidget(self.sample_id_edit, 1)
 
-        layout.addStretch(1)
-        box.setLayout(layout)
+        for text, handler in (("Set ID", self._on_set_sample_id),
+                              ("Clear ID", self._on_clear_sample_id),
+                              ("Teach Position", self._on_teach_slot)):
+            btn = QPushButton(text)
+            btn.clicked.connect(handler)
+            slot_row.addWidget(btn)
+            self._all_buttons.append(btn)
+        outer.addLayout(slot_row)
+
+        # Row 3: what is actually in the carousel right now.
+        self.slot_table = QTableWidget(0, 3)
+        self.slot_table.setHorizontalHeaderLabels(["Slot", "Position", "Sample ID"])
+        self.slot_table.verticalHeader().setVisible(False)
+        self.slot_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.slot_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.slot_table.setMaximumHeight(180)
+        header = self.slot_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        outer.addWidget(self.slot_table)
+
+        box.setLayout(outer)
         return box
 
     def _on_teach_slot(self):
         self._send_command(cmd.teach_carousel_slot_command(self.slot_box.value()))
+
+    def _on_set_sample_id(self):
+        sample_id = self.sample_id_edit.text().strip()
+        if not sample_id:
+            QMessageBox.warning(self, "No Sample ID",
+                                "Type a sample ID to tag slot %d with." % self.slot_box.value())
+            return
+        self._send_command(cmd.set_sample_id_command(self.slot_box.value(), sample_id))
+
+    def _on_clear_sample_id(self):
+        self._send_command(cmd.clear_sample_id_command(self.slot_box.value()))
+
+    def _on_slot_changed(self, slot):
+        """Show the selected slot's sample ID. Deliberately only on an explicit
+        slot change -- doing it from update_state() would wipe a half-typed ID
+        every time the 3 s get_state poll came back."""
+        self.sample_id_edit.setText(self._samples.get(slot, ""))
+
+    def _on_reset_carousel(self):
+        # Destructive and not obviously so: it discards the taught positions
+        # too, so say that before doing it rather than after.
+        used = len(self._samples)
+        if QMessageBox.question(
+                self, "Replace Carousel",
+                "Reset the carousel inventory?\n\n"
+                "This clears all %d sample ID(s) AND the taught reference position, "
+                "so one slot must be taught again before the next sample.\n\n"
+                "Do this after physically swapping in a fresh carousel." % used,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._send_command(cmd.reset_carousel_command())
 
     # -- workflows ------------------------------------------------------------
     def _build_workflow_group(self):
@@ -74,7 +152,10 @@ class WorkflowTab(QWidget):
         return box
 
     def _on_make_sample(self):
-        self._send_command(cmd.make_sample_command(self.slot_box.value()))
+        # A blank ID is fine: the server assigns a timestamp one, so the slot
+        # this consumes is recorded either way.
+        self._send_command(cmd.make_sample_command(self.slot_box.value(),
+                                                   self.sample_id_edit.text().strip()))
 
     # -- tracking panel ---------------------------------------------------
     def _build_tracking_group(self):
@@ -118,6 +199,18 @@ class WorkflowTab(QWidget):
         self._send_command(cmd.set_location_command(what, value))
 
     # -- external updates (from get_state polling / tracking MQTT) ----------
+    @staticmethod
+    def _by_slot(table):
+        """Re-key a snapshot slot table to ints. The server keys these by int,
+        but the snapshot reaches us through JSON, which only has string keys."""
+        out = {}
+        for key, value in (table or {}).items():
+            try:
+                out[int(key)] = value
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def update_state(self, snapshot):
         """Refresh the tracking panel from a state.snapshot()-shaped dict."""
         for what, label in self._tracking_labels.items():
@@ -126,11 +219,68 @@ class WorkflowTab(QWidget):
             label.setStyleSheet("color: red; font-weight: bold;" if value == cmd.UNKNOWN else "")
 
         self._carousel_label.setText(str(snapshot.get("carousel_slot", cmd.UNKNOWN)))
+        self._update_carousel(snapshot)
 
         fc_in_use = snapshot.get("flowcell_in_use")
         if fc_in_use is not None:
             self._flowcell_in_use_label.setText(str(fc_in_use))
             self.flowcell.set_flowcell_in_use(fc_in_use)
+
+    def _update_carousel(self, snapshot):
+        self._samples = self._by_slot(snapshot.get("carousel_samples"))
+        positions = self._by_slot(snapshot.get("carousel_slots"))
+        size = snapshot.get("carousel_size", cmd.UNKNOWN)
+        step = snapshot.get("carousel_step", cmd.UNKNOWN)
+        known = isinstance(size, int) and size >= 1
+
+        # Nothing slot-shaped means anything until the carousel's geometry is
+        # configured, so the controls stay off rather than offering a range the
+        # server will reject.
+        for widget in (self.slot_box, self.sample_id_edit):
+            widget.setEnabled(known)
+
+        if not known:
+            self._geometry_label.setText(
+                "carousel.size not configured (json/palmixer_config.json)")
+            self._geometry_label.setStyleSheet("color: red; font-weight: bold;")
+            self._used_label.setText("")
+            self.slot_table.setRowCount(0)
+            return
+
+        step_known = isinstance(step, (int, float)) and not isinstance(step, bool)
+        self._geometry_label.setText(
+            "%d slots, step %s --" % (size, ("%g" % step) if step_known
+                                      else "NOT CONFIGURED"))
+        self._geometry_label.setStyleSheet(
+            "" if step_known else "color: red; font-weight: bold;")
+
+        if self.slot_box.maximum() != size:
+            # Clamping the value would fire valueChanged and overwrite a
+            # half-typed sample ID, so suppress it while adjusting the range.
+            blocked = self.slot_box.blockSignals(True)
+            self.slot_box.setRange(1, size)
+            self.slot_box.blockSignals(blocked)
+
+        used = len(self._samples)
+        full = bool(snapshot.get("carousel_full"))
+        self._used_label.setText("%d/%d slots used%s" % (used, size,
+                                                         " -- FULL, replace it" if full else ""))
+        self._used_label.setStyleSheet("color: red; font-weight: bold;" if full else "")
+
+        self.slot_table.setRowCount(size)
+        for row in range(size):
+            slot = row + 1
+            position = positions.get(slot)
+            cells = (str(slot),
+                     "not taught" if position is None else "%.4f" % position,
+                     self._samples.get(slot, ""))
+            for col, text in enumerate(cells):
+                item = self.slot_table.item(row, col)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.slot_table.setItem(row, col, item)
+                if item.text() != text:
+                    item.setText(text)
 
     @property
     def busy_widgets(self):

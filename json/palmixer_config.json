@@ -16,5 +16,9 @@
     },
     "motor": {
         "pv": "12idb:m6"
+    },
+    "carousel": {
+        "size": 12,
+        "step": 30.0
     }
 }

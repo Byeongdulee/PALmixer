@@ -1,15 +1,31 @@
 # -*- coding: utf-8 -*-
 """Persistent tracking state for PALmixer: what is where, and the carousel table.
 
-Four things are tracked, backed by ``palmixer_state.ini`` next to this file so
+Five things are tracked, backed by ``palmixer_state.ini`` next to this file so
 they survive a server restart:
 
     A) the mixer head's location   -- at the mixer, or at its cleaning station
     B) flowcell 1 and 2 locations  -- independently, at the beam or at cleaning
     C) the carousel slot last moved to (the EPICS motor holds the true position)
     D) which flowcell is in use    -- PAL12idb's flowcell_ID
+    E) the carousel's slot inventory -- one taught reference position, and the
+       sample ID held in each slot
 
-Plus the taught slot -> motor position table the carousel moves use.
+The carousel's *geometry* is not state: how many slots it has and how far the
+motor moves between two adjacent ones are properties of the hardware, so they
+are configuration (``carousel.size`` / ``carousel.step`` in
+json/palmixer_config.json) and are only read here. Slots are evenly spaced, so
+only one has to be taught: every other slot's position is derived from that
+reference and the step, which means re-teaching after a carousel swap is one
+move rather than N.
+
+A slot is "used" exactly when it has a sample ID -- make_sample assigns one
+(auto-generating a timestamp ID if the operator did not name the sample) as
+soon as the mix step succeeds, since mixing is what consumes the vial. When
+every slot is used the carousel is a spent consumable: the operator swaps in a
+fresh one and calls reset_carousel(), which drops the sample IDs and the taught
+reference, because a replacement carousel is not guaranteed to seat where the
+old one did.
 
 IMPORTANT -- this module must stay dependency-free (stdlib only). PAL12idb.py
 imports ``camera_tools`` at module scope, which only resolves inside the
@@ -27,6 +43,9 @@ we do not know. Callers are expected to refuse to move rather than guess.
 import configparser
 import os
 import threading
+import time
+
+from . import config  # stdlib-only itself, so this keeps state.py importable anywhere
 
 # -- location vocabulary ----------------------------------------------------
 UNKNOWN = "unknown"
@@ -51,17 +70,38 @@ LOCATION_KEYS = (WHAT_MIXER_HEAD, WHAT_FLOWCELL_1, WHAT_FLOWCELL_2)
 _INI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "palmixer_state.ini")
 _TRACKING = "tracking"
-_CAROUSEL = "carousel"
+_CAROUSEL = "carousel"            # the taught reference: ref_slot + ref_position
+_CAROUSEL_SAMPLES = "carousel_samples"  # slot -> sample ID; a key here == used
+
+# A sample ID is free text the operator types, so it gets bounded here rather
+# than trusted: long enough for a real label, short enough that it cannot bloat
+# the ini or the retained MQTT snapshot.
+MAX_SAMPLE_ID_LEN = 128
 
 # Re-entrant: the setters below call the getters while holding it.
 _lock = threading.RLock()
 _listeners = []
 
+# See _write(): bounded retry for a transient Windows file-lock on os.replace.
+_REPLACE_RETRIES = 5
+_REPLACE_BACKOFF_S = 0.05
+
 
 # -- ini plumbing -----------------------------------------------------------
 def _read():
-    parser = configparser.ConfigParser()
-    parser.read(_INI_PATH)
+    # Locked, not just the writes: the server is multi-threaded (a fast ZMQ
+    # command answers on its own thread while the worker thread is mid-workflow,
+    # and both write state), and on Windows os.replace() below fails outright
+    # with "Access is denied" if any other handle has the file open. A lock-free
+    # read racing a write is therefore not a stale read, it is a crashed write.
+    # _lock is re-entrant, so _mutate() can hold it across read-modify-write.
+    with _lock:
+        # interpolation=None: sample IDs are free text, and configparser's
+        # default BasicInterpolation treats "%" in a *value* as a syntax error
+        # -- raised not on write but on the next get()/items(), so one "%" in an
+        # ID would poison every later read. Nothing here wants interpolation.
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read(_INI_PATH)
     return parser
 
 
@@ -71,7 +111,18 @@ def _write(parser):
     tmp = _INI_PATH + ".tmp"
     with open(tmp, "w") as fp:
         parser.write(fp)
-    os.replace(tmp, _INI_PATH)
+    for attempt in range(_REPLACE_RETRIES):
+        try:
+            os.replace(tmp, _INI_PATH)
+            return
+        except PermissionError:
+            # Windows only, and not our own threads (those are serialized on
+            # _lock): a virus scanner or the search indexer transiently holding
+            # the file it just saw us create. Backing off briefly clears it;
+            # losing a state transition to it would not.
+            if attempt == _REPLACE_RETRIES - 1:
+                raise
+            time.sleep(_REPLACE_BACKOFF_S)
 
 
 def _get(section, key, default=UNKNOWN):
@@ -82,15 +133,40 @@ def _get(section, key, default=UNKNOWN):
     return value or default
 
 
-def _set(section, key, value):
-    """Set one key, preserving every other section/key in the file."""
+def _mutate(fn):
+    """Apply ``fn(parser)`` to the stored ini: one read, one atomic write, one
+    notification. Multi-key changes (clearing the carousel) have to land as a
+    single transition -- a half-cleared inventory must never be observable, and
+    listeners should see one snapshot, not one per key."""
     with _lock:
         parser = _read()
+        fn(parser)
+        _write(parser)
+    _notify()
+
+
+def _set(section, key, value):
+    """Set one key, preserving every other section/key in the file."""
+    def apply(parser):
         if not parser.has_section(section):
             parser.add_section(section)
         parser.set(section, key, str(value))
-        _write(parser)
-    _notify()
+    _mutate(apply)
+
+
+def _slot_keys(parser, section):
+    """The ``slot_<n>`` keys of ``section`` as ``{int: raw string value}``."""
+    if not parser.has_section(section):
+        return {}
+    out = {}
+    for key, value in parser.items(section):
+        if not key.startswith("slot_"):
+            continue
+        try:
+            out[int(key.split("_", 1)[1])] = value
+        except ValueError:
+            continue  # ignore a hand-edited line we cannot parse
+    return out
 
 
 # -- change notification ----------------------------------------------------
@@ -180,35 +256,232 @@ def set_carousel_slot(slot):
     _set(_TRACKING, "carousel_slot", int(slot))
 
 
-def carousel_slots():
-    """The taught slot -> motor position table, as ``{int: float}``."""
+# -- carousel geometry (configuration, not state) ---------------------------
+# Read from json/palmixer_config.json on every call rather than cached, so
+# editing the file and restarting only the *server* is enough -- and so a test
+# can point config elsewhere without this module holding a stale copy.
+def get_carousel_size():
+    """How many slots the mounted carousel has, as an int, or UNKNOWN.
+
+    UNKNOWN when ``carousel.size`` is absent or not a positive integer.
+    Carousels differ, so nothing is guessed: slot operations refuse until it is
+    configured rather than silently accepting a slot the hardware lacks."""
+    try:
+        size = int(config.get_section("carousel").get("size", 0))
+    except (TypeError, ValueError):
+        return UNKNOWN
+    return size if size >= 1 else UNKNOWN
+
+
+def get_carousel_step():
+    """Motor travel between two adjacent slots, or UNKNOWN.
+
+    May be negative, for a carousel whose slot numbering runs against the
+    motor's positive direction. Zero is not a step, it is an absent one: every
+    slot would map to the same position, so it reads as UNKNOWN and the moves
+    that need it refuse rather than driving to the wrong slot."""
+    try:
+        step = float(config.get_section("carousel").get("step", 0.0))
+    except (TypeError, ValueError):
+        return UNKNOWN
+    return step if step else UNKNOWN
+
+
+def require_carousel_step():
+    step = get_carousel_step()
+    if step == UNKNOWN:
+        raise ValueError("carousel step is not configured; set carousel.step in "
+                         "json/palmixer_config.json to the motor travel between "
+                         "two adjacent slots")
+    return step
+
+
+def validate_slot(slot):
+    """Range-check ``slot`` against the configured size; return it as an int.
+
+    Public because callers want to reject a bad slot *before* doing work for
+    it -- server.py checks here before reading the motor, so an out-of-range
+    slot reports that rather than whatever the hardware read had to say.
+
+    Raises ValueError, which the ZMQ reply path turns into "ERROR: <reason>"
+    and the workflows turn into a WorkflowError."""
+    try:
+        n = int(slot)
+    except (TypeError, ValueError):
+        raise ValueError("carousel slot must be an integer, got %r" % (slot,))
+    size = get_carousel_size()
+    if size == UNKNOWN:
+        raise ValueError("carousel size is not configured; set carousel.size in "
+                         "json/palmixer_config.json to the number of slots")
+    if not 1 <= n <= size:
+        raise ValueError("carousel slot must be 1..%d, got %d" % (size, n))
+    return n
+
+
+def carousel_reference():
+    """The taught reference as ``(slot, position)``, or None if untaught.
+
+    One reference locates the whole carousel: the slots are evenly spaced, so
+    every other position follows from it and ``carousel.step``. A reference for
+    a slot outside the configured size is stale -- a carousel of a different
+    size was swapped in -- and reads as untaught rather than being trusted."""
     parser = _read()
     if not parser.has_section(_CAROUSEL):
-        return {}
-    slots = {}
-    for key, value in parser.items(_CAROUSEL):
-        if not key.startswith("slot_"):
-            continue
-        try:
-            slots[int(key.split("_", 1)[1])] = float(value)
-        except ValueError:
-            continue  # ignore a hand-edited line we cannot parse
-    return slots
+        return None
+    try:
+        slot = int(parser.get(_CAROUSEL, "ref_slot", fallback=""))
+        position = float(parser.get(_CAROUSEL, "ref_position", fallback=""))
+    except ValueError:
+        return None
+    size = get_carousel_size()
+    if size == UNKNOWN or not 1 <= slot <= size:
+        return None
+    return slot, position
 
 
 def teach_carousel_slot(slot, position):
-    """Record ``position`` (motor engineering units) as carousel slot ``slot``."""
-    _set(_CAROUSEL, "slot_%d" % int(slot), repr(float(position)))
+    """Record ``position`` (motor engineering units) as carousel slot ``slot``,
+    and with it the position of every other slot.
+
+    Teaching a second slot does not add to a table -- it replaces the
+    reference, re-locating the whole carousel from the slot just taught."""
+    ref_slot = validate_slot(slot)
+    require_carousel_step()
+
+    def apply(parser):
+        if not parser.has_section(_CAROUSEL):
+            parser.add_section(_CAROUSEL)
+        parser.set(_CAROUSEL, "ref_slot", str(ref_slot))
+        parser.set(_CAROUSEL, "ref_position", repr(float(position)))
+    _mutate(apply)
 
 
 def slot_position(slot):
-    """Motor position for ``slot``. Raises KeyError if it has not been taught."""
-    slots = carousel_slots()
-    key = int(slot)
-    if key not in slots:
-        raise KeyError("carousel slot %d has not been taught (known slots: %s)"
-                       % (key, sorted(slots) or "none"))
-    return slots[key]
+    """Motor position for ``slot``, derived from the reference and the step.
+
+    Raises KeyError if the carousel has not been located yet -- the message is
+    surfaced to the operator verbatim, so it says what to do about it."""
+    n = validate_slot(slot)
+    reference = carousel_reference()
+    if reference is None:
+        raise KeyError("the carousel has not been taught: drive the motor to any "
+                       "slot and record it with \"teach_carousel_slot <n>\", and "
+                       "every other slot follows from carousel.step")
+    ref_slot, ref_position = reference
+    return ref_position + (n - ref_slot) * require_carousel_step()
+
+
+def carousel_slots():
+    """The full slot -> motor position table, as ``{int: float}``.
+
+    Derived, not stored: once the reference is taught every slot has a
+    position, so this is either empty or complete."""
+    size = get_carousel_size()
+    if size == UNKNOWN or carousel_reference() is None:
+        return {}
+    try:
+        return {n: slot_position(n) for n in range(1, size + 1)}
+    except (KeyError, ValueError):
+        return {}
+
+
+# -- carousel sample IDs ----------------------------------------------------
+# A slot is "used" exactly when it holds a sample ID. Keeping those the same
+# fact, rather than a separate used-flag beside an ID, means the two can never
+# disagree about whether a slot has been consumed.
+def new_sample_id():
+    """The auto-assigned ID for a sample the operator did not name."""
+    return time.strftime("S%Y%m%d-%H%M%S")
+
+
+def clean_sample_id(sample_id):
+    """Normalise and bounds-check an operator-supplied sample ID.
+
+    Public for the same reason as validate_slot: a workflow validates the ID on
+    the synchronous accept path, so a bad one is refused before a multi-minute
+    sequence starts rather than failing at the marking step in the middle."""
+    # Collapsing whitespace also strips the newlines and tabs that would
+    # otherwise break the one-line-per-key ini format on the way back out.
+    text = " ".join(str(sample_id).split())
+    if not text:
+        raise ValueError("sample ID must not be empty")
+    if len(text) > MAX_SAMPLE_ID_LEN:
+        raise ValueError("sample ID must be at most %d characters, got %d"
+                         % (MAX_SAMPLE_ID_LEN, len(text)))
+    if text.lower() == UNKNOWN:
+        raise ValueError('%r is not a usable sample ID: it is what get_sample_id '
+                         'reports for a slot that has none' % UNKNOWN)
+    return text
+
+
+def carousel_samples():
+    """The slot -> sample ID table, as ``{int: str}``. Its keys are the used slots.
+
+    Bounded by the configured size: if a smaller carousel is configured while
+    IDs for higher slots are still on disk, those slots do not exist on the
+    carousel that is mounted, and counting them would make it look full."""
+    size = get_carousel_size()
+    limit = size if size != UNKNOWN else 0
+    return {slot: value for slot, value in _slot_keys(_read(), _CAROUSEL_SAMPLES).items()
+            if value.strip() and 1 <= slot <= limit}
+
+
+def get_sample_id(slot):
+    """The sample ID held in ``slot``, or None if the slot is unused."""
+    return carousel_samples().get(validate_slot(slot))
+
+
+def set_sample_id(slot, sample_id):
+    """Tag ``slot`` with ``sample_id``, marking it used. Returns the stored ID.
+
+    Overwrites an existing ID: re-mixing into a slot that already holds a
+    sample is allowed, and the new sample is what is in there afterwards."""
+    text = clean_sample_id(sample_id)
+    _set(_CAROUSEL_SAMPLES, "slot_%d" % validate_slot(slot), text)
+    return text
+
+
+def clear_sample_id(slot):
+    """Drop ``slot``'s sample ID, marking it unused again -- the way back from a
+    slot marked used by mistake, without resetting the whole carousel."""
+    key = "slot_%d" % validate_slot(slot)
+
+    def apply(parser):
+        if parser.has_section(_CAROUSEL_SAMPLES):
+            parser.remove_option(_CAROUSEL_SAMPLES, key)
+    _mutate(apply)
+
+
+def used_slot_count():
+    return len(carousel_samples())
+
+
+def carousel_is_full():
+    """True when every slot holds a sample -- time to replace the carousel.
+
+    Advisory only: make_sample still runs on a full carousel, overwriting the
+    target slot's ID, because re-mixing a slot is a legitimate thing to do."""
+    size = get_carousel_size()
+    if size == UNKNOWN:
+        return False
+    return used_slot_count() >= size
+
+
+def reset_carousel():
+    """Replace the carousel: clear the entire slot inventory in one transition.
+
+    Drops the taught reference along with the sample IDs, because a replacement
+    carousel is not guaranteed to seat where the old one did -- keeping a stale
+    reference would be the dangerous default, since every slot position is
+    derived from it. The slot last moved to goes back to UNKNOWN for the same
+    reason. The geometry (size, step) is configuration and is untouched."""
+    def apply(parser):
+        for section in (_CAROUSEL, _CAROUSEL_SAMPLES):
+            if parser.has_section(section):
+                parser.remove_section(section)
+        if parser.has_option(_TRACKING, "carousel_slot"):
+            parser.remove_option(_TRACKING, "carousel_slot")
+    _mutate(apply)
 
 
 # -- D) flowcell in use -----------------------------------------------------
@@ -231,7 +504,17 @@ def set_flowcell_in_use(flowcell_id):
 
 # -- the whole picture ------------------------------------------------------
 def snapshot():
-    """Everything tracked, as a plain dict. This is what goes on the wire."""
+    """Everything tracked, as a plain dict. This is what goes on the wire.
+
+    Assembled under the lock: each getter below re-reads the file, so without
+    it a write landing mid-assembly would produce a snapshot whose fields come
+    from different versions of the state -- carousel_full disagreeing with the
+    carousel_samples in the very same payload, for instance."""
+    with _lock:
+        return _snapshot()
+
+
+def _snapshot():
     return {
         WHAT_MIXER_HEAD: get_mixer_head(),
         WHAT_FLOWCELL_1: get_flowcell_location(1),
@@ -239,4 +522,12 @@ def snapshot():
         "flowcell_in_use": get_flowcell_in_use(),
         "carousel_slot": get_carousel_slot(),
         "carousel_slots": carousel_slots(),
+        "carousel_size": get_carousel_size(),
+        "carousel_step": get_carousel_step(),
+        "carousel_reference": carousel_reference(),
+        "carousel_samples": carousel_samples(),
+        # Derivable from the two above, but carried explicitly so every
+        # consumer of the retained MQTT snapshot -- not just this repo's GUI --
+        # gets the "replace the carousel" signal without recomputing it.
+        "carousel_full": carousel_is_full(),
     }
