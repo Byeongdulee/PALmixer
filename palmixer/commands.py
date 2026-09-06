@@ -47,6 +47,12 @@ STATION_LABELS = {
 
 SEARCH_APRILTAG = "search_apriltag"
 
+# Explicit sync between waypoints.ini (which every move reads) and the
+# 12idUR:WaypointL:* EPICS PVs (the beamline-wide interchange). These are the
+# only commands that do Channel Access on the waypoint PVs.
+PUSH_POSITIONS = "push_positions"
+PULL_POSITIONS = "pull_positions"
+
 # The 8 "actual transport functions" defined in PAL12idb.py.
 TRANSPORT_FUNCTIONS = (
     "mixer2cleaningstation",
@@ -119,9 +125,32 @@ WHAT_FLOWCELL_1 = _state.WHAT_FLOWCELL_1
 WHAT_FLOWCELL_2 = _state.WHAT_FLOWCELL_2
 
 
+# Marker prefix on a "position not configured" ERROR reply, shared between
+# server.py (which builds the message) and the GUI (which matches it to
+# decide whether to pop up a dialog instead of just logging it).
+POSITION_NOT_CONFIGURED = "position not configured"
+
+
+def position_not_configured_error(missing_labels):
+    """Build the ERROR detail for a transport/workflow command that needs a
+    station position no one has taught yet (see PAL12idb.check_positions_defined)."""
+    return "%s: %s -- use the Configuration tab to search its AprilTag first" % (
+        POSITION_NOT_CONFIGURED, ", ".join(missing_labels))
+
+
 def search_apriltag_command(station):
     """Build the wire command for searching a station's AprilTag."""
     return "%s %s" % (SEARCH_APRILTAG, station)
+
+
+def push_positions_command():
+    """waypoints.ini -> EPICS waypoint PVs."""
+    return PUSH_POSITIONS
+
+
+def pull_positions_command():
+    """EPICS waypoint PVs -> waypoints.ini."""
+    return PULL_POSITIONS
 
 
 def motor_tweak_command(direction, step):

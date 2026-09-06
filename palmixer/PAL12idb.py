@@ -41,11 +41,17 @@ def set_flowcell_ID(n):
 
 _POSITION_FIELDS = ('X', 'Y', 'Z', 'RX', 'RY', 'RZ')
 
-# The 12idUR:WaypointL:<ID>:<field> PVs may not always be available (no IOC
-# running, or this code running off the beamline network). waypoints.ini,
-# next to this file, is a plain-text fallback store: every set_position()
-# mirrors the position there, so get_position() can fall back to the
-# last-known value when the PV(s) are disconnected.
+# waypoints.ini, next to this file, is the runtime source of truth for taught
+# positions: get_position()/set_position() touch the file and nothing else.
+# That keeps Channel Access off the control path entirely -- a caget on a
+# disconnected PV blocks for seconds, and get_position() is reached from
+# check_positions_defined() on the synchronous ZMQ reply path, where a stall
+# would time the client out (or worse, let a command be started after the
+# client had already given up on it).
+#
+# The 12idUR:WaypointL:<ID>:<field> PVs are an interchange with the rest of
+# the beamline rather than a store this package reads: sync them explicitly
+# with push_positions_to_pvs() / pull_positions_from_pvs().
 _INI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'waypoints.ini')
 
 _ID_NAMES = {
@@ -88,30 +94,102 @@ def _write_ini_position(ID, pos):
         parser.write(fp)
 
 
-# caget returns None if the PV is disconnected or the request times out. Never
-# hand that on to a caller, since the pose goes straight into robot.moveto().
-# If any field is unavailable, fall back to the cached position in
-# waypoints.ini instead of failing outright.
+def _pv_name(ID, field):
+    return f'12idUR:WaypointL:{ID}:{field}'
+
+
 def get_position(ID):
-    pos = [caget(f'12idUR:WaypointL:{ID}:{f}') for f in _POSITION_FIELDS]
-    missing = [f for f, v in zip(_POSITION_FIELDS, pos) if v is None]
-    if missing:
-        cached = _read_ini_position(ID)
-        if cached is not None:
-            print(f"waypoint {ID}: PV(s) {missing} unavailable; using cached "
-                  f"position from {_INI_PATH}")
-            return cached
+    """The taught position for waypoint `ID`, read from waypoints.ini.
+
+    Raises RuntimeError if the station has never been taught. Does no Channel
+    Access by design (see the note on _INI_PATH); to bring in a position
+    taught elsewhere, run pull_positions_from_pvs() first.
+    """
+    pos = _read_ini_position(ID)
+    if pos is None:
         raise RuntimeError(
-            f'waypoint {ID}: no value read from PV(s) {missing}, and no '
-            f'cached position in {_INI_PATH}')
+            f'waypoint {ID} ({_ini_section(ID)}) has no position in {_INI_PATH}; '
+            f'search its AprilTag to teach it, or pull it from EPICS')
     return pos
 
 def set_position(ID, pos):
-    for f, v in zip(_POSITION_FIELDS, pos):
-        caput(f'12idUR:WaypointL:{ID}:{f}', v)
-    # Keep the file cache current even when EPICS is up, so it stays a valid
-    # fallback the next time it is not.
+    """Record a taught position in waypoints.ini.
+
+    Does not write the EPICS PVs -- push_positions_to_pvs() does that, so
+    publishing to the rest of the beamline stays an explicit operator action.
+    """
     _write_ini_position(ID, pos)
+
+
+# -- EPICS waypoint sync -------------------------------------------------------
+# The only two functions here that do Channel Access on the waypoint PVs.
+# Both are operator-initiated (Configuration tab), never part of a move.
+WAYPOINT_IDS = (sampletableID, cleaningstationID1, cleaningstationID2,
+                mixerstationID, mixer_cleaningstationID)
+
+
+def _sync_summary(verb, done, skipped, failed, failed_label):
+    """Report what a push/pull actually managed, and raise only if it managed
+    nothing at all.
+
+    A partial result is normal, not an error: on a fresh install most
+    waypoints have never been taught on either side. Only a sync where every
+    single station failed points at something the operator must fix (the IOC
+    being down, typically), so that is the case worth raising on.
+    """
+    parts = ["%s %d/%d (%s)" % (verb, len(done), len(WAYPOINT_IDS),
+                                 ", ".join(done) if done else "none")]
+    if skipped:
+        parts.append("not taught yet: %s" % ", ".join(skipped))
+    if failed:
+        parts.append("%s: %s" % (failed_label, ", ".join(failed)))
+    summary = "; ".join(parts)
+    if failed and not done:
+        raise RuntimeError(summary)
+    return summary
+
+
+def push_positions_to_pvs():
+    """Copy every taught position in waypoints.ini out to its EPICS PVs.
+
+    Stations with no ini entry are skipped -- there is nothing to push, and
+    that is the normal state of a fresh install rather than an error.
+    Returns a summary naming any station whose PVs could not be written;
+    raises RuntimeError only if every station failed.
+    """
+    pushed, skipped, failed = [], [], []
+    for ID in WAYPOINT_IDS:
+        name = _ini_section(ID)
+        pos = _read_ini_position(ID)
+        if pos is None:
+            skipped.append(name)
+            continue
+        # Attempt every field before judging: caput() returns None for a PV it
+        # could not reach, and short-circuiting would leave a half-written set.
+        results = [caput(_pv_name(ID, f), v) for f, v in zip(_POSITION_FIELDS, pos)]
+        (pushed if all(r is not None for r in results) else failed).append(name)
+    return _sync_summary("pushed", pushed, skipped, failed, "PV not writable")
+
+
+def pull_positions_from_pvs():
+    """Import positions from the EPICS waypoint PVs into waypoints.ini.
+
+    A station is only written when all six of its fields read back, so a
+    partial EPICS outage cannot overwrite a good taught position with junk.
+    caget() returns None both for a PV that is unreachable and for one that
+    was never populated, so those two cases share a bucket in the summary.
+    Raises RuntimeError only if no station read back at all.
+    """
+    pulled, failed = [], []
+    for ID in WAYPOINT_IDS:
+        name = _ini_section(ID)
+        pos = [caget(_pv_name(ID, f)) for f in _POSITION_FIELDS]
+        if any(v is None for v in pos):
+            failed.append(name)
+            continue
+        _write_ini_position(ID, pos)
+        pulled.append(name)
+    return _sync_summary("pulled", pulled, (), failed, "no value from PV")
 
 def get_sampletable_position():
     global sample_table, sampletableID
@@ -160,6 +238,48 @@ def set_mixer_cleaningstation_position(pos):
     global mixer_cleaning_station
     mixer_cleaning_station = pos
     set_position(mixer_cleaningstationID, pos)
+
+# -- position readiness checks -----------------------------------------------
+# Station keys match commands.STATIONS / commands.STATION_LABELS, so callers
+# on the server side can report a missing position using the same label the
+# Configuration tab's AprilTag-search buttons use.
+_STATION_IDS = {
+    'sample_table': lambda: sampletableID,
+    'mixer_station': lambda: mixerstationID,
+    'mixer_cleaning_station': lambda: mixer_cleaningstationID,
+    # Resolved at call time, like the transport functions do: which physical
+    # cleaning station this means depends on the flowcell currently in use.
+    'cleaning_station': lambda: cleaningstationID1 if flowcell_ID == 1 else cleaningstationID2,
+}
+
+# Which station positions each transport function reads via get_position().
+# workflows.py composes its own requirements from this rather than keeping a
+# second list, so the two cannot drift apart.
+TRANSPORT_STATIONS = {
+    'mixer2cleaningstation': ('mixer_station', 'mixer_cleaning_station'),
+    'mixer2mixingstation': ('mixer_cleaning_station', 'mixer_station'),
+    'load_flowcell_from_cleaningstation_to_beam': ('cleaning_station', 'sample_table'),
+    'load_flowcell_from_beam_to_cleaningstation': ('sample_table', 'cleaning_station'),
+    'ready_flowcell_to_draw': ('cleaning_station', 'mixer_station'),
+    'load_sample_to_beam': ('sample_table',),
+    'return_sample': ('sample_table', 'mixer_station'),
+    'wash_flowcell_after_return': ('cleaning_station',),
+}
+
+
+def check_positions_defined(station_keys):
+    """Which of `station_keys` have not been taught yet (no waypoints.ini entry).
+
+    Returns a list of station-key strings (empty if all are configured). A
+    plain file read, with no Channel Access and no side effects, so it is
+    cheap enough to run on the synchronous ZMQ reply path before accepting a
+    command. An unrecognized station key is a caller bug and raises KeyError
+    rather than being quietly reported as unconfigured."""
+    missing = []
+    for key in dict.fromkeys(station_keys):  # de-dup, keep first-seen order
+        if _read_ini_position(_STATION_IDS[key]()) is None:
+            missing.append(key)
+    return missing
 
 # Basic operation functions
 def pickup(robot, height = needle_clear_height):

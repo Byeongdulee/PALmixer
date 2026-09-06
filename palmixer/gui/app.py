@@ -18,11 +18,11 @@ import json
 import sys
 import threading
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QTimer, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QApplication, QGroupBox, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMainWindow, QTabWidget, QVBoxLayout, QWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .. import commands as cmd
@@ -121,7 +121,7 @@ class MainWindow(QMainWindow):
         self._status_polled.connect(self._on_status_polled)
         self._mqtt_state.connect(self._on_mqtt_state)
         self._mqtt_motion.connect(self._on_mqtt_motion)
-        self._tracking_updated.connect(self.workflow_tab.update_state)
+        self._tracking_updated.connect(self._on_tracking_updated)
 
     # -- ZMQ (command sending) ------------------------------------------------
     def send_command(self, command):
@@ -138,6 +138,15 @@ class MainWindow(QMainWindow):
     def _on_zmq_reply(self, command, reply):
         color = QColor("darkred") if reply.startswith("ERROR") else QColor("gray")
         self._log("<- %s: %s" % (command, reply), color)
+        # This ERROR text only comes from the Experiment/Automation tabs'
+        # transport, make_sample, and unload_sample commands (see server.py's
+        # _require_positions) -- Configuration-tab commands are how a
+        # position gets configured in the first place, so they never trigger
+        # it. A dialog is worth the interruption here: the alternative is a
+        # log line that is easy to miss before the operator walks away for a
+        # multi-minute sequence that would otherwise never have started.
+        if reply.startswith("ERROR: %s" % cmd.POSITION_NOT_CONFIGURED):
+            QMessageBox.warning(self, "Position Not Configured", reply[len("ERROR: "):])
 
     def _poll_status_async(self):
         threading.Thread(target=self._poll_status_worker, daemon=True).start()
@@ -154,6 +163,13 @@ class MainWindow(QMainWindow):
     def _on_status_polled(self, state):
         if state:
             self._set_busy(state.strip().upper() == "BUSY")
+
+    def _on_tracking_updated(self, snapshot):
+        self.workflow_tab.update_state(snapshot)
+        fc_in_use = snapshot.get("flowcell_in_use")
+        if fc_in_use is not None:
+            self.config_tab.flowcell.set_flowcell_in_use(fc_in_use)
+            self.experiment_tab.flowcell.set_flowcell_in_use(fc_in_use)
 
     # -- MQTT (status feed) ----------------------------------------------------
     def _start_mqtt(self, cfg):

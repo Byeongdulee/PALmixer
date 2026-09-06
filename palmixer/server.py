@@ -203,9 +203,15 @@ class PALmixerServer:
             label = "%s %s" % (cmd.SEARCH_APRILTAG, station)
             return (lambda: self._search_apriltag(station)), label
 
+        if name in (cmd.PUSH_POSITIONS, cmd.PULL_POSITIONS):
+            if args:
+                raise ValueError("%s takes no arguments" % name)
+            return (lambda: self._sync_positions(name)), name
+
         if name in cmd.TRANSPORT_FUNCTIONS:
             if args:
                 raise ValueError("%s takes no arguments" % name)
+            self._require_positions(self.PAL12idb.TRANSPORT_STATIONS[name] if self.PAL12idb else ())
             return (lambda: self._run_transport(name)), name
 
         if name == cmd.MOTOR_TWEAK:
@@ -233,6 +239,7 @@ class PALmixerServer:
                 slot = int(args[0])
             except ValueError:
                 raise ValueError("slot must be an integer, got %r" % args[0])
+            self._require_positions(self.workflows.stations_for_make_sample())
             try:
                 self.workflows._check_make_sample(slot)
             except WorkflowError as e:
@@ -243,6 +250,7 @@ class PALmixerServer:
         if name == cmd.UNLOAD_SAMPLE:
             if args:
                 raise ValueError("%s takes no arguments" % cmd.UNLOAD_SAMPLE)
+            self._require_positions(self.workflows.stations_for_unload_sample())
             try:
                 self.workflows._check_unload_sample()
             except WorkflowError as e:
@@ -250,6 +258,21 @@ class PALmixerServer:
             return (lambda: self.workflows.unload_sample()), cmd.UNLOAD_SAMPLE
 
         raise ValueError("unknown command %r" % name)
+
+    def _require_positions(self, station_keys):
+        """Refuse up front (as a synchronous ERROR reply) rather than letting
+        a transport call fail deep inside a multi-minute action once it is
+        already ACCEPTED. No-op in simulate mode, where there is no PAL12idb
+        and therefore nothing to check.
+
+        Safe to call from the reply path: check_positions_defined() reads
+        waypoints.ini and does no Channel Access, so it cannot stall here."""
+        if self.simulate or self.PAL12idb is None or not station_keys:
+            return
+        missing = self.PAL12idb.check_positions_defined(station_keys)
+        if missing:
+            labels = [cmd.STATION_LABELS.get(s, s) for s in missing]
+            raise ValueError(cmd.position_not_configured_error(labels))
 
     def _run_action(self, action_fn, action_label, trace):
         """Runs on a background thread: execute the action, publish the
@@ -278,6 +301,18 @@ class PALmixerServer:
             return "simulated AprilTag search for %s" % station
         pos = self.PAL12idb.locate_apriltag(self.rob, pos=station)
         return "found %s at %s" % (station, pos)
+
+    def _sync_positions(self, name):
+        """Explicit waypoints.ini <-> EPICS PV sync, the only Channel Access
+        this package does on the waypoint PVs. Runs on the worker thread
+        because a disconnected PV makes it slow, which is exactly why moves
+        read the ini instead (see PAL12idb.get_position)."""
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated %s" % name
+        if name == cmd.PUSH_POSITIONS:
+            return self.PAL12idb.push_positions_to_pvs()
+        return self.PAL12idb.pull_positions_from_pvs()
 
     def _run_transport(self, name):
         if self.simulate:

@@ -9,11 +9,12 @@ tracking MQTT topic) via update_state().
 """
 
 from PyQt5.QtWidgets import (
-    QButtonGroup, QComboBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-    QPushButton, QRadioButton, QSpinBox, QVBoxLayout, QWidget,
+    QComboBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+    QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from .. import commands as cmd
+from .flowcell_selector import FlowcellSelector
 
 
 class WorkflowTab(QWidget):
@@ -23,36 +24,15 @@ class WorkflowTab(QWidget):
         self._all_buttons = []
         self._tracking_labels = {}
 
+        self.flowcell = FlowcellSelector(send_command)
+
         layout = QVBoxLayout()
-        layout.addWidget(self._build_flowcell_group())
+        layout.addWidget(self.flowcell)
         layout.addWidget(self._build_carousel_group())
         layout.addWidget(self._build_workflow_group())
         layout.addWidget(self._build_tracking_group())
         layout.addStretch(1)
         self.setLayout(layout)
-
-    # -- flowcell in use --------------------------------------------------
-    def _build_flowcell_group(self):
-        box = QGroupBox("Flowcell in Use")
-        layout = QHBoxLayout()
-        self._flowcell_group = QButtonGroup(self)
-        for fc in cmd.FLOWCELL_IDS:
-            radio = QRadioButton("Flowcell %d" % fc)
-            # `clicked` fires only on real user interaction, unlike `toggled`,
-            # which also fires for the default setChecked() below and for the
-            # programmatic sync in update_state() -- either of which would
-            # otherwise send an unsolicited set_flowcell to the server.
-            radio.clicked.connect(lambda _checked, n=fc: self._on_set_flowcell(n))
-            self._flowcell_group.addButton(radio, fc)
-            layout.addWidget(radio)
-            if fc == cmd.FLOWCELL_IDS[0]:
-                radio.setChecked(True)
-        layout.addStretch(1)
-        box.setLayout(layout)
-        return box
-
-    def _on_set_flowcell(self, flowcell_id):
-        self._send_command(cmd.set_flowcell_command(flowcell_id))
 
     # -- carousel -----------------------------------------------------------
     def _build_carousel_group(self):
@@ -150,11 +130,9 @@ class WorkflowTab(QWidget):
         fc_in_use = snapshot.get("flowcell_in_use")
         if fc_in_use is not None:
             self._flowcell_in_use_label.setText(str(fc_in_use))
-            btn = self._flowcell_group.button(int(fc_in_use))
-            if btn is not None and not btn.isChecked():
-                btn.setChecked(True)  # `clicked` does not fire for this
+            self.flowcell.set_flowcell_in_use(fc_in_use)
 
     @property
     def busy_widgets(self):
         """Widgets to disable while the server reports BUSY."""
-        return list(self._all_buttons)
+        return list(self._all_buttons) + self.flowcell.busy_widgets

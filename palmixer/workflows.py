@@ -74,6 +74,39 @@ class Workflows:
         self.on_step(op, "started", "(not awaited)")
         threading.Thread(target=run, daemon=True).start()
 
+    # -- position requirements -------------------------------------------------
+    # Composed from PAL12idb.TRANSPORT_STATIONS rather than listed separately,
+    # so a change to which stations a transport function reads cannot leave a
+    # stale second copy behind. server.py calls these before accepting a
+    # workflow command, to refuse one that needs a station nobody has taught.
+    def _stations(self, *transport_names):
+        if self.pal is None:  # simulate mode: no PAL12idb, nothing to check
+            return ()
+        stations = ()
+        for name in transport_names:
+            stations += self.pal.TRANSPORT_STATIONS[name]
+        return stations
+
+    def stations_for_make_sample(self):
+        # The opening mixer2cleaningstation is conditional, but step 5 runs it
+        # unconditionally, so its stations are needed either way.
+        return self._stations('mixer2cleaningstation', 'mixer2mixingstation',
+                               'ready_flowcell_to_draw', 'load_sample_to_beam')
+
+    def stations_for_unload_sample(self):
+        # The mixer head only has to be parked out of the way when it is
+        # actually sitting at the mixer station; otherwise the opening
+        # mixer2cleaningstation is skipped and the mixer cleaning station is
+        # never touched, so requiring it would refuse a run that would work.
+        if self.pal is None:
+            return ()
+        names = ('return_sample', 'wash_flowcell_after_return')
+        if state.get_mixer_head() == state.MIXER_AT_MIXER:
+            names = ('mixer2cleaningstation',) + names
+        # raise_to_sampletable_height reads the sample table directly rather
+        # than through a transport function, so it is not in the table above.
+        return self._stations(*names) + ('sample_table',)
+
     @staticmethod
     def _require_known(value, what, allowed):
         if value == state.UNKNOWN:

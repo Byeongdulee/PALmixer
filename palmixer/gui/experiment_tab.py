@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .. import commands as cmd
+from .flowcell_selector import FlowcellSelector
 
 
 class ExperimentTab(QWidget):
@@ -19,7 +20,10 @@ class ExperimentTab(QWidget):
         self._send_command = send_command
         self._all_buttons = []
 
+        self.flowcell = FlowcellSelector(send_command)
+
         layout = QVBoxLayout()
+        layout.addWidget(self.flowcell)
         layout.addWidget(self._build_transport_group())
         layout.addWidget(self._build_motor_group())
         layout.addWidget(self._build_pump_group())
@@ -82,4 +86,4 @@ class ExperimentTab(QWidget):
     @property
     def busy_widgets(self):
         """Widgets to disable while the server reports BUSY."""
-        return list(self._all_buttons)
+        return list(self._all_buttons) + self.flowcell.busy_widgets
