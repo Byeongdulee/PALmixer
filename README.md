@@ -107,6 +107,25 @@ hardware.
 Only one worker action runs at a time; a worker command sent while busy gets
 `ERROR: busy`.
 
+### Transport functions
+
+The eight `PAL12idb` transport functions above, each sent as its own bare
+command:
+
+| Command | Move |
+|---|---|
+| `mixer2cleaningstation` | Mixer -> Cleaning Station |
+| `mixer2mixingstation` | Cleaning Station -> Mixer |
+| `load_flowcell_from_cleaningstation_to_beam` | Cleaning Station -> Beam |
+| `load_flowcell_from_beam_to_cleaningstation` | Beam -> Cleaning Station |
+| `ready_flowcell_to_draw` | Ready Flowcell to Draw |
+| `load_sample_to_beam` | Load Sample to Beam |
+| `return_sample` | Return Sample from Beam |
+| `wash_flowcell_after_return` | Wash Flowcell After Return |
+
+Each acts on the flowcell currently in use (`set_flowcell`) and records its
+own target location on success (see [State tracking](#state-tracking)).
+
 The GUI greys its flowcell selectors out while the server is BUSY, even
 though `set_flowcell` is one of the fast commands the server would answer
 mid-action: `PAL12idb` re-reads `flowcell_ID` at every transport call, so
