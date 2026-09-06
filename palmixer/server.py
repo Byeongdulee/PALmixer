@@ -67,7 +67,13 @@ class PALmixerServer:
             import robot12idb  # noqa: E402  (path must be set first)
             from . import PAL12idb as pal
 
-            self.rob = robot12idb.UR3(name=cfg["robot"].get("name", "UR3"))
+            # Pass `ip` explicitly so the connection uses *our* config
+            # (json/palmixer_config.json, overridable with PALMIXER_ROBOT_IP)
+            # instead of UR_12idb's own list_of_robots.json -- that file is
+            # a default for other UR_12idb consumers, not a second place
+            # this package's robot address has to be kept in sync.
+            self.rob = robot12idb.UR3(name=cfg["robot"].get("name", "UR3"),
+                                       ip=cfg["robot"].get("ip"))
             self.PAL12idb = pal
         else:
             print("PALmixerServer: --simulate mode, no hardware will be touched.")
