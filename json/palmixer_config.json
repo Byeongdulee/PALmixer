@@ -1,0 +1,20 @@
+{
+    "zmq": {
+        "host": "localhost",
+        "port": 9880
+    },
+    "mqtt": {
+        "host": "localhost",
+        "port": 1883,
+        "prefix": "aps12",
+        "beamline": "12idb"
+    },
+    "robot": {
+        "name": "UR3",
+        "ip": "UR3-12idb.xray.aps.anl.gov",
+        "ur12idb_path": "/home/beams15/S12STAFF/python_codes/UR_12idb"
+    },
+    "motor": {
+        "pv": "12idb:m6"
+    }
+}

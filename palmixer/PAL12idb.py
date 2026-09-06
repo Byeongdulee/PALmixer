@@ -1,0 +1,308 @@
+import configparser
+import os
+
+import camera_tools
+ref_mixer_cleantable = [0.4, 0.1, 0.1, 2.231, -2.212, 0]
+ref_cleanstation = [0.38, -0.16, -0.1, 2.231, -2.212, 0]
+ref_sampletable = [-0.22, -0.37, 0.12, -2.18860535, 2.25379435, 0]
+distance_gripper_tag = 0.05
+# move sth out by 50 mm
+# move sav down by 30 mm
+# after grap, have to move 0.20 m up to clear the needle.
+sample_table = []
+cleaning_station1 = []
+cleaning_station2 = []
+mixer_cleaning_station = []
+mixer_station = []
+needle_clear_height = 0.20
+mixer_height = 0.05
+grab_depth = 0.01
+flowcell_ID = 1
+from epics import caget, caput
+sampletableID = 1
+cleaningstationID1 = 2
+cleaningstationID2 = 3
+mixerstationID = 4
+mixer_cleaningstationID = 5
+
+_POSITION_FIELDS = ('X', 'Y', 'Z', 'RX', 'RY', 'RZ')
+
+# The 12idUR:WaypointL:<ID>:<field> PVs may not always be available (no IOC
+# running, or this code running off the beamline network). waypoints.ini,
+# next to this file, is a plain-text fallback store: every set_position()
+# mirrors the position there, so get_position() can fall back to the
+# last-known value when the PV(s) are disconnected.
+_INI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'waypoints.ini')
+
+_ID_NAMES = {
+    sampletableID: 'sample_table',
+    cleaningstationID1: 'cleaning_station_1',
+    cleaningstationID2: 'cleaning_station_2',
+    mixerstationID: 'mixer_station',
+    mixer_cleaningstationID: 'mixer_cleaning_station',
+}
+
+
+def _ini_section(ID):
+    return _ID_NAMES.get(ID, 'waypoint_%s' % ID)
+
+
+def _read_ini_position(ID):
+    # Returns the cached position for ID, or None if there is no usable entry.
+    parser = configparser.ConfigParser()
+    parser.read(_INI_PATH)
+    section = _ini_section(ID)
+    if not parser.has_section(section):
+        return None
+    try:
+        return [parser.getfloat(section, f) for f in _POSITION_FIELDS]
+    except (ValueError, configparser.NoOptionError):
+        return None
+
+
+def _write_ini_position(ID, pos):
+    # Merge into the existing file rather than overwriting it, so other
+    # stations' cached positions survive.
+    parser = configparser.ConfigParser()
+    parser.read(_INI_PATH)
+    section = _ini_section(ID)
+    if not parser.has_section(section):
+        parser.add_section(section)
+    for f, v in zip(_POSITION_FIELDS, pos):
+        parser.set(section, f, repr(float(v)))
+    with open(_INI_PATH, 'w') as fp:
+        parser.write(fp)
+
+
+# caget returns None if the PV is disconnected or the request times out. Never
+# hand that on to a caller, since the pose goes straight into robot.moveto().
+# If any field is unavailable, fall back to the cached position in
+# waypoints.ini instead of failing outright.
+def get_position(ID):
+    pos = [caget(f'12idUR:WaypointL:{ID}:{f}') for f in _POSITION_FIELDS]
+    missing = [f for f, v in zip(_POSITION_FIELDS, pos) if v is None]
+    if missing:
+        cached = _read_ini_position(ID)
+        if cached is not None:
+            print(f"waypoint {ID}: PV(s) {missing} unavailable; using cached "
+                  f"position from {_INI_PATH}")
+            return cached
+        raise RuntimeError(
+            f'waypoint {ID}: no value read from PV(s) {missing}, and no '
+            f'cached position in {_INI_PATH}')
+    return pos
+
+def set_position(ID, pos):
+    for f, v in zip(_POSITION_FIELDS, pos):
+        caput(f'12idUR:WaypointL:{ID}:{f}', v)
+    # Keep the file cache current even when EPICS is up, so it stays a valid
+    # fallback the next time it is not.
+    _write_ini_position(ID, pos)
+
+def get_sampletable_position():
+    global sample_table, sampletableID
+    sample_table = get_position(sampletableID)
+    return sample_table
+
+def set_sampletable_position(pos):
+    global sample_table,sampletableID
+    sample_table = pos
+    set_position(sampletableID, pos)
+
+def get_cleaningstation_position(ID):
+    global cleaning_station1, cleaning_station2
+    if ID == 1:
+        cleaning_station1 = get_position(cleaningstationID1)
+        return cleaning_station1
+    else:
+        cleaning_station2 = get_position(cleaningstationID2)
+        return cleaning_station2
+
+def set_cleaningstation_position(ID, pos):
+    global cleaning_station1, cleaning_station2
+    if ID == 1:
+        cleaning_station1 = pos
+        set_position(cleaningstationID1, pos)
+    else:
+        cleaning_station2 = pos
+        set_position(cleaningstationID2, pos)
+
+def get_mixerstation_position():
+    global mixer_station
+    mixer_station = get_position(mixerstationID)
+    return mixer_station
+
+def set_mixerstation_position(pos):
+    global mixer_station
+    mixer_station = pos
+    set_position(mixerstationID, pos)
+
+def get_mixer_cleaningstation_position():
+    global mixer_cleaning_station
+    mixer_cleaning_station = get_position(mixer_cleaningstationID)
+    return mixer_cleaning_station
+
+def set_mixer_cleaningstation_position(pos):
+    global mixer_cleaning_station
+    mixer_cleaning_station = pos
+    set_position(mixer_cleaningstationID, pos)
+
+# Basic operation functions
+def pickup(robot, height = needle_clear_height):
+    robot.release()
+    # cm go deeper from the standard height
+    robot.mvr2z(-grab_depth-distance_gripper_tag)
+    robot.grab()
+    # move high enough so the needle is cleared
+    robot.mvr2z(height)
+
+def dropdown(robot, height = needle_clear_height):
+    # move down
+    robot.mvr2z(-1*(height+grab_depth-0.005))
+    robot.release()
+    # move back up to standard height
+    robot.mvr2z(distance_gripper_tag)
+
+def test_pickup(robot, height=needle_clear_height):
+    pickup(robot, height=height)
+    dropdown(robot, height=height)
+
+def test_mixer_pickup(robot):
+    test_pickup(robot, height=mixer_height)
+
+def goto_default(robot):
+    robot.moveto(ref_mixer_cleantable)
+
+def transport(robot, p1, p2, height = needle_clear_height):
+    # picking up the flowcell at p1 and dropping it at p2. The robot is assumed to be empty.
+    # assuming robot is empty
+    robot.activate_gripper()
+    robot.moveto(p1)
+    pickup(robot)
+    # Z position should be the needle cleared position. Work on a copy: writing
+    # p2[2] in place edits the caller's list, so a taught position passed in
+    # (sample_table / cleaning_station) would creep upward on every transport.
+    p2 = list(p2)
+    p2[2] = p2[2]-distance_gripper_tag+height
+    robot.moveto(p2)
+    dropdown(robot)
+# Actual transport functions. These functions are used to move the flowcell between the cleaning station, mixer station, and sample table.
+# mixer head to its cleaning station. The robot is assumed to be empty.
+def mixer2cleaningstation(robot):
+    if flowcell_ID == 1:
+        cleaning_station = get_cleaningstation_position(1)
+    else:
+        cleaning_station = get_cleaningstation_position(2)
+    transport(robot, get_mixerstation_position(), cleaning_station, height=mixer_height)
+
+# mixer head to the mixer station. The robot is assumed to be empty.
+def mixer2mixingstation(robot):
+    if flowcell_ID == 1:
+        cleaning_station = get_cleaningstation_position(1)
+    else:
+        cleaning_station = get_cleaningstation_position(2)
+    transport(robot, cleaning_station, get_mixerstation_position(), height=mixer_height)
+
+# Bring the flowcell parked at the cleaning station to the beam, ready for data collection. The robot is assumed to be empty.
+# This is for measuring water background. The flowcell is not loaded with sample.
+def load_flowcell_from_cleaningstation_to_beam(robot):
+    if flowcell_ID == 1:
+        cleaning_station = get_cleaningstation_position(1)
+    else:
+        cleaning_station = get_cleaningstation_position(2)
+    transport(robot, cleaning_station, get_sampletable_position(), height=needle_clear_height)
+
+# Bring the flowcell from the beam to the cleaning station. 
+def load_flowcell_from_beam_to_cleaningstation(robot):
+    if flowcell_ID == 1:
+        cleaning_station = get_cleaningstation_position(1)
+    else:
+        cleaning_station = get_cleaningstation_position(2)
+    transport(robot, get_sampletable_position(), cleaning_station, height=needle_clear_height)
+
+# Bring the flowcell parked at the cleaning station to the mixing station, 
+# Ready to draw solution from the mixer. The robot is assumed to be empty.
+def ready_flowcell_to_draw(robot):
+    if flowcell_ID == 1:
+        cleaning_station = get_cleaningstation_position(1)
+    else:
+        cleaning_station = get_cleaningstation_position(2)
+    # draw solution and put it in the beam
+    # assuming the robot is empty.
+    robot.moveto(cleaning_station)
+    pickup(robot)
+    p2 = list(get_mixerstation_position())
+    p2[2] = p2[2]-distance_gripper_tag+needle_clear_height
+    robot.moveto(p2)
+    robot.bump(z=-1,backoff=0.002)
+
+# after drawing, the robot is holding the flowcell. Move it to the beam and drop it.
+def load_sample_to_beam(robot):
+    robot.mvr2z(needle_clear_height)
+    p2 = list(get_sampletable_position())
+    p2[2] = p2[2]-distance_gripper_tag+needle_clear_height
+    robot.moveto(p2)
+    dropdown(robot)
+
+# after data collection, pick up the flowcell from the beam and move it to the mixer to aspirate.
+def return_sample(robot):
+    # move up to the sample table height.
+    p = robot.get_pos()
+    sample_table_pos = get_sampletable_position()
+    p[2] = sample_table_pos[2]
+    robot.moveto(p)
+    # move to the sample table
+    robot.moveto(sample_table_pos)
+    robot.pickup()
+    p2 = list(get_mixerstation_position())
+    p2[2] = p2[2]-distance_gripper_tag+needle_clear_height
+    robot.moveto(p2)
+    robot.bump(z=-1,backoff=0.005)
+
+# after aspirating, move the flowcell to the cleaning station and drop it.
+def wash_flowcell_after_return(robot):
+    if flowcell_ID == 1:
+        cleaning_station = get_cleaningstation_position(1)
+    else:
+        cleaning_station = get_cleaningstation_position(2)
+    robot.mvr2z(needle_clear_height)
+    robot.moveto(cleaning_station)
+    dropdown(robot, height=mixer_height)
+
+## Configuration functions. These functions are used to locate the positions of the sample table and cleaning station using AprilTags.
+def locate_apriltag(robot, pos = ''):
+    # Record the taught position of a station. Returns the pose it found, and
+    # also stores it in sample_table / cleaning_station.
+    global sample_table, cleaning_station1, cleaning_station2, mixer_cleaning_station, mixer_station
+    ref_pos = []
+    if pos == 'sample_table':
+        ref_pos = ref_sampletable
+    if pos == 'cleaning_station':
+        ref_pos = ref_cleanstation
+    if pos == 'mixer_cleaning_station':
+        ref_pos = ref_mixer_cleantable
+    if pos == 'mixer_station':
+        ref_pos = ref_mixer_cleantable
+    print(f"Looking for {pos} ....")
+    if len(ref_pos)==0:
+        ref_pos = ref_sampletable
+    camera_tools.search_apriltag_by_tilt(robot, ref_pos=ref_pos)
+    robot.put_tcp2camera()
+
+    robot.grab()
+    robot.bump(z=-1,backoff=distance_gripper_tag)
+    robot.set_tcp(robot.tcp)
+    p = robot.get_pose()
+    v = p.get_pose_vector().tolist()
+    if pos == 'sample_table':
+        set_sampletable_position(v)
+    if pos == 'cleaning_station':
+        if flowcell_ID == 1:
+            set_cleaningstation_position(1, v)
+        else:
+            set_cleaningstation_position(2, v)
+    if pos == 'mixer_cleaning_station':
+        set_mixer_cleaningstation_position(v)
+    if pos == 'mixer_station':
+        set_mixerstation_position(v)
+    return v

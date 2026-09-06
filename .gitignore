@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# runtime artifacts, not source
+*.log
+palmixer/waypoints.ini
+
+# local tooling state
+.claude/

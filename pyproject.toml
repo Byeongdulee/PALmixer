@@ -1,0 +1,21 @@
+[project]
+name = "palmixer"
+version = "0.1.0"
+description = "Control package for the APS 12-ID-B PALmixer flowcell workflow (UR3 robot + EPICS motor + pump), with a PyQt5 GUI, ZMQ control plane, and MQTT status reporting."
+authors = [
+    {name = "Byeongdu Lee", email = "blee@anl.gov"},
+]
+dependencies = [
+    "pyzmq",
+    "paho-mqtt>=2.0",
+    "pyqt5",
+    "requests",
+    "pyepics",
+]
+requires-python = ">=3.8.1"
+readme = "README.md"
+license = {text = "MIT"}
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
