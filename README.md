@@ -61,6 +61,24 @@ An MQTT broker (e.g. `mosquitto`) reachable at the configured host/port is
 needed for the status log to populate; ZMQ command/reply works without one
 (MQTT publishing fails open -- it never blocks or breaks control).
 
+### On Windows
+
+`UR_12idb` is not installed in the environment, so point `PALmixer` at a
+checkout of it:
+
+```powershell
+$env:PALMIXER_UR12IDB_PATH = 'C:\path\to\UR_12idb'
+```
+
+Activating the environment (rather than invoking `...\envs\aps12robot\python.exe`
+by path) is still the right thing to do, but it is no longer load-bearing:
+`palmixer/_winenv.py` puts `<env>\Library\bin` back on `PATH` at import if
+activation did not. Without that, conda-forge's MKL-linked numpy dies at its
+first `np.linalg.inv()` with a delay-load failure (`0xC06D007F`) that kills the
+process with no traceback -- which in practice meant the server vanishing
+part-way through an AprilTag search, since `urx`'s `get_pose()` is what reaches
+that call. See the docstring in `_winenv.py`.
+
 ## Command vocabulary (ZMQ)
 
 | Command | Path | Effect |
