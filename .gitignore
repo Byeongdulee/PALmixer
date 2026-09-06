@@ -11,3 +11,6 @@ palmixer/palmixer_state.ini
 
 # local tooling state
 .claude/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
