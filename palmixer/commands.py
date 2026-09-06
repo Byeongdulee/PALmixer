@@ -12,7 +12,15 @@ strings, one request -> one reply.
     "<transport_name>"                    -> "ACCEPTED" | "ERROR: <reason>"
     "motor_tweak forward|reverse <step>"  -> "ACCEPTED" | "ERROR: <reason>"
     "pump <op>"                           -> "ACCEPTED" | "ERROR: <reason>"
+    "make_sample <slot>"                  -> "ACCEPTED" | "ERROR: <reason>"
+    "unload_sample"                       -> "ACCEPTED" | "ERROR: <reason>"
+    "set_flowcell <1|2>"                  -> "OK" | "ERROR: <reason>"
+    "get_state"                           -> "<JSON snapshot>"
+    "set_location <what> <value>"         -> "OK" | "ERROR: <reason>"
+    "teach_carousel_slot <n>"             -> "OK" | "ERROR: <reason>"
 """
+
+from . import state as _state
 
 STATUS = "status"
 
@@ -73,12 +81,14 @@ PUMP_MIX = "mix"
 PUMP_CLEAN_MIXER = "clean_mixer"
 PUMP_DRAW_TO_FLOWCELL = "draw_to_flowcell"
 PUMP_ASPIRATE_FROM_FLOWCELL = "aspirate_from_flowcell"
+PUMP_WASH_FLOWCELL = "wash_flowcell"
 
 PUMP_OPS = (
     PUMP_MIX,
     PUMP_CLEAN_MIXER,
     PUMP_DRAW_TO_FLOWCELL,
     PUMP_ASPIRATE_FROM_FLOWCELL,
+    PUMP_WASH_FLOWCELL,
 )
 
 PUMP_LABELS = {
@@ -86,7 +96,27 @@ PUMP_LABELS = {
     PUMP_CLEAN_MIXER: "Clean Mixer",
     PUMP_DRAW_TO_FLOWCELL: "Draw to Flowcell",
     PUMP_ASPIRATE_FROM_FLOWCELL: "Aspirate from Flowcell",
+    PUMP_WASH_FLOWCELL: "Wash Flowcell",
 }
+
+# -- automation workflows (make a full sample / unload a sample) -----------
+MAKE_SAMPLE = "make_sample"
+UNLOAD_SAMPLE = "unload_sample"
+
+# -- tracking / state commands ----------------------------------------------
+SET_FLOWCELL = "set_flowcell"
+GET_STATE = "get_state"
+SET_LOCATION = "set_location"
+TEACH_CAROUSEL_SLOT = "teach_carousel_slot"
+
+FLOWCELL_IDS = _state.FLOWCELL_IDS               # (1, 2)
+LOCATION_KEYS = _state.LOCATION_KEYS             # mixer_head, flowcell_1, flowcell_2
+MIXER_LOCATIONS = _state.MIXER_LOCATIONS
+FC_LOCATIONS = _state.FC_LOCATIONS
+UNKNOWN = _state.UNKNOWN
+WHAT_MIXER_HEAD = _state.WHAT_MIXER_HEAD
+WHAT_FLOWCELL_1 = _state.WHAT_FLOWCELL_1
+WHAT_FLOWCELL_2 = _state.WHAT_FLOWCELL_2
 
 
 def search_apriltag_command(station):
@@ -102,3 +132,33 @@ def motor_tweak_command(direction, step):
 def pump_command(op):
     """Build the wire command for a pump operation."""
     return "%s %s" % (PUMP, op)
+
+
+def make_sample_command(slot):
+    """Build the wire command to run the full make-a-sample sequence."""
+    return "%s %s" % (MAKE_SAMPLE, slot)
+
+
+def unload_sample_command():
+    """Build the wire command to run the full unload-sample sequence."""
+    return UNLOAD_SAMPLE
+
+
+def set_flowcell_command(flowcell_id):
+    """Build the wire command to change which flowcell is in use."""
+    return "%s %s" % (SET_FLOWCELL, flowcell_id)
+
+
+def get_state_command():
+    """Build the wire command to fetch the tracking state snapshot."""
+    return GET_STATE
+
+
+def set_location_command(what, location):
+    """Build the wire command to reconcile a tracked item to ``location``."""
+    return "%s %s %s" % (SET_LOCATION, what, location)
+
+
+def teach_carousel_slot_command(slot):
+    """Build the wire command to record the current motor position as ``slot``."""
+    return "%s %s" % (TEACH_CAROUSEL_SLOT, slot)

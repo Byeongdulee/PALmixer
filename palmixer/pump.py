@@ -4,14 +4,19 @@
 No real pump control package exists yet for the PALmixer mixer/flowcell
 plumbing. This stub gives the server and GUI a stable interface to code
 against now; swap the body of each method for a real driver later (a
-Tricontinent-style Z-pipet driver such as UR_12idb/common/tc_pipet.py, or a
 dedicated ZMQ/serial pump service) without touching server.py or the GUI.
 
 Every operation returns ``(ok: bool, detail: str)`` and is expected to take a
 little real time, so callers (server.py's worker thread) see it as a genuine
 blocking action -- just like a real pump move would be.
+
+All operations serialize on a single lock. This is what makes it safe for a
+workflow to fire ``clean_mixer()`` on a daemon thread and move on without
+waiting for it: a later call (e.g. ``draw_to_flowcell()``) simply blocks on
+the lock until the clean finishes, so two pump ops never run concurrently.
 """
 
+import threading
 import time
 
 PUMP_ACTION_DURATION_S = 1.0  # placeholder "how long the pump pretends to run"
@@ -27,6 +32,7 @@ class Pump:
     def __init__(self, **kwargs):
         # A real driver would take connection info here (serial port, host:port, ...).
         self._initialized = False
+        self._lock = threading.Lock()
 
     def initialize(self):
         print("PLACEHOLDER Pump: initialize() -- no hardware connected.")
@@ -49,8 +55,13 @@ class Pump:
         """Aspirate solution back out of the flowcell."""
         return self._do("aspirate_from_flowcell")
 
+    def wash_flowcell(self):
+        """Wash the flowcell after a sample has been returned to it."""
+        return self._do("wash_flowcell")
+
     def _do(self, op):
-        print("PLACEHOLDER Pump: running %r ..." % op)
-        time.sleep(PUMP_ACTION_DURATION_S)
-        print("PLACEHOLDER Pump: %r complete." % op)
-        return True, "%s complete (placeholder, no hardware)" % op
+        with self._lock:
+            print("PLACEHOLDER Pump: running %r ..." % op)
+            time.sleep(PUMP_ACTION_DURATION_S)
+            print("PLACEHOLDER Pump: %r complete." % op)
+            return True, "%s complete (placeholder, no hardware)" % op

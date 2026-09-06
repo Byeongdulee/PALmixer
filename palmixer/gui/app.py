@@ -14,6 +14,7 @@ Both the ZMQ reply and the MQTT callback arrive on background threads; both
 are marshaled onto the Qt main thread via signals before touching any widget.
 """
 
+import json
 import sys
 import threading
 
@@ -26,10 +27,11 @@ from PyQt5.QtWidgets import (
 
 from .. import commands as cmd
 from .. import config
-from ..mqtt_status import MQTTSubscriber, motion_topic, state_topic
+from ..mqtt_status import MQTTSubscriber, motion_topic, state_topic, tracking_topic
 from ..zmq_transport import ZMQClient
 from .config_tab import ConfigTab
 from .experiment_tab import ExperimentTab
+from .workflow_tab import WorkflowTab
 
 STATUS_POLL_INTERVAL_MS = 3000
 
@@ -45,6 +47,7 @@ class MainWindow(QMainWindow):
     _status_polled = pyqtSignal(str)        # "IDLE" / "BUSY" / "" (poll failed)
     _mqtt_state = pyqtSignal(dict)          # decoded state payload
     _mqtt_motion = pyqtSignal(dict)         # decoded motion payload
+    _tracking_updated = pyqtSignal(dict)    # state.snapshot() dict, from poll or MQTT
 
     def __init__(self):
         super().__init__()
@@ -70,19 +73,29 @@ class MainWindow(QMainWindow):
         central = QWidget()
         layout = QVBoxLayout()
 
+        # Built before the tabs (though added to the layout after them, so it
+        # still renders underneath): it creates self.log_list, which
+        # send_command() writes to. A tab that sends a command while being
+        # constructed would otherwise raise inside a Qt slot, which PyQt turns
+        # into a hard abort rather than a catchable exception.
+        status_panel = self._build_status_panel()
+
         self.tabs = QTabWidget()
         self.config_tab = ConfigTab(robot_ip, self.send_command)
         self.experiment_tab = ExperimentTab(self.send_command)
+        self.workflow_tab = WorkflowTab(self.send_command)
         self.tabs.addTab(self.config_tab, "Configuration")
         self.tabs.addTab(self.experiment_tab, "Experiment")
+        self.tabs.addTab(self.workflow_tab, "Automation")
         layout.addWidget(self.tabs, stretch=1)
 
-        layout.addWidget(self._build_status_panel())
+        layout.addWidget(status_panel)
 
         central.setLayout(layout)
         self.setCentralWidget(central)
 
-        self._busy_widgets = self.config_tab.busy_widgets + self.experiment_tab.busy_widgets
+        self._busy_widgets = (self.config_tab.busy_widgets + self.experiment_tab.busy_widgets
+                               + self.workflow_tab.busy_widgets)
 
     def _build_status_panel(self):
         box = QGroupBox("Status")
@@ -108,6 +121,7 @@ class MainWindow(QMainWindow):
         self._status_polled.connect(self._on_status_polled)
         self._mqtt_state.connect(self._on_mqtt_state)
         self._mqtt_motion.connect(self._on_mqtt_motion)
+        self._tracking_updated.connect(self.workflow_tab.update_state)
 
     # -- ZMQ (command sending) ------------------------------------------------
     def send_command(self, command):
@@ -130,6 +144,12 @@ class MainWindow(QMainWindow):
 
     def _poll_status_worker(self):
         self._status_polled.emit(self.client.status())
+        try:
+            reply = self.client.send(cmd.get_state_command(), timeout_ms=5000)
+            snapshot = json.loads(reply)
+        except Exception:
+            return
+        self._tracking_updated.emit(snapshot)
 
     def _on_status_polled(self, state):
         if state:
@@ -142,6 +162,7 @@ class MainWindow(QMainWindow):
                                         client_id_prefix="palmixer-gui")
         self.mqtt_sub.subscribe(state_topic(self._beamline), self._on_mqtt_state_raw, qos=0)
         self.mqtt_sub.subscribe(motion_topic(self._beamline), self._on_mqtt_motion_raw, qos=1)
+        self.mqtt_sub.subscribe(tracking_topic(self._beamline), self._on_mqtt_tracking_raw, qos=0)
         self.mqtt_sub.start()
 
     # These run on paho's background thread -- only emit signals here, no widgets.
@@ -152,6 +173,10 @@ class MainWindow(QMainWindow):
     def _on_mqtt_motion_raw(self, topic, payload):
         if isinstance(payload, dict):
             self._mqtt_motion.emit(payload)
+
+    def _on_mqtt_tracking_raw(self, topic, payload):
+        if isinstance(payload, dict):
+            self._tracking_updated.emit(payload)
 
     def _on_mqtt_state(self, payload):
         self._set_busy(str(payload.get("state", "")).upper() == "BUSY")

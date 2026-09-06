@@ -13,18 +13,22 @@ Run directly:
 """
 
 import argparse
+import json
 import sys
 import threading
 import time
 
 from . import commands as cmd
 from . import config
+from . import state
 from .mqtt_status import (
     MQTTPublisher, PHASE_FAILURE, PHASE_STARTED, PHASE_SUCCESS,
     motion_payload, motion_topic, new_trace, state_payload, state_topic,
+    tracking_topic,
 )
 from .pump import Pump
 from .motor import Motor
+from .workflows import Workflows, WorkflowError
 from .zmq_transport import ZMQCommandServer
 
 STATE_IDLE = "IDLE"
@@ -42,6 +46,7 @@ class PALmixerServer:
         self._busy_lock = threading.Lock()
         self._busy = False
         self._current_action = None
+        self._current_trace = None  # trace id of the action running now, for _publish_step
 
         self._mqtt = MQTTPublisher(
             host=cfg["mqtt"].get("host"), port=cfg["mqtt"].get("port"),
@@ -66,6 +71,10 @@ class PALmixerServer:
         else:
             print("PALmixerServer: --simulate mode, no hardware will be touched.")
 
+        self.workflows = Workflows(self.PAL12idb, self.rob, self.pump, self.motor,
+                                    on_step=self._publish_step, simulate=self.simulate)
+        state.add_listener(self._publish_tracking)
+
         self.zmq_server = ZMQCommandServer(
             dispatch_fn=self.dispatch,
             fast_dispatch_fn=self.fast_dispatch,
@@ -74,15 +83,79 @@ class PALmixerServer:
 
     # -- status ------------------------------------------------------------
     def fast_dispatch(self, msg):
-        """Read-only commands, answered without touching hardware. Returns
-        None for anything else so it falls through to dispatch()."""
-        if msg.strip() == cmd.STATUS:
+        """Read-only commands, answered without touching hardware -- including
+        while a multi-minute workflow is running, since the ZMQ REP socket is
+        strictly one-in-flight and dispatch() occupies it for the duration.
+        Returns None for anything else so it falls through to dispatch()."""
+        parts = msg.strip().split()
+        if not parts:
+            return None
+        name, args = parts[0], parts[1:]
+
+        if name == cmd.STATUS:
             return STATE_BUSY if self._busy else STATE_IDLE
+
+        if name == cmd.GET_STATE:
+            return json.dumps(state.snapshot())
+
+        if name == cmd.SET_FLOWCELL:
+            if len(args) != 1:
+                return "ERROR: usage: %s <%s>" % (
+                    cmd.SET_FLOWCELL, "|".join(str(i) for i in cmd.FLOWCELL_IDS))
+            try:
+                fc = int(args[0])
+            except ValueError:
+                return "ERROR: flowcell id must be an integer, got %r" % args[0]
+            if fc not in cmd.FLOWCELL_IDS:
+                return "ERROR: flowcell id must be one of %s" % (list(cmd.FLOWCELL_IDS),)
+            if self.PAL12idb is not None:
+                self.PAL12idb.set_flowcell_ID(fc)
+            state.set_flowcell_in_use(fc)
+            return "OK"
+
+        if name == cmd.SET_LOCATION:
+            if len(args) != 2 or args[0] not in cmd.LOCATION_KEYS:
+                return "ERROR: usage: %s <%s> <value>" % (
+                    cmd.SET_LOCATION, "|".join(cmd.LOCATION_KEYS))
+            what, value = args
+            try:
+                state.set_location(what, value)
+            except ValueError as e:
+                return "ERROR: %s" % e
+            return "OK"
+
+        if name == cmd.TEACH_CAROUSEL_SLOT:
+            if len(args) != 1:
+                return "ERROR: usage: %s <slot>" % cmd.TEACH_CAROUSEL_SLOT
+            try:
+                slot = int(args[0])
+            except ValueError:
+                return "ERROR: slot must be an integer, got %r" % args[0]
+            if self.simulate:
+                position = float(slot)  # arbitrary, distinct per slot; no real motor to read
+            else:
+                try:
+                    position = self.motor.read()
+                except Exception as e:
+                    return "ERROR: could not read motor position: %s" % e
+            state.teach_carousel_slot(slot, position)
+            return "OK"
+
         return None
 
-    def _publish_state(self, state, action=None):
-        self._mqtt.publish(state_topic(self._beamline), state_payload(state, action),
+    def _publish_state(self, state_value, action=None):
+        self._mqtt.publish(state_topic(self._beamline), state_payload(state_value, action),
                             qos=0, retain=True)
+
+    def _publish_step(self, step, phase, detail=""):
+        """Wired as Workflows' on_step: one motion message per workflow step,
+        correlated to the parent make_sample/unload_sample action by trace id."""
+        self._mqtt.publish(motion_topic(self._beamline),
+                            motion_payload(step, phase, phase != PHASE_FAILURE,
+                                           detail=detail, trace=self._current_trace))
+
+    def _publish_tracking(self, snapshot):
+        self._mqtt.publish(tracking_topic(self._beamline), snapshot, qos=0, retain=True)
 
     # -- command dispatch ----------------------------------------------------
     def dispatch(self, msg):
@@ -109,6 +182,7 @@ class PALmixerServer:
             self._current_action = action_label
 
         trace = new_trace()
+        self._current_trace = trace
         self._publish_state(STATE_BUSY, action_label)
         self._mqtt.publish(motion_topic(self._beamline),
                             motion_payload(action_label, PHASE_STARTED, True, trace=trace))
@@ -152,6 +226,29 @@ class PALmixerServer:
             label = "%s %s" % (cmd.PUMP, op)
             return (lambda: self._run_pump(op)), label
 
+        if name == cmd.MAKE_SAMPLE:
+            if len(args) != 1:
+                raise ValueError("usage: %s <slot>" % cmd.MAKE_SAMPLE)
+            try:
+                slot = int(args[0])
+            except ValueError:
+                raise ValueError("slot must be an integer, got %r" % args[0])
+            try:
+                self.workflows._check_make_sample(slot)
+            except WorkflowError as e:
+                raise ValueError(str(e))
+            label = "%s %s" % (cmd.MAKE_SAMPLE, slot)
+            return (lambda: self.workflows.make_sample(slot)), label
+
+        if name == cmd.UNLOAD_SAMPLE:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.UNLOAD_SAMPLE)
+            try:
+                self.workflows._check_unload_sample()
+            except WorkflowError as e:
+                raise ValueError(str(e))
+            return (lambda: self.workflows.unload_sample()), cmd.UNLOAD_SAMPLE
+
         raise ValueError("unknown command %r" % name)
 
     def _run_action(self, action_fn, action_label, trace):
@@ -171,6 +268,7 @@ class PALmixerServer:
             with self._busy_lock:
                 self._busy = False
                 self._current_action = None
+            self._current_trace = None
             self._publish_state(STATE_IDLE)
 
     # -- individual actions --------------------------------------------------
@@ -204,6 +302,7 @@ class PALmixerServer:
     # -- lifecycle ------------------------------------------------------------
     def start(self):
         self._publish_state(STATE_IDLE)
+        self._publish_tracking(state.snapshot())
         self.zmq_server.start()
 
     def stop(self):

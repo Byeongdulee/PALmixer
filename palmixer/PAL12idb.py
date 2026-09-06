@@ -1,7 +1,14 @@
 import configparser
+import functools
 import os
 
 import camera_tools
+
+try:
+    from . import state
+except ImportError:
+    import state
+
 ref_mixer_cleantable = [0.4, 0.1, 0.1, 2.231, -2.212, 0]
 ref_cleanstation = [0.38, -0.16, -0.1, 2.231, -2.212, 0]
 ref_sampletable = [-0.22, -0.37, 0.12, -2.18860535, 2.25379435, 0]
@@ -17,13 +24,20 @@ mixer_station = []
 needle_clear_height = 0.20
 mixer_height = 0.05
 grab_depth = 0.01
-flowcell_ID = 1
+flowcell_ID = state.get_flowcell_in_use()
 from epics import caget, caput
 sampletableID = 1
 cleaningstationID1 = 2
 cleaningstationID2 = 3
 mixerstationID = 4
 mixer_cleaningstationID = 5
+
+
+def set_flowcell_ID(n):
+    """Change which flowcell (1 or 2) the transport functions act on."""
+    global flowcell_ID
+    flowcell_ID = int(n)
+    state.set_flowcell_in_use(flowcell_ID)
 
 _POSITION_FIELDS = ('X', 'Y', 'Z', 'RX', 'RY', 'RZ')
 
@@ -186,25 +200,53 @@ def transport(robot, p1, p2, height = needle_clear_height):
     p2[2] = p2[2]-distance_gripper_tag+height
     robot.moveto(p2)
     dropdown(robot)
+# State tracking. Every transport function below is wrapped with @_tracks so
+# that wherever it is called from -- a workflow or a single button on the
+# Experiment tab -- the tracked location is updated the same way. The state
+# is recorded only after the motion returns; if it raises, the tracked item
+# is set to state.UNKNOWN instead, since a motion that failed partway leaves
+# the hardware in a position nobody actually knows.
+def _tracks(get_setter, value):
+    """Decorator: record `value` via get_setter()'s setter on success, else UNKNOWN.
+
+    `get_setter` is called at call-time, not decoration time, so it can look
+    at module state (like the current flowcell_ID) as of the moment the
+    transport function actually runs.
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            setter = get_setter()
+            try:
+                result = fn(*args, **kwargs)
+            except Exception:
+                setter(state.UNKNOWN)
+                raise
+            setter(value)
+            return result
+        return wrapper
+    return decorator
+
+
+def _flowcell_setter():
+    fc = flowcell_ID
+    return lambda location: state.set_flowcell_location(fc, location)
+
+
 # Actual transport functions. These functions are used to move the flowcell between the cleaning station, mixer station, and sample table.
 # mixer head to its cleaning station. The robot is assumed to be empty.
+@_tracks(lambda: state.set_mixer_head, state.MIXER_AT_CLEANING)
 def mixer2cleaningstation(robot):
-    if flowcell_ID == 1:
-        cleaning_station = get_cleaningstation_position(1)
-    else:
-        cleaning_station = get_cleaningstation_position(2)
-    transport(robot, get_mixerstation_position(), cleaning_station, height=mixer_height)
+    transport(robot, get_mixerstation_position(), get_mixer_cleaningstation_position(), height=mixer_height)
 
 # mixer head to the mixer station. The robot is assumed to be empty.
+@_tracks(lambda: state.set_mixer_head, state.MIXER_AT_MIXER)
 def mixer2mixingstation(robot):
-    if flowcell_ID == 1:
-        cleaning_station = get_cleaningstation_position(1)
-    else:
-        cleaning_station = get_cleaningstation_position(2)
-    transport(robot, cleaning_station, get_mixerstation_position(), height=mixer_height)
+    transport(robot, get_mixer_cleaningstation_position(), get_mixerstation_position(), height=mixer_height)
 
 # Bring the flowcell parked at the cleaning station to the beam, ready for data collection. The robot is assumed to be empty.
 # This is for measuring water background. The flowcell is not loaded with sample.
+@_tracks(_flowcell_setter, state.FC_AT_BEAM)
 def load_flowcell_from_cleaningstation_to_beam(robot):
     if flowcell_ID == 1:
         cleaning_station = get_cleaningstation_position(1)
@@ -212,7 +254,8 @@ def load_flowcell_from_cleaningstation_to_beam(robot):
         cleaning_station = get_cleaningstation_position(2)
     transport(robot, cleaning_station, get_sampletable_position(), height=needle_clear_height)
 
-# Bring the flowcell from the beam to the cleaning station. 
+# Bring the flowcell from the beam to the cleaning station.
+@_tracks(_flowcell_setter, state.FC_AT_CLEANING)
 def load_flowcell_from_beam_to_cleaningstation(robot):
     if flowcell_ID == 1:
         cleaning_station = get_cleaningstation_position(1)
@@ -220,8 +263,9 @@ def load_flowcell_from_beam_to_cleaningstation(robot):
         cleaning_station = get_cleaningstation_position(2)
     transport(robot, get_sampletable_position(), cleaning_station, height=needle_clear_height)
 
-# Bring the flowcell parked at the cleaning station to the mixing station, 
+# Bring the flowcell parked at the cleaning station to the mixing station,
 # Ready to draw solution from the mixer. The robot is assumed to be empty.
+@_tracks(_flowcell_setter, state.FC_IN_GRIPPER)
 def ready_flowcell_to_draw(robot):
     if flowcell_ID == 1:
         cleaning_station = get_cleaningstation_position(1)
@@ -237,6 +281,7 @@ def ready_flowcell_to_draw(robot):
     robot.bump(z=-1,backoff=0.002)
 
 # after drawing, the robot is holding the flowcell. Move it to the beam and drop it.
+@_tracks(_flowcell_setter, state.FC_AT_BEAM)
 def load_sample_to_beam(robot):
     robot.mvr2z(needle_clear_height)
     p2 = list(get_sampletable_position())
@@ -245,6 +290,7 @@ def load_sample_to_beam(robot):
     dropdown(robot)
 
 # after data collection, pick up the flowcell from the beam and move it to the mixer to aspirate.
+@_tracks(_flowcell_setter, state.FC_IN_GRIPPER)
 def return_sample(robot):
     # move up to the sample table height.
     p = robot.get_pos()
@@ -253,13 +299,14 @@ def return_sample(robot):
     robot.moveto(p)
     # move to the sample table
     robot.moveto(sample_table_pos)
-    robot.pickup()
+    pickup(robot)
     p2 = list(get_mixerstation_position())
     p2[2] = p2[2]-distance_gripper_tag+needle_clear_height
     robot.moveto(p2)
     robot.bump(z=-1,backoff=0.005)
 
 # after aspirating, move the flowcell to the cleaning station and drop it.
+@_tracks(_flowcell_setter, state.FC_AT_CLEANING)
 def wash_flowcell_after_return(robot):
     if flowcell_ID == 1:
         cleaning_station = get_cleaningstation_position(1)
@@ -268,6 +315,16 @@ def wash_flowcell_after_return(robot):
     robot.mvr2z(needle_clear_height)
     robot.moveto(cleaning_station)
     dropdown(robot, height=mixer_height)
+
+# after washing, raise the robot to the sample table's height so it is clear
+# of the cleaning station before the next command moves it elsewhere. Uses the
+# full 6-element pose rather than robot.get_pos() (which is position only, and
+# which moveto() would have to backfill the orientation for) so the pose sent
+# is explicit here rather than reconstructed inside moveto().
+def raise_to_sampletable_height(robot):
+    p = robot.get_pose().get_pose_vector().tolist()
+    p[2] = get_sampletable_position()[2]
+    robot.moveto(p)
 
 ## Configuration functions. These functions are used to locate the positions of the sample table and cleaning station using AprilTags.
 def locate_apriltag(robot, pos = ''):

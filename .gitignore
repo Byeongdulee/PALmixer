@@ -7,6 +7,7 @@ dist/
 # runtime artifacts, not source
 *.log
 palmixer/waypoints.ini
+palmixer/palmixer_state.ini
 
 # local tooling state
 .claude/

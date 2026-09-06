@@ -9,8 +9,9 @@ raising.
 
 Topic scheme, under the shared "aps12/<beamline>/..." root:
 
-    aps12/<beamline>/palmixer/state    QoS 0, retained  -- {"state": "IDLE"|"BUSY", ...}
-    aps12/<beamline>/palmixer/motion   QoS 1             -- one message per phase of a command
+    aps12/<beamline>/palmixer/state     QoS 0, retained  -- {"state": "IDLE"|"BUSY", ...}
+    aps12/<beamline>/palmixer/motion    QoS 1             -- one message per phase of a command
+    aps12/<beamline>/palmixer/tracking  QoS 0, retained  -- state.snapshot(), on every change
 
 Motion payload:
     {
@@ -55,6 +56,10 @@ def state_topic(beamline):
 
 def motion_topic(beamline):
     return _topic(beamline, "palmixer", "motion")
+
+
+def tracking_topic(beamline):
+    return _topic(beamline, "palmixer", "tracking")
 
 
 def motion_payload(action, phase, ok, detail="", trace=None):

@@ -73,3 +73,14 @@ class Motor:
             self._caput("TWR", 1)
         self.wait_done(timeout=timeout)
         return self.read()
+
+    def move_to(self, position, timeout=120.0):
+        """Move to an absolute position (.VAL), wait for .DMOV, return .RBV.
+
+        Used for the carousel, which is taught as slot -> absolute position
+        rather than moved with relative tweaks like the Experiment tab's
+        forward/reverse buttons.
+        """
+        self._caput("VAL", float(position))
+        self.wait_done(timeout=timeout)
+        return self.read()
