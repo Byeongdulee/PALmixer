@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """Configuration tab: live camera view + AprilTag search buttons.
 
-Each button sends a ``search_apriltag <station>`` command over ZMQ to the
-PALmixer server, which drives the robot to look for the station's AprilTag
-(PAL12idb.locate_apriltag). The server replies "ACCEPTED" immediately and the
-outcome shows up in the shared MQTT status log.
+Each search button sends a ``search_apriltag <station>`` command over ZMQ to
+the PALmixer server, which drives the robot to look for the station's
+AprilTag (PAL12idb.locate_apriltag). The server replies "ACCEPTED"
+immediately and the outcome shows up in the shared MQTT status log.
+
+"Stop Search" sends ``stop_search``, a fast command the server answers even
+while busy (see server.py's fast_dispatch) -- it is deliberately left out of
+busy_widgets so it stays enabled for exactly the window where it is useful.
 """
 
 from PyQt5.QtWidgets import QGroupBox, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
@@ -30,6 +34,13 @@ class ConfigTab(QWidget):
             btn.clicked.connect(lambda _checked, s=station: self._on_search(s))
             button_layout.addWidget(btn)
             self.station_buttons.append(btn)
+        self.stop_search_button = QPushButton("Stop Search")
+        self.stop_search_button.setStyleSheet("color: darkred; font-weight: bold;")
+        self.stop_search_button.setToolTip(
+            "Abort an in-progress AprilTag search and stop the robot immediately.")
+        self.stop_search_button.clicked.connect(
+            lambda: self._send_command(cmd.stop_search_command()))
+        button_layout.addWidget(self.stop_search_button)
         button_box.setLayout(button_layout)
 
         layout = QVBoxLayout()

@@ -47,6 +47,7 @@ class PALmixerServer:
         self._busy = False
         self._current_action = None
         self._current_trace = None  # trace id of the action running now, for _publish_step
+        self._search_stop_event = None  # set while a search_apriltag action is running
 
         self._mqtt = MQTTPublisher(
             host=cfg["mqtt"].get("host"), port=cfg["mqtt"].get("port"),
@@ -97,6 +98,9 @@ class PALmixerServer:
 
         if name == cmd.GET_STATE:
             return json.dumps(state.snapshot())
+
+        if name == cmd.STOP_SEARCH:
+            return self._stop_search()
 
         if name == cmd.SET_FLOWCELL:
             if len(args) != 1:
@@ -201,6 +205,9 @@ class PALmixerServer:
                 raise ValueError("usage: %s <%s>" % (cmd.SEARCH_APRILTAG, "|".join(cmd.STATIONS)))
             station = args[0]
             label = "%s %s" % (cmd.SEARCH_APRILTAG, station)
+            # Created here (on the synchronous reply path, before ACCEPTED is
+            # sent) so a stop_search sent right after is guaranteed to find it.
+            self._search_stop_event = threading.Event()
             return (lambda: self._search_apriltag(station)), label
 
         if name in (cmd.PUSH_POSITIONS, cmd.PULL_POSITIONS):
@@ -295,11 +302,37 @@ class PALmixerServer:
             self._publish_state(STATE_IDLE)
 
     # -- individual actions --------------------------------------------------
+    def _stop_search(self):
+        """Abort an in-progress search_apriltag: sets the cooperative stop
+        event the search loop polls between moves, and -- the part that
+        actually matters for how quickly it stops -- tells the robot
+        controller to halt whatever move is in flight right now, rather than
+        waiting for that move to finish on its own."""
+        if (self._current_action is None
+                or not self._current_action.startswith(cmd.SEARCH_APRILTAG + " ")):
+            return "ERROR: no AprilTag search is running"
+        event = self._search_stop_event
+        if event is not None:
+            event.set()
+        if not self.simulate and self.rob is not None:
+            try:
+                self.rob.robot.stopj()
+            except Exception as e:
+                return "ERROR: failed to stop robot: %s" % e
+        return "OK"
+
     def _search_apriltag(self, station):
         if self.simulate:
-            time.sleep(2)
+            # Sleep in small slices so a stop_search sent during a --simulate
+            # run is also honored, instead of only being useful against real
+            # hardware.
+            event = self._search_stop_event
+            for _ in range(20):
+                if event is not None and event.is_set():
+                    raise RuntimeError("AprilTag search for %s was stopped by the operator" % station)
+                time.sleep(0.1)
             return "simulated AprilTag search for %s" % station
-        pos = self.PAL12idb.locate_apriltag(self.rob, pos=station)
+        pos = self.PAL12idb.locate_apriltag(self.rob, pos=station, stop_event=self._search_stop_event)
         return "found %s at %s" % (station, pos)
 
     def _sync_positions(self, name):

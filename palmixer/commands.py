@@ -9,6 +9,7 @@ strings, one request -> one reply.
 
     "status"                              -> "IDLE" | "BUSY"
     "search_apriltag <station>"           -> "ACCEPTED" | "ERROR: <reason>"
+    "stop_search"                         -> "OK" | "ERROR: <reason>"
     "<transport_name>"                    -> "ACCEPTED" | "ERROR: <reason>"
     "motor_tweak forward|reverse <step>"  -> "ACCEPTED" | "ERROR: <reason>"
     "pump <op>"                           -> "ACCEPTED" | "ERROR: <reason>"
@@ -46,6 +47,7 @@ STATION_LABELS = {
 }
 
 SEARCH_APRILTAG = "search_apriltag"
+STOP_SEARCH = "stop_search"
 
 # Explicit sync between waypoints.ini (which every move reads) and the
 # 12idUR:WaypointL:* EPICS PVs (the beamline-wide interchange). These are the
@@ -141,6 +143,11 @@ def position_not_configured_error(missing_labels):
 def search_apriltag_command(station):
     """Build the wire command for searching a station's AprilTag."""
     return "%s %s" % (SEARCH_APRILTAG, station)
+
+
+def stop_search_command():
+    """Build the wire command to abort an in-progress AprilTag search."""
+    return STOP_SEARCH
 
 
 def push_positions_command():

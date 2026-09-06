@@ -67,6 +67,7 @@ needed for the status log to populate; ZMQ command/reply works without one
 |---|---|---|
 | `status` | fast | `IDLE` or `BUSY` |
 | `search_apriltag <station>` | worker | Locate a station's AprilTag (`sample_table`, `cleaning_station`, `mixer_station`, `mixer_cleaning_station`) and record its position |
+| `stop_search` | fast | Abort an in-progress `search_apriltag`: stops the robot immediately (`stopj`) and signals the search loop to give up rather than continue to the next tilt/step. `ERROR: no AprilTag search is running` if nothing is searching |
 | `push_positions` / `pull_positions` | worker | Sync taught positions with the EPICS waypoint PVs (see below) |
 | `mixer2cleaningstation` etc. (8 names) | worker | Run the matching `PAL12idb` transport function |
 | `motor_tweak forward\|reverse <step>` | worker | Tweak `12idb:m6` by `step` |

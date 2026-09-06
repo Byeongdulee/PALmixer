@@ -447,9 +447,11 @@ def raise_to_sampletable_height(robot):
     robot.moveto(p)
 
 ## Configuration functions. These functions are used to locate the positions of the sample table and cleaning station using AprilTags.
-def locate_apriltag(robot, pos = ''):
+def locate_apriltag(robot, pos = '', stop_event=None):
     # Record the taught position of a station. Returns the pose it found, and
-    # also stores it in sample_table / cleaning_station.
+    # also stores it in sample_table / cleaning_station. stop_event, if given,
+    # is a threading.Event the caller can set (alongside stopping the robot)
+    # to abort the search early; see camera_tools.search_apriltag_by_tilt.
     global sample_table, cleaning_station1, cleaning_station2, mixer_cleaning_station, mixer_station
     ref_pos = []
     if pos == 'sample_table':
@@ -463,7 +465,15 @@ def locate_apriltag(robot, pos = ''):
     print(f"Looking for {pos} ....")
     if len(ref_pos)==0:
         ref_pos = ref_sampletable
-    camera_tools.search_apriltag_by_tilt(robot, ref_pos=ref_pos)
+    found = camera_tools.search_apriltag_by_tilt(robot, ref_pos=ref_pos, stop_event=stop_event)
+    if not found:
+        # Previously this fell through to grab/bump/record a position even on
+        # a failed or aborted search -- since the robot could be anywhere the
+        # tilt search left it. Stop here instead: no position is worth
+        # recording without a confirmed tag detection.
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError(f"AprilTag search for {pos} was stopped by the operator")
+        raise RuntimeError(f"AprilTag search for {pos} failed to find a tag")
     robot.put_tcp2camera()
 
     robot.grab()
