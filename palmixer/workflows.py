@@ -141,6 +141,19 @@ class Workflows:
         self._require_known(mixer_loc, state.WHAT_MIXER_HEAD,
                              (state.MIXER_AT_MIXER, state.MIXER_AT_CLEANING))
 
+        # Every slot position is derived from one taught reference, so a reference
+        # taught on a different carousel sends the robot to where that one's slot
+        # was. Refused rather than warned: the failure is a collision, not a bad
+        # number. carousel.keep_reference_on_mount declares a repeatable mount and
+        # turns this off.
+        if state.carousel_reference_stale():
+            raise WorkflowError(
+                'the taught slot positions belong to carousel %r but %r is mounted. '
+                'Teach one slot on this carousel ("teach_carousel_slot <n>"), or set '
+                'carousel.keep_reference_on_mount if it seats repeatably.'
+                % (state.reference_carousel_id() or "an unnamed one",
+                   state.get_carousel_id()))
+
         try:
             return state.slot_position(slot)
         except KeyError as e:

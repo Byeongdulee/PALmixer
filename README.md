@@ -91,6 +91,10 @@ that call. See the docstring in `_winenv.py`.
 | `mixer2cleaningstation` etc. (8 names) | worker | Run the matching `PAL12idb` transport function |
 | `motor_tweak forward\|reverse <step>` | worker | Tweak `12idb:m6` by `step` |
 | `pump mix\|clean_mixer\|draw_to_flowcell\|aspirate_from_flowcell\|wash_flowcell` | worker | Run a pump operation (placeholder) |
+| `set_mixing_speed <rpm>` | fast | The speed the next `mix` runs at. Bounds-checked against `pump.min_rpm`/`max_rpm`; refused while an action is running |
+| `get_mixing_speed` | fast | That speed, in rpm |
+| `mount_carousel <id> [base64 {slot: sample_id}]` | fast | Declare which carousel is in the machine and everything on it, in **one** transition |
+| `get_carousel_id` | fast | The mounted carousel's ID, or `unknown` |
 | `make_sample <slot> [sample id]` | worker | Full mix-and-load sequence (see below), tagging `<slot>` with the sample ID -- a timestamp ID is assigned if none is given |
 | `unload_sample` | worker | Full return-and-wash sequence (see below) |
 | `set_flowcell <1\|2>` | fast | Change which flowcell the transport functions and workflows act on -- a "Flowcell in Use" selector sending this lives on all three GUI tabs, kept in sync with each other from `get_state`/the tracking topic |
@@ -324,3 +328,19 @@ call (`mix`, `clean_mixer`, `draw_to_flowcell`, `aspirate_from_flowcell`,
 `wash_flowcell`), each just logging and sleeping briefly, serialized on a
 single lock so two pump ops never run concurrently. Swap its internals for a
 real driver without touching `server.py`, `workflows.py`, or the GUI.
+
+**Mixing speed is a real settable**, even though the pump behind it is not:
+`set_mixing_speed`/`get_mixing_speed` read and write it, `mix()` runs at
+whatever it holds, and the mix's completion detail names the speed it ran at --
+so a campaign varying mixing speed as a design axis records a value that came
+back from the pump rather than one it merely asked for. Geometry lives in
+`json/palmixer_config.json`:
+
+```json
+"pump": { "mixing_speed_rpm": 800.0, "min_rpm": 0.0, "max_rpm": 3000.0 }
+```
+
+Out-of-range is **refused, not clamped**: a caller asking for 5000 rpm on a
+3000 rpm pump has a design space that does not match the hardware, and quietly
+mixing at 3000 would put a number in its records that nothing ran at.
+`Pump._apply_speed` is the single method a real driver has to implement.

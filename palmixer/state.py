@@ -73,6 +73,11 @@ _TRACKING = "tracking"
 _CAROUSEL = "carousel"            # the taught reference: ref_slot + ref_position
 _CAROUSEL_SAMPLES = "carousel_samples"  # slot -> sample ID; a key here == used
 
+# Only the MOUNTED carousel is tracked -- there is no per-carousel history. A
+# carousel taken off and put back later arrives as a fresh mount and must be
+# re-registered with everything in it, which is what mount_carousel() is for.
+MAX_CAROUSEL_ID_LEN = 64
+
 # A sample ID is free text the operator types, so it gets bounded here rather
 # than trusted: long enough for a real label, short enough that it cannot bloat
 # the ini or the retained MQTT snapshot.
@@ -347,12 +352,16 @@ def teach_carousel_slot(slot, position):
     reference, re-locating the whole carousel from the slot just taught."""
     ref_slot = validate_slot(slot)
     require_carousel_step()
+    # Stamped with the carousel it was taught on, so a later mount can tell
+    # whether this reference belongs to the hardware now in the machine.
+    mounted = get_carousel_id()
 
     def apply(parser):
         if not parser.has_section(_CAROUSEL):
             parser.add_section(_CAROUSEL)
         parser.set(_CAROUSEL, "ref_slot", str(ref_slot))
         parser.set(_CAROUSEL, "ref_position", repr(float(position)))
+        parser.set(_CAROUSEL, "ref_carousel_id", "" if mounted == UNKNOWN else mounted)
     _mutate(apply)
 
 
@@ -412,6 +421,95 @@ def clean_sample_id(sample_id):
         raise ValueError('%r is not a usable sample ID: it is what get_sample_id '
                          'reports for a slot that has none' % UNKNOWN)
     return text
+
+
+# -- which carousel is mounted ----------------------------------------------
+def clean_carousel_id(carousel_id):
+    """Normalise and bounds-check a carousel ID, as clean_sample_id does for samples."""
+    text = " ".join(str(carousel_id).split())
+    if not text:
+        raise ValueError("carousel ID must not be empty")
+    if len(text) > MAX_CAROUSEL_ID_LEN:
+        raise ValueError("carousel ID must be at most %d characters, got %d"
+                         % (MAX_CAROUSEL_ID_LEN, len(text)))
+    if text.lower() == UNKNOWN:
+        raise ValueError('%r is not a usable carousel ID: it is what an unmounted '
+                         'carousel reports' % UNKNOWN)
+    return text
+
+
+def get_carousel_id():
+    """The mounted carousel's ID, or UNKNOWN if nobody has said which one it is."""
+    return _get(_TRACKING, "carousel_id", UNKNOWN)
+
+
+def mount_carousel(carousel_id, samples=None):
+    """Replace the mounted carousel: its ID and its whole slot inventory, atomically.
+
+    One command rather than a clear followed by N tags, because a half-applied
+    swap is the worst possible state: PALmixer's idea of what is in each slot
+    would disagree with the physical carousel, and every sample measured
+    afterwards would carry the wrong ID with nothing to reveal it.
+
+    The taught reference is **kept**, but stamped with the carousel it was taught
+    on -- see carousel_reference_stale(). Dropping it would mean re-teaching a
+    slot on every batch; trusting it blindly would drive the robot to the wrong
+    place if the new carousel does not seat identically. Stamping it lets the
+    operator decide, once, in configuration.
+    """
+    text = clean_carousel_id(carousel_id)
+    cleaned = {}
+    for slot, sample_id in dict(samples or {}).items():
+        cleaned[validate_slot(slot)] = clean_sample_id(sample_id)
+
+    def apply(parser):
+        if not parser.has_section(_TRACKING):
+            parser.add_section(_TRACKING)
+        parser.set(_TRACKING, "carousel_id", text)
+        # Removed and rebuilt, not merged: a slot the new carousel does not use
+        # must not inherit what the old one had in it.
+        if parser.has_section(_CAROUSEL_SAMPLES):
+            parser.remove_section(_CAROUSEL_SAMPLES)
+        if cleaned:
+            parser.add_section(_CAROUSEL_SAMPLES)
+            for slot, sample_id in sorted(cleaned.items()):
+                parser.set(_CAROUSEL_SAMPLES, "slot_%d" % slot, sample_id)
+    _mutate(apply)
+    return text
+
+
+def reference_carousel_id():
+    """Which carousel the taught reference was recorded on, or "" if unstamped."""
+    return _get(_CAROUSEL, "ref_carousel_id", "")
+
+
+def carousel_reference_stale():
+    """True when the taught reference belongs to a different carousel than the
+    mounted one.
+
+    Not an error by itself -- a repeatable mount makes it harmless, which is what
+    ``carousel.keep_reference_on_mount`` declares. Without that declaration the
+    workflows refuse rather than drive to a position taught on other hardware.
+    """
+    if carousel_reference() is None:
+        return False
+    if _keep_reference_on_mount():
+        return False
+    taught_on = reference_carousel_id()
+    mounted = get_carousel_id()
+    if not taught_on or mounted == UNKNOWN:
+        # Nothing to compare: a reference taught before carousel IDs existed, or
+        # no carousel declared. Treated as usable -- this is the pre-existing
+        # single-carousel way of working, which must keep working.
+        return False
+    return taught_on != mounted
+
+
+def _keep_reference_on_mount():
+    try:
+        return bool(config.get_section("carousel").get("keep_reference_on_mount", False))
+    except Exception:                                       # noqa: BLE001
+        return False
 
 
 def carousel_samples():
@@ -479,8 +577,9 @@ def reset_carousel():
         for section in (_CAROUSEL, _CAROUSEL_SAMPLES):
             if parser.has_section(section):
                 parser.remove_section(section)
-        if parser.has_option(_TRACKING, "carousel_slot"):
-            parser.remove_option(_TRACKING, "carousel_slot")
+        for option in ("carousel_slot", "carousel_id"):
+            if parser.has_option(_TRACKING, option):
+                parser.remove_option(_TRACKING, option)
     _mutate(apply)
 
 
@@ -526,6 +625,13 @@ def _snapshot():
         "carousel_step": get_carousel_step(),
         "carousel_reference": carousel_reference(),
         "carousel_samples": carousel_samples(),
+        # Which physical carousel is in the machine, and whether the taught
+        # reference belongs to it. `stale` is what workflows refuse on: every
+        # slot position is derived from that reference, so using one taught on
+        # different hardware drives the robot to the wrong place.
+        "carousel_id": get_carousel_id(),
+        "reference_carousel": reference_carousel_id(),
+        "reference_stale": carousel_reference_stale(),
         # Derivable from the two above, but carried explicitly so every
         # consumer of the retained MQTT snapshot -- not just this repo's GUI --
         # gets the "replace the carousel" signal without recomputing it.

@@ -19,6 +19,13 @@
     },
     "carousel": {
         "size": 12,
-        "step": 30.0
+        "step": 15.0,
+        "radius_mm": 50.0,
+        "tube_diameter_mm": 10.0
+    },
+    "pump": {
+        "mixing_speed_rpm": 800.0,
+        "min_rpm": 0.0,
+        "max_rpm": 3000.0
     }
 }

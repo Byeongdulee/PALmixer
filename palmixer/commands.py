@@ -133,6 +133,23 @@ SET_SAMPLE_ID = "set_sample_id"
 GET_SAMPLE_ID = "get_sample_id"
 CLEAR_SAMPLE_ID = "clear_sample_id"
 
+# -- swapping the whole carousel ---------------------------------------------
+# A batch of samples is prepared onto a carousel off-line and swapped in whole.
+# One command carries the ID *and* the inventory so the swap lands as a single
+# transition: a half-applied one would leave this server's idea of each slot
+# disagreeing with the physical carousel, and every sample measured afterwards
+# would carry the wrong ID with nothing to reveal it.
+MOUNT_CAROUSEL = "mount_carousel"
+GET_CAROUSEL_ID = "get_carousel_id"
+
+# -- pump settings -----------------------------------------------------------
+# Mixing speed is a property of the pump, not of a sample, so it is set and read
+# like the flowcell selector rather than passed to make_sample: set it, then mix.
+# That keeps make_sample's signature stable and means the GUI's own "Mix" button
+# runs at the same speed the automation would.
+SET_MIXING_SPEED = "set_mixing_speed"
+GET_MIXING_SPEED = "get_mixing_speed"
+
 FLOWCELL_IDS = _state.FLOWCELL_IDS               # (1, 2)
 LOCATION_KEYS = _state.LOCATION_KEYS             # mixer_head, flowcell_1, flowcell_2
 MIXER_LOCATIONS = _state.MIXER_LOCATIONS
@@ -242,3 +259,53 @@ def get_sample_id_command(slot):
 def clear_sample_id_command(slot):
     """Build the wire command to drop ``slot``'s sample ID, marking it unused."""
     return "%s %s" % (CLEAR_SAMPLE_ID, slot)
+
+
+def mount_carousel_command(carousel_id, samples=None):
+    """Build the wire command declaring which carousel is now in the machine.
+
+    ``samples`` is ``{slot: sample_id}`` for everything on it. Base64'd because
+    the rest of this protocol is whitespace-delimited and a sample ID may contain
+    spaces -- the same reason PALsystem base64s its prep payloads.
+    """
+    import base64
+    import json
+
+    payload = {str(int(slot)): str(sample_id)
+               for slot, sample_id in dict(samples or {}).items()}
+    token = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+    return "%s %s %s" % (MOUNT_CAROUSEL, carousel_id, token)
+
+
+def decode_inventory(token):
+    """The inverse. Returns ``{int slot: str sample_id}``. Raises ValueError."""
+    import base64
+    import json
+
+    try:
+        raw = base64.b64decode(token, validate=True)
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise ValueError("inventory is not base64'd JSON: %s" % e)
+    if not isinstance(payload, dict):
+        raise ValueError("inventory must be a JSON object of {slot: sample_id}")
+    out = {}
+    for slot, sample_id in payload.items():
+        try:
+            out[int(slot)] = str(sample_id)
+        except (TypeError, ValueError):
+            raise ValueError("inventory slot %r is not an integer" % (slot,))
+    return out
+
+
+def get_carousel_id_command():
+    return GET_CAROUSEL_ID
+
+
+def set_mixing_speed_command(rpm):
+    """Build the wire command setting the speed the next mix will run at."""
+    return "%s %s" % (SET_MIXING_SPEED, rpm)
+
+
+def get_mixing_speed_command():
+    return GET_MIXING_SPEED

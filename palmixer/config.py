@@ -45,7 +45,13 @@ _DEFAULTS = {
         "ur12idb_path": "/home/beams15/S12STAFF/python_codes/UR_12idb",
     },
     "motor": {"pv": "12idb:m6"},
-    "carousel": {"size": 0, "step": 0.0},
+    # `step` is degrees of rotation between adjacent slots -- 12.m6 is a rotary
+    # stage, so its engineering units and the carousel's angular pitch are the
+    # same number. PVapp's "CRS" holder type describes the same hardware
+    # (app/holders.py) and must agree: radius and tube diameter are carried here
+    # too so the two can be compared without opening both repos.
+    "carousel": {"size": 0, "step": 0.0, "radius_mm": 50.0,
+                 "tube_diameter_mm": 10.0},
 }
 
 

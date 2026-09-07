@@ -103,7 +103,14 @@ class PALmixerServer:
             return STATE_BUSY if self._busy else STATE_IDLE
 
         if name == cmd.GET_STATE:
-            return json.dumps(state.snapshot())
+            # The pump's speed is a live setting rather than tracked state, so it is
+            # added here (where the pump is) rather than in state.py -- but it rides
+            # on the same snapshot, because a client polling for "what is the machine
+            # set to" should not need a second round trip for it.
+            return json.dumps(dict(state.snapshot(),
+                                   mixing_speed=self.pump.speed,
+                                   mixing_speed_limits=[self.pump.min_rpm,
+                                                        self.pump.max_rpm]))
 
         if name == cmd.STOP_SEARCH:
             return self._stop_search()
@@ -193,7 +200,68 @@ class PALmixerServer:
                 return "ERROR: %s" % e
             return "OK"
 
+        if name == cmd.GET_CAROUSEL_ID:
+            if args:
+                return "ERROR: %s takes no arguments" % cmd.GET_CAROUSEL_ID
+            return state.get_carousel_id()
+
+        # Fast, like set_flowcell: it is a setpoint the next mix picks up, not an
+        # action. Answering it mid-workflow is harmless -- and refused below when it
+        # would land between the guard and the mix of a running make_sample.
+        if name == cmd.GET_MIXING_SPEED:
+            if args:
+                return "ERROR: %s takes no arguments" % cmd.GET_MIXING_SPEED
+            return "%g" % self.pump.speed
+
+        if name == cmd.SET_MIXING_SPEED:
+            if len(args) != 1:
+                return "ERROR: usage: %s <rpm>" % cmd.SET_MIXING_SPEED
+            if self._busy:
+                # make_sample reads the speed when it reaches its mix step, so a
+                # change landing mid-run would apply to a sample the caller thought
+                # was already settled -- and the record would name the wrong speed.
+                return ("ERROR: busy (running %r); the mixing speed cannot change "
+                        "mid-action" % self._current_action)
+            ok, detail = self.pump.set_speed(args[0])
+            return ("OK %s" % detail) if ok else ("ERROR: %s" % detail)
+
+        if name == cmd.MOUNT_CAROUSEL:
+            return self._mount_carousel(args)
+
         return None
+
+    def _mount_carousel(self, args):
+        """Declare which carousel is now in the machine, and everything on it.
+
+        One transition, not a clear plus N tags: a swap that half-applied would
+        leave this server's slot table disagreeing with the physical carousel,
+        and every sample measured afterwards would carry the wrong ID.
+
+        Refused while an action is running. It is a fast command, so the server
+        would happily answer mid-workflow -- but `make_sample` re-reads the slot
+        table as it goes, so replacing the carousel underneath a running one
+        would mix from a slot that is no longer there.
+        """
+        if len(args) not in (1, 2):
+            return "ERROR: usage: %s <carousel id> [base64 {slot: sample_id}]" \
+                % cmd.MOUNT_CAROUSEL
+        if self._busy:
+            return "ERROR: busy (running %r); the carousel cannot change mid-action" \
+                % self._current_action
+        try:
+            samples = cmd.decode_inventory(args[1]) if len(args) == 2 else {}
+            carousel_id = state.mount_carousel(args[0], samples)
+        except ValueError as e:
+            return "ERROR: %s" % e
+        detail = "mounted carousel %s with %d sample(s)" % (carousel_id, len(samples))
+        if state.carousel_reference_stale():
+            # Not refused here -- mounting is bookkeeping and always allowed. The
+            # workflows refuse, which is where a wrong position would do harm.
+            detail += ("; the taught slot positions belong to carousel %r, so teach "
+                       "one slot on this one before making a sample"
+                       % state.reference_carousel_id())
+        print(detail)
+        return "OK %s" % detail
 
     def _publish_state(self, state_value, action=None):
         self._mqtt.publish(state_topic(self._beamline), state_payload(state_value, action),
