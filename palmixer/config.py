@@ -12,6 +12,7 @@ Sections:
     robot {name, ip, ur12idb_path}              -- UR robot + camera
     motor {pv}                                  -- EPICS motor PV base
     carousel {size, step}                       -- carousel geometry
+    pump  {host, mixer_port, flowcell_port, ...}-- apssector12_pump_control ZMQ
 
 Env overrides (take precedence over the JSON):
     PALMIXER_ZMQ_HOST   PALMIXER_ZMQ_PORT
@@ -19,6 +20,16 @@ Env overrides (take precedence over the JSON):
     PALMIXER_ROBOT_IP   PALMIXER_UR12IDB_PATH
     PALMIXER_MOTOR_PV
     PALMIXER_CAROUSEL_SIZE  PALMIXER_CAROUSEL_STEP
+    PALMIXER_PUMP_HOST  PALMIXER_PUMP_MIXER_PORT  PALMIXER_PUMP_FLOWCELL_PORT
+
+The pump section points at the two loopback ZMQ servers run by the
+apssector12_pump_control dashboards (mixing on 5555, flowcell on 5556). Its
+ports are configured *here*, not via PALMIXER_ZMQ_PORT: the pump dashboards
+themselves read PALMIXER_ZMQ_PORT / PALMIXER_MQTT_PORT for their own ports (the
+same env names this package uses for its control plane), so the pump client is
+given its own PALMIXER_PUMP_* overrides to avoid the collision. mixing_speed_rpm
+/ min_rpm / max_rpm are advisory only -- the pump dashboard sets the real mix
+speed (see palmixer/pump.py).
 
 The carousel section describes the *hardware*: how many slots the carousel has
 and how far the motor moves between two adjacent ones. Both defaults here are
@@ -52,6 +63,13 @@ _DEFAULTS = {
     # too so the two can be compared without opening both repos.
     "carousel": {"size": 0, "step": 0.0, "radius_mm": 50.0,
                  "tube_diameter_mm": 10.0},
+    # ZMQ endpoints of the apssector12_pump_control dashboards. speed_* are
+    # advisory (the dashboard owns the real mix speed); timeouts govern the
+    # REQ/REP round-trip and the poll-to-completion wait in palmixer/pump.py.
+    "pump": {"mixing_speed_rpm": 800.0, "min_rpm": 0.0, "max_rpm": 3000.0,
+             "host": "127.0.0.1", "mixer_port": 5555, "flowcell_port": 5556,
+             "request_timeout_s": 5.0, "poll_interval_s": 0.5,
+             "operation_timeout_s": 600.0},
 }
 
 
@@ -95,6 +113,14 @@ def _merged():
         cfg["carousel"]["size"] = env("PALMIXER_CAROUSEL_SIZE")
     if env("PALMIXER_CAROUSEL_STEP"):
         cfg["carousel"]["step"] = env("PALMIXER_CAROUSEL_STEP")
+    # NB: deliberately NOT PALMIXER_ZMQ_PORT -- that names this package's own
+    # control plane, and the pump dashboards reuse it for their ports too.
+    if env("PALMIXER_PUMP_HOST"):
+        cfg["pump"]["host"] = env("PALMIXER_PUMP_HOST")
+    if env("PALMIXER_PUMP_MIXER_PORT"):
+        cfg["pump"]["mixer_port"] = int(env("PALMIXER_PUMP_MIXER_PORT"))
+    if env("PALMIXER_PUMP_FLOWCELL_PORT"):
+        cfg["pump"]["flowcell_port"] = int(env("PALMIXER_PUMP_FLOWCELL_PORT"))
     return cfg
 
 

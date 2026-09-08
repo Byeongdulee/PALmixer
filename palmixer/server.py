@@ -2,7 +2,8 @@
 """Headless PALmixer server.
 
 Owns the UR3 robot (via UR_12idb), the PAL12idb transport/AprilTag library,
-the placeholder pump, and the EPICS motor. Exposes them to the PyQt GUI (or
+the pump (a ZMQ client to apssector12_pump_control), and the EPICS motor.
+Exposes them to the PyQt GUI (or
 any other ZMQ client) as a small command vocabulary (see commands.py) over a
 ZMQ REQ/REP socket, and reports motion start/success/failure over MQTT (see
 mqtt_status.py).
@@ -56,8 +57,7 @@ class PALmixerServer:
 
         self.rob = None
         self.PAL12idb = None
-        self.pump = Pump()
-        self.pump.initialize()
+        self.pump = Pump(simulate=self.simulate)
         self.motor = Motor(cfg["motor"].get("pv", "12idb:m6"))
 
         if not self.simulate:

@@ -2,7 +2,7 @@
 
 Control package for the APS 12-ID-B PALmixer flowcell workflow: a UR3 robot
 (via [UR_12idb](../UR_12idb)), an EPICS motor (`12idb:m6`), and a mixer pump
-(placeholder driver, no hardware integration yet).
+(a ZMQ client to [apssector12_pump_control](../apssector12_pump_control)).
 
 ## Architecture
 
@@ -90,7 +90,7 @@ that call. See the docstring in `_winenv.py`.
 | `push_positions` / `pull_positions` | worker | Sync taught positions with the EPICS waypoint PVs (see below) |
 | `mixer2cleaningstation` etc. (8 names) | worker | Run the matching `PAL12idb` transport function |
 | `motor_tweak forward\|reverse <step>` | worker | Tweak `12idb:m6` by `step` |
-| `pump mix\|clean_mixer\|draw_to_flowcell\|aspirate_from_flowcell\|wash_flowcell` | worker | Run a pump operation (placeholder) |
+| `pump mix\|clean_mixer\|draw_to_flowcell\|aspirate_from_flowcell\|wash_flowcell` | worker | Run a pump operation (ZMQ to apssector12_pump_control) |
 | `set_mixing_speed <rpm>` | fast | The speed the next `mix` runs at. Bounds-checked against `pump.min_rpm`/`max_rpm`; refused while an action is running |
 | `get_mixing_speed` | fast | That speed, in rpm |
 | `mount_carousel <id> [base64 {slot: sample_id}]` | fast | Declare which carousel is in the machine and everything on it, in **one** transition |
@@ -322,25 +322,59 @@ flowcell in use to be at the sample table.
 
 ## Pump driver
 
-`palmixer/pump.py` is a **placeholder** -- there is no pump hardware
-integration yet. It implements the five operations the GUI and workflows
-call (`mix`, `clean_mixer`, `draw_to_flowcell`, `aspirate_from_flowcell`,
-`wash_flowcell`), each just logging and sleeping briefly, serialized on a
-single lock so two pump ops never run concurrently. Swap its internals for a
-real driver without touching `server.py`, `workflows.py`, or the GUI.
+`palmixer/pump.py` is a **ZMQ client** to
+[apssector12_pump_control](../apssector12_pump_control), which runs the real
+TriContinent syringe pumps behind two loopback-only ZMQ REP servers. It
+implements the five operations the GUI and workflows call, routing each to the
+right server:
 
-**Mixing speed is a real settable**, even though the pump behind it is not:
-`set_mixing_speed`/`get_mixing_speed` read and write it, `mix()` runs at
-whatever it holds, and the mix's completion detail names the speed it ran at --
-so a campaign varying mixing speed as a design axis records a value that came
-back from the pump rather than one it merely asked for. Geometry lives in
+| PALmixer op | Server | Endpoint | ZMQ command |
+|---|---|---|---|
+| `mix` | mixing | `tcp://127.0.0.1:5555` | `sample_make` |
+| `clean_mixer` | mixing | `tcp://127.0.0.1:5555` | `clean_all` |
+| `draw_to_flowcell` | flowcell | `tcp://127.0.0.1:5556` | `draw_to_flowcell` |
+| `aspirate_from_flowcell` | flowcell | `tcp://127.0.0.1:5556` | `aspirate_from_flowcell` |
+| `wash_flowcell` | flowcell | `tcp://127.0.0.1:5556` | `wash_flowcell` |
+
+All five stay serialized on a single lock so two pump ops never run
+concurrently, and each keeps the `(ok, detail)` contract, so `server.py`,
+`workflows.py`, and the GUI are untouched.
+
+**Both pump dashboards must be running first.** Launch `PumpControl.cmd` and
+`FlowCellControl.cmd`, then in each one connect, confirm syringe sizes, and
+initialize -- the dashboards own the COM ports and those safety confirmations,
+and they are the only gate on readiness. PALmixer does not pre-check them: it
+opens no socket until the first op, and an unready pump simply replies
+`ok:false`, which surfaces as a failed op / `WorkflowError`. A ZMQ reply means
+the op is **queued**, not done: each op then polls `status` until
+`operation_active` goes false before returning.
+
+**Flowcell selection is by device index.** The flowcell ops carry a 0-based
+`device` derived from `state.get_flowcell_in_use()`: PALmixer flowcell **ID 1**
+maps to flowcell2 / `device 0` (`flow2_sample`), and **ID 2** to flowcell3 /
+`device 1` (`flow3_sample`). Use `set_flowcell` to switch which one the ops act
+on.
+
+**Mixing speed is advisory.** `set_mixing_speed`/`get_mixing_speed` still read
+and write a value, the mix's completion detail names it, and out-of-range is
+**refused, not clamped** -- but the *pump dashboard* owns the real mix speed
+(`sample_make` uses the dashboard's volumes/speeds and rejects overrides), so
+this value is a local record folded into the sample record, not a command sent
+to the pump.
+
+Endpoints, timeouts, and the advisory speed limits live in
 `json/palmixer_config.json`:
 
 ```json
-"pump": { "mixing_speed_rpm": 800.0, "min_rpm": 0.0, "max_rpm": 3000.0 }
+"pump": {
+    "mixing_speed_rpm": 800.0, "min_rpm": 0.0, "max_rpm": 3000.0,
+    "host": "127.0.0.1", "mixer_port": 5555, "flowcell_port": 5556,
+    "request_timeout_s": 5.0, "poll_interval_s": 0.5, "operation_timeout_s": 600.0
+}
 ```
 
-Out-of-range is **refused, not clamped**: a caller asking for 5000 rpm on a
-3000 rpm pump has a design space that does not match the hardware, and quietly
-mixing at 3000 would put a number in its records that nothing ran at.
-`Pump._apply_speed` is the single method a real driver has to implement.
+They can be overridden with `PALMIXER_PUMP_HOST`, `PALMIXER_PUMP_MIXER_PORT`,
+and `PALMIXER_PUMP_FLOWCELL_PORT`. These have **pump-specific names on purpose**:
+the pump dashboards themselves read `PALMIXER_ZMQ_PORT` / `PALMIXER_MQTT_PORT`
+(the same env names PALmixer uses for its own control plane), so the pump client
+is given its own to avoid the collision.
