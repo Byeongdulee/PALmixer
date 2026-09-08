@@ -22,7 +22,7 @@ cleaning_station2 = []
 mixer_cleaning_station = []
 mixer_station = []
 needle_clear_height = 0.20
-mixer_height = 0.05
+mixer_height = 0.02
 grab_depth = 0.01
 flowcell_ID = state.get_flowcell_in_use()
 from epics import caget, caput
