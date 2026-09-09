@@ -8,7 +8,7 @@ Wire protocol (mirrors APS12_SAXSDaq's ZMQCommandServer): plain space-delimited
 strings, one request -> one reply.
 
     "status"                              -> "IDLE" | "BUSY"
-    "search_apriltag <station>"           -> "ACCEPTED" | "ERROR: <reason>"
+    "search_apriltag <station> [skip_roll]" -> "ACCEPTED" | "ERROR: <reason>"
     "stop_search"                         -> "OK" | "ERROR: <reason>"
     "set_position_here <station>"         -> "OK <pose>" | "ERROR: <reason>"
     "set_orientation_here <station>"      -> "OK <pose>" | "ERROR: <reason>"
@@ -60,6 +60,13 @@ STATION_LABELS = {
 
 SEARCH_APRILTAG = "search_apriltag"
 STOP_SEARCH = "stop_search"
+
+# Optional trailing flag on search_apriltag. It tells the server to keep the
+# camera face-normal-down (level) after finding the tag, instead of tipping it
+# face-down or squaring it to a tilted tag -- see the roll skip in
+# camera_tools.search_apriltag_by_tilt. Position is recorded either way; only
+# the recorded orientation differs.
+SKIP_ROLL = "skip_roll"
 
 # Teach a station from where the robot is standing instead of by searching for
 # its AprilTag -- for a station whose tag is obscured, or one being nudged off
@@ -206,8 +213,14 @@ def position_not_configured_error(missing_labels):
         POSITION_NOT_CONFIGURED, ", ".join(missing_labels))
 
 
-def search_apriltag_command(station):
-    """Build the wire command for searching a station's AprilTag."""
+def search_apriltag_command(station, skip_roll=False):
+    """Build the wire command for searching a station's AprilTag.
+
+    ``skip_roll`` appends the SKIP_ROLL flag, keeping the camera level (face
+    straight down) instead of rolling it face-down / squaring it to the tag.
+    """
+    if skip_roll:
+        return "%s %s %s" % (SEARCH_APRILTAG, station, SKIP_ROLL)
     return "%s %s" % (SEARCH_APRILTAG, station)
 
 

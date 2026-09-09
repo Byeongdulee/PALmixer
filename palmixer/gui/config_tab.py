@@ -12,8 +12,8 @@ busy_widgets so it stays enabled for exactly the window where it is useful.
 """
 
 from PyQt5.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel,
+    QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
 from .. import commands as cmd
@@ -44,6 +44,17 @@ class ConfigTab(QWidget):
         self.stop_search_button.clicked.connect(
             lambda: self._send_command(cmd.stop_search_command()))
         button_layout.addWidget(self.stop_search_button)
+        # Applies to whichever station is searched next: keep the camera level
+        # (face straight down) instead of rolling it face-down / squaring it to
+        # a tilted tag. Position is still recorded; teach a tilted seat's angle
+        # by hand (below) afterward. Default off = the current search behavior.
+        self.skip_roll_check = QCheckBox("Keep camera face-down (skip roll)")
+        self.skip_roll_check.setToolTip(
+            "Search for the tag and record the position, but leave the camera "
+            "level (facing straight down) instead of tipping it face-down or "
+            "squaring it to a tilted tag. Use for a seat whose tilt you teach "
+            "by hand afterward.")
+        button_layout.addWidget(self.skip_roll_check)
         button_box.setLayout(button_layout)
 
         layout = QVBoxLayout()
@@ -57,7 +68,8 @@ class ConfigTab(QWidget):
         self.setLayout(layout)
 
     def _on_search(self, station):
-        self._send_command(cmd.search_apriltag_command(station))
+        self._send_command(cmd.search_apriltag_command(
+            station, skip_roll=self.skip_roll_check.isChecked()))
 
     # -- go to a taught position -----------------------------------------------
     def _build_goto_group(self):

@@ -329,14 +329,19 @@ class PALmixerServer:
         Raises ValueError for anything unrecognized or malformed.
         """
         if name == cmd.SEARCH_APRILTAG:
+            skip_roll = len(args) == 2 and args[1] == cmd.SKIP_ROLL
+            if skip_roll:
+                args = args[:1]
             if len(args) != 1 or args[0] not in cmd.STATIONS:
-                raise ValueError("usage: %s <%s>" % (cmd.SEARCH_APRILTAG, "|".join(cmd.STATIONS)))
+                raise ValueError("usage: %s <%s> [%s]" % (
+                    cmd.SEARCH_APRILTAG, "|".join(cmd.STATIONS), cmd.SKIP_ROLL))
             station = args[0]
-            label = "%s %s" % (cmd.SEARCH_APRILTAG, station)
+            label = "%s %s%s" % (cmd.SEARCH_APRILTAG, station,
+                                 " (skip roll)" if skip_roll else "")
             # Created here (on the synchronous reply path, before ACCEPTED is
             # sent) so a stop_search sent right after is guaranteed to find it.
             self._search_stop_event = threading.Event()
-            return (lambda: self._search_apriltag(station)), label
+            return (lambda: self._search_apriltag(station, skip_roll)), label
 
         if name in (cmd.PUSH_POSITIONS, cmd.PULL_POSITIONS):
             if args:
@@ -519,7 +524,7 @@ class PALmixerServer:
         print(detail)
         return "OK %s" % detail
 
-    def _search_apriltag(self, station):
+    def _search_apriltag(self, station, skip_roll=False):
         if self.simulate:
             # Sleep in small slices so a stop_search sent during a --simulate
             # run is also honored, instead of only being useful against real
@@ -529,8 +534,11 @@ class PALmixerServer:
                 if event is not None and event.is_set():
                     raise RuntimeError("AprilTag search for %s was stopped by the operator" % station)
                 time.sleep(0.1)
-            return "simulated AprilTag search for %s" % station
-        pos = self.PAL12idb.locate_apriltag(self.rob, pos=station, stop_event=self._search_stop_event)
+            return "simulated AprilTag search for %s%s" % (
+                station, " (skip roll)" if skip_roll else "")
+        pos = self.PAL12idb.locate_apriltag(
+            self.rob, pos=station, stop_event=self._search_stop_event,
+            skip_roll=skip_roll)
         return "found %s at %s" % (station, pos)
 
     def _sync_positions(self, name):

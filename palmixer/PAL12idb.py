@@ -756,11 +756,14 @@ def descend_to_apriltag(robot, distance = apriltag_view_distance, tolerance = 0.
         descended = descended + step
     return measured
 
-def locate_apriltag(robot, pos = '', stop_event=None):
+def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False):
     # Record the taught position of a station. Returns the pose it found, and
     # also stores it in sample_table / cleaning_station. stop_event, if given,
     # is a threading.Event the caller can set (alongside stopping the robot)
     # to abort the search early; see camera_tools.search_apriltag_by_tilt.
+    # skip_roll leaves the camera face-normal-down (level) instead of rolling
+    # it face-down / squaring it to a tilted tag: position is still recorded,
+    # only the orientation differs (teach a tilted seat's angle by hand).
     global sample_table, cleaning_station1, cleaning_station2, mixer_cleaning_station, mixer_station
     ref_pos = []
     if pos == 'sample_table':
@@ -792,7 +795,7 @@ def locate_apriltag(robot, pos = '', stop_event=None):
     # sitting on the tag, for a result the first pass had already reached.
     found = camera_tools.search_apriltag_by_tilt(
         robot, ref_pos=ref_pos, align_to_tag=(pos in APRILTAG_NOT_FLAT),
-        stop_event=stop_event)
+        stop_event=stop_event, skip_roll=skip_roll)
     if not found:
         # Previously this fell through to grab/bump/record a position even
         # on a failed or aborted search -- since the robot could be
