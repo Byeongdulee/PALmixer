@@ -18,8 +18,8 @@
         "pv": "12idb:m6"
     },
     "carousel": {
-        "size": 12,
-        "step": 15.0,
+        "size": 16,
+        "step": 22.5,
         "radius_mm": 50.0,
         "tube_diameter_mm": 10.0
     },
