@@ -10,7 +10,12 @@ strings, one request -> one reply.
     "status"                              -> "IDLE" | "BUSY"
     "search_apriltag <station>"           -> "ACCEPTED" | "ERROR: <reason>"
     "stop_search"                         -> "OK" | "ERROR: <reason>"
+    "set_position_here <station>"         -> "OK <pose>" | "ERROR: <reason>"
+    "set_orientation_here <station>"      -> "OK <pose>" | "ERROR: <reason>"
+    "tweak_orientation x|y|z <degrees>"   -> "ACCEPTED" | "ERROR: <reason>"
+    "goto_position <station>"             -> "ACCEPTED" | "ERROR: <reason>"
     "<transport_name>"                    -> "ACCEPTED" | "ERROR: <reason>"
+    "zalign"                              -> "ACCEPTED" | "ERROR: <reason>"
     "motor_tweak forward|reverse <step>"  -> "ACCEPTED" | "ERROR: <reason>"
     "pump <op>"                           -> "ACCEPTED" | "ERROR: <reason>"
     "make_sample <slot> [sample id]"      -> "ACCEPTED" | "ERROR: <reason>"
@@ -56,6 +61,26 @@ STATION_LABELS = {
 SEARCH_APRILTAG = "search_apriltag"
 STOP_SEARCH = "stop_search"
 
+# Teach a station from where the robot is standing instead of by searching for
+# its AprilTag -- for a station whose tag is obscured, or one being nudged off
+# a position that is already nearly right. Records exactly what the search
+# records (PAL12idb.record_current_position), so the two are interchangeable.
+SET_POSITION_HERE = "set_position_here"
+
+# Teach a station's orientation alone, keeping the X/Y/Z the AprilTag search
+# found. For the flowcell cleaning station, where the flowcell does not sit
+# level and its 12 mm tag is too small to resolve the tilt from -- position is
+# measured well there, orientation is not. TWEAK_ORIENTATION is the jog that
+# gets the tool onto the seat angle; SET_ORIENTATION_HERE records it.
+SET_ORIENTATION_HERE = "set_orientation_here"
+TWEAK_ORIENTATION = "tweak_orientation"
+ORIENTATION_AXES = ("x", "y", "z")
+
+# Drive to a station's taught position and stop there, without picking
+# anything up -- the way to check by eye what a search or a manual teach
+# actually recorded (PAL12idb.goto_station).
+GOTO_POSITION = "goto_position"
+
 # Explicit sync between waypoints.ini (which every move reads) and the
 # 12idUR:WaypointL:* EPICS PVs (the beamline-wide interchange). These are the
 # only commands that do Channel Access on the waypoint PVs.
@@ -84,6 +109,13 @@ TRANSPORT_LABELS = {
     "return_sample": "Return Sample from Beam",
     "wash_flowcell_after_return": "Wash Flowcell After Return",
 }
+
+# Straighten the tool's Z axis to point straight down, keeping the current
+# heading and position (robUR.Zalign). A recovery action rather than part of
+# any sequence: something that leaves the wrist tilted -- an aborted AprilTag
+# tilt search, a manual jog on the pendant -- makes the next transport's
+# vertical moves go off at an angle, and this puts it back.
+ZALIGN = "zalign"
 
 MOTOR_TWEAK = "motor_tweak"
 MOTOR_FORWARD = "forward"
@@ -184,6 +216,27 @@ def stop_search_command():
     return STOP_SEARCH
 
 
+def set_position_here_command(station):
+    """Build the wire command to teach ``station`` from the robot's current pose."""
+    return "%s %s" % (SET_POSITION_HERE, station)
+
+
+def set_orientation_here_command(station):
+    """Build the wire command to give ``station`` the tool's current orientation,
+    keeping its taught position."""
+    return "%s %s" % (SET_ORIENTATION_HERE, station)
+
+
+def tweak_orientation_command(axis, degrees):
+    """Build the wire command to rotate the tool about its own ``axis``."""
+    return "%s %s %s" % (TWEAK_ORIENTATION, axis, degrees)
+
+
+def goto_position_command(station):
+    """Build the wire command to drive to ``station``'s taught position."""
+    return "%s %s" % (GOTO_POSITION, station)
+
+
 def push_positions_command():
     """waypoints.ini -> EPICS waypoint PVs."""
     return PUSH_POSITIONS
@@ -192,6 +245,11 @@ def push_positions_command():
 def pull_positions_command():
     """EPICS waypoint PVs -> waypoints.ini."""
     return PULL_POSITIONS
+
+
+def zalign_command():
+    """Build the wire command to level the tool Z axis straight down."""
+    return ZALIGN
 
 
 def motor_tweak_command(direction, step):

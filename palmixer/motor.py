@@ -12,7 +12,10 @@ Wraps the standard EPICS motor record tweak fields on a single motor PV
 
 caget() returns None if a PV is disconnected or the request times out; that
 must never be treated as a valid position or done-flag, mirroring the guard
-already used in PAL12idb.get_position().
+already used in PAL12idb.get_position(). caput() reports the same condition
+the same way, and is checked for it -- pyepics only prints "cannot connect to
+<pv>" and carries on otherwise, which would turn an unreachable IOC into a
+tweak that looks accepted and then times out a minute later waiting on .DMOV.
 """
 
 import time
@@ -35,7 +38,11 @@ class Motor:
 
     def _caput(self, suffix, value):
         from epics import caput
-        caput("%s.%s" % (self.pv, suffix), value)
+        name = "%s.%s" % (self.pv, suffix)
+        if caput(name, value) is None:
+            raise MotorError(
+                "%s: write failed (PV disconnected?). Check that the IOC for %s "
+                "is running and reachable from this host." % (name, self.pv))
 
     def read(self):
         """Return the current readback value (.RBV). Raises MotorError if disconnected."""

@@ -48,6 +48,13 @@ class PALmixerServer:
         self._busy = False
         self._current_action = None
         self._current_trace = None  # trace id of the action running now, for _publish_step
+        # How the last action ended -- {action, ok, detail, time}, success as
+        # well as failure. Rides on the get_state snapshot so a client learns
+        # about it from its ordinary poll: the motion MQTT topic is the only
+        # other place an async outcome is reported, and it is silent whenever
+        # the broker is unreachable or paho is not installed -- which left the
+        # GUI showing nothing at all for a search that had already given up.
+        self._last_result = None
         self._search_stop_event = None  # set while a search_apriltag action is running
 
         self._mqtt = MQTTPublisher(
@@ -110,10 +117,15 @@ class PALmixerServer:
             return json.dumps(dict(state.snapshot(),
                                    mixing_speed=self.pump.speed,
                                    mixing_speed_limits=[self.pump.min_rpm,
-                                                        self.pump.max_rpm]))
+                                                        self.pump.max_rpm],
+                                   last_result=self._last_result))
 
         if name == cmd.STOP_SEARCH:
             return self._stop_search()
+
+        if name in (cmd.SET_POSITION_HERE, cmd.SET_ORIENTATION_HERE):
+            return self._set_position_here(args, orientation_only=(
+                name == cmd.SET_ORIENTATION_HERE))
 
         if name == cmd.SET_FLOWCELL:
             if len(args) != 1:
@@ -337,6 +349,34 @@ class PALmixerServer:
             self._require_positions(self.PAL12idb.TRANSPORT_STATIONS[name] if self.PAL12idb else ())
             return (lambda: self._run_transport(name)), name
 
+        if name == cmd.GOTO_POSITION:
+            if len(args) != 1 or args[0] not in cmd.STATIONS:
+                raise ValueError("usage: %s <%s>" % (cmd.GOTO_POSITION, "|".join(cmd.STATIONS)))
+            station = args[0]
+            # Refuse an untaught station here rather than letting the move fail
+            # once it has already been ACCEPTED -- same check, and the same
+            # "search its AprilTag first" message, the transports get.
+            self._require_positions((station,))
+            label = "%s %s" % (cmd.GOTO_POSITION, station)
+            return (lambda: self._goto_position(station)), label
+
+        if name == cmd.TWEAK_ORIENTATION:
+            if len(args) != 2 or args[0].lower() not in cmd.ORIENTATION_AXES:
+                raise ValueError("usage: %s <%s> <degrees>" % (
+                    cmd.TWEAK_ORIENTATION, "|".join(cmd.ORIENTATION_AXES)))
+            axis = args[0].lower()
+            try:
+                degrees = float(args[1])
+            except ValueError:
+                raise ValueError("degrees must be numeric, got %r" % args[1])
+            label = "%s %s %s" % (cmd.TWEAK_ORIENTATION, axis, degrees)
+            return (lambda: self._tweak_orientation(axis, degrees)), label
+
+        if name == cmd.ZALIGN:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.ZALIGN)
+            return self._zalign, cmd.ZALIGN
+
         if name == cmd.MOTOR_TWEAK:
             if len(args) != 2 or args[0] not in (cmd.MOTOR_FORWARD, cmd.MOTOR_REVERSE):
                 raise ValueError("usage: %s <forward|reverse> <step>" % cmd.MOTOR_TWEAK)
@@ -406,11 +446,15 @@ class PALmixerServer:
         outcome, and clear the busy flag."""
         try:
             detail = action_fn()
+            self._last_result = {"action": action_label, "ok": True,
+                                 "detail": detail or "", "time": time.time()}
             self._mqtt.publish(motion_topic(self._beamline),
                                 motion_payload(action_label, PHASE_SUCCESS, True,
                                                detail=detail or "", trace=trace))
         except Exception as e:
             print("PALmixerServer: action %r failed: %s" % (action_label, e))
+            self._last_result = {"action": action_label, "ok": False,
+                                 "detail": str(e), "time": time.time()}
             self._mqtt.publish(motion_topic(self._beamline),
                                 motion_payload(action_label, PHASE_FAILURE, False,
                                                detail=str(e), trace=trace))
@@ -440,6 +484,40 @@ class PALmixerServer:
             except Exception as e:
                 return "ERROR: failed to stop robot: %s" % e
         return "OK"
+
+    def _set_position_here(self, args, orientation_only=False):
+        """Teach a station from the robot's current pose.
+
+        A fast command rather than an action: it reads a pose and writes
+        waypoints.ini, with no motion of its own. Refused while busy, though --
+        unlike the other fast commands this one samples where the arm *is*, and
+        a pose read out of the middle of a move records a point the robot was
+        only passing through.
+
+        orientation_only keeps the station's taught X/Y/Z and replaces just
+        RX/RY/RZ, for a station the AprilTag search places well but cannot
+        orient.
+        """
+        verb = cmd.SET_ORIENTATION_HERE if orientation_only else cmd.SET_POSITION_HERE
+        if len(args) != 1 or args[0] not in cmd.STATIONS:
+            return "ERROR: usage: %s <%s>" % (verb, "|".join(cmd.STATIONS))
+        station = args[0]
+        if self._busy:
+            return ("ERROR: busy (running %r); the robot has to be standing still "
+                    "to teach from it" % self._current_action)
+        if self.simulate:
+            return "OK simulated %s of %s" % (verb, station)
+        record = (self.PAL12idb.record_current_orientation if orientation_only
+                  else self.PAL12idb.record_current_position)
+        try:
+            pose = record(self.rob, station)
+        except Exception as e:
+            return "ERROR: could not record %s: %s" % (station, e)
+        detail = "taught %s%s at %s" % (station,
+                                        " orientation" if orientation_only else "",
+                                        pose)
+        print(detail)
+        return "OK %s" % detail
 
     def _search_apriltag(self, station):
         if self.simulate:
@@ -473,6 +551,30 @@ class PALmixerServer:
             return "simulated transport %s" % name
         getattr(self.PAL12idb, name)(self.rob)
         return "%s complete" % name
+
+    def _goto_position(self, station):
+        if self.simulate:
+            time.sleep(1)
+            return "simulated goto %s" % station
+        pose = self.PAL12idb.goto_station(self.rob, station)
+        return "at %s (%s)" % (station, pose)
+
+    def _tweak_orientation(self, axis, degrees):
+        if self.simulate:
+            time.sleep(0.3)
+            return "simulated %s rotation of %s deg" % (axis, degrees)
+        pose = self.PAL12idb.tweak_orientation(self.rob, axis, degrees)
+        return "rotated %s by %s deg, now at %s" % (axis, degrees, pose)
+
+    def _zalign(self):
+        """Level the tool Z axis (robUR.Zalign). Runs through the same busy /
+        ACCEPTED path as a transport: it is a real move, slow by design
+        (acc=vel=0.05), so it must not hold up the reply thread."""
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated zalign"
+        pose = self.rob.Zalign()
+        return "z-aligned at %s" % (pose,)
 
     def _motor_tweak(self, direction, step):
         if self.simulate:

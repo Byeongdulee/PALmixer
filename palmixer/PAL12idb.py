@@ -51,6 +51,24 @@ APRILTAG_SIZES = {
 }
 # Camera-to-tag distance the close-range pass of locate_apriltag works from.
 apriltag_view_distance = 0.2
+# Stations whose tag is not lying flat, so the camera has to be squared to the
+# tag's own normal rather than tipped face-down: the flowcell does not sit
+# level in its cleaning station, so its tag comes up at an angle. For these the
+# search skips Zalign() as well -- levelling the tool first would square it to
+# a surface the tag is not parallel to. See camera_tools.search_apriltag_by_tilt.
+APRILTAG_NOT_FLAT = ('cleaning_station',)
+# Speed and acceleration for setting the flowcell down on the sample stage:
+# half of what every other move runs at. Imported from robUR rather than
+# hard-coded to 0.05, so this stays half of whatever the default becomes.
+try:
+    from common.robUR import DEFAULT_ACCEL, DEFAULT_SPEED
+except ImportError:
+    # robUR is only importable where UR_12idb is on the path -- the server adds
+    # it before importing this module, but the GUI-side imports of the shared
+    # constants below do not need the robot driver.
+    DEFAULT_ACCEL = DEFAULT_SPEED = 0.1
+placement_speed = DEFAULT_SPEED / 2
+placement_accel = DEFAULT_ACCEL / 2
 flowcell_ID = state.get_flowcell_in_use()
 from epics import caget, caput
 sampletableID = 1
@@ -362,9 +380,15 @@ def dropdown_sampletable(robot):
     # distance_gripper_tag + grab_depth from the taught pose, so this is
     # (taught Z - distance_gripper_tag) - grab_depth + 0.005. Same landing
     # height the relative-move dropdown() used before it was changed to bump.
+    #
+    # The descent runs at half speed. It is the one move that sets the
+    # flowcell down on the beamline stage, open-loop -- no bump to feel for
+    # contact -- so anything the taught position is off by is taken up by the
+    # hardware. Halving the approach is cheap here: it is a 0.06 m move once
+    # per sample.
     p = list(get_sampletable_position())
     p[2] = p[2]-distance_gripper_tag-grab_depth+0.005
-    robot.moveto(p)
+    robot.moveto(p, acc=placement_accel, vel=placement_speed)
     robot.release()
     # move back up to standard height
     robot.mvr2z(distance_gripper_tag)
@@ -577,6 +601,115 @@ def raise_to_sampletable_height(robot):
     robot.moveto(p)
 
 ## Configuration functions. These functions are used to locate the positions of the sample table and cleaning station using AprilTags.
+def store_station_position(pos, v):
+    """Record `v` as station `pos`'s taught position.
+
+    The one place a station name is turned into a setter, so the AprilTag
+    search and the manual teach cannot record to different places. `pos` is a
+    commands.STATIONS name; which physical cleaning station 'cleaning_station'
+    means depends on the flowcell in use, resolved here at call time.
+
+    Raises ValueError on an unknown station rather than returning quietly:
+    silently recording nothing would look exactly like a successful teach.
+    """
+    if pos == 'sample_table':
+        set_sampletable_position(v)
+    elif pos == 'cleaning_station':
+        set_cleaningstation_position(1 if flowcell_ID == 1 else 2, v)
+    elif pos == 'mixer_cleaning_station':
+        set_mixer_cleaningstation_position(v)
+    elif pos == 'mixer_station':
+        set_mixerstation_position(v)
+    else:
+        raise ValueError('unknown station %r' % (pos,))
+    return v
+
+def get_station_position(pos):
+    """The taught position for station `pos` (a commands.STATIONS name).
+
+    The read counterpart of store_station_position(), resolving
+    'cleaning_station' against the flowcell in use the same way. Raises
+    RuntimeError (from get_position) if the station has never been taught.
+    """
+    if pos == 'sample_table':
+        return get_sampletable_position()
+    if pos == 'cleaning_station':
+        return get_cleaningstation_position(1 if flowcell_ID == 1 else 2)
+    if pos == 'mixer_cleaning_station':
+        return get_mixer_cleaningstation_position()
+    if pos == 'mixer_station':
+        return get_mixerstation_position()
+    raise ValueError('unknown station %r' % (pos,))
+
+ORIENTATION_AXES = ('x', 'y', 'z')
+
+def tweak_orientation(robot, axis, degrees):
+    """Rotate the tool `degrees` about its own `axis`, leaving position alone.
+
+    The jog behind the Configuration tab's orientation teaching. Rotating in
+    the TCP frame keeps the gripper tip where it is and swings the wrist
+    around it, so the operator can match the tool to a tilted seat without
+    losing the position the AprilTag search found.
+    """
+    axis = str(axis).lower()
+    if axis not in ORIENTATION_AXES:
+        raise ValueError('axis must be one of %s, got %r' % (ORIENTATION_AXES, axis))
+    robot.set_tcp(robot.tcp)
+    {'x': robot.rotx, 'y': robot.roty, 'z': robot.rotz}[axis](
+        float(degrees), coordinate='tcp')
+    return robot.get_pose().get_pose_vector().tolist()
+
+def goto_station(robot, pos):
+    """Move the robot to station `pos`'s taught position, via transfer_point.
+
+    A manual "take me there" for checking a taught position by eye, not part
+    of any sequence -- so unlike the transports, which know both ends of the
+    leg they are running, this always goes through transfer_point. It can be
+    pressed with the arm standing anywhere, and the corridor is the one route
+    that does not depend on knowing where it started.
+
+    The arm ends at the taught pose itself: the same pose a transport starts
+    from, distance_gripper_tag + grab_depth above the grab point. It does not
+    grab, release, or descend.
+    """
+    target = get_station_position(pos)
+    move_via_transferpoint(robot, target)
+    return target
+
+def record_current_orientation(robot, pos):
+    """Replace station `pos`'s taught orientation, keeping its taught X/Y/Z.
+
+    For a station the AprilTag search locates well but cannot orient: the
+    flowcell does not sit level in its cleaning station, and its 12 mm tag is
+    too small at any workable standoff to resolve which way it is tilted (the
+    pose solver's two solutions differ by more than the tilt itself). Position
+    is unaffected by that -- centring on the tag is a 1-2 px measurement -- so
+    only RX/RY/RZ are taken from where the arm is now.
+
+    The seat angle is fixed station geometry, so this is a once-per-setup
+    operation, not something to redo per teach. Raises RuntimeError if the
+    station has no taught position yet: there is no X/Y/Z to keep.
+    """
+    taught = get_station_position(pos)
+    robot.set_tcp(robot.tcp)
+    current = robot.get_pose().get_pose_vector().tolist()
+    return store_station_position(pos, list(taught[:3]) + list(current[3:]))
+
+def record_current_position(robot, pos):
+    """Record where the robot is standing right now as station `pos`.
+
+    The manual alternative to locate_apriltag(): same stations, same stored
+    value -- the pose read with the gripper TCP active -- but taken from
+    wherever the arm has been jogged to instead of from an AprilTag search.
+
+    What gets stored is a reference pose, not the grab point: pickup()
+    descends distance_gripper_tag + grab_depth from it. Jogging the gripper
+    onto the object and pressing this would teach a position that much too
+    low, so the arm has to be left where a search would leave it.
+    """
+    robot.set_tcp(robot.tcp)
+    return store_station_position(pos, robot.get_pose().get_pose_vector().tolist())
+
 def descend_to_apriltag(robot, distance = apriltag_view_distance, tolerance = 0.005,
                         max_steps = 4, max_descent = 0.4, stop_event = None):
     """Move the camera until it sits `distance` m from the AprilTag in view.
@@ -642,33 +775,41 @@ def locate_apriltag(robot, pos = '', stop_event=None):
     # roll_around_tag() sets, and the pixels-to-meters conversion in
     # center_camera2apriltag() all scale with it.
     robot.camera.AT_physical_size = APRILTAG_SIZES.get(pos, flowcell_apriltag_size)
-    # Two passes. The first finds the tag from wherever the reference position
-    # happens to leave the camera. The second is run from a measured
-    # apriltag_view_distance above the tag, so the position finally recorded
-    # comes from a close-range detection taken at a known standoff rather than
-    # from wherever the first pass happened to stop.
-    for refine in (False, True):
-        if refine:
-            print(f"Closing in on the {pos} tag ....")
-            if descend_to_apriltag(robot, stop_event=stop_event) is None:
-                raise RuntimeError(f"Lost the AprilTag for {pos} while closing in")
-            # Read the pose with the gripper TCP active: that is the frame
-            # search_apriltag_by_tilt() applies ref_pos in (it does
-            # set_tcp(rob.tcp) before its opening moveto). Reading it under
-            # whatever TCP the previous pass left active would hand the next
-            # pass a reference in the wrong frame.
-            robot.put_tcp2camera()
-            robot.set_tcp(robot.tcp)
-            ref_pos = robot.get_pose().get_pose_vector().tolist()
-        found = camera_tools.search_apriltag_by_tilt(robot, ref_pos=ref_pos, stop_event=stop_event)
-        if not found:
-            # Previously this fell through to grab/bump/record a position even
-            # on a failed or aborted search -- since the robot could be
-            # anywhere the tilt search left it. Stop here instead: no position
-            # is worth recording without a confirmed tag detection.
-            if stop_event is not None and stop_event.is_set():
-                raise RuntimeError(f"AprilTag search for {pos} was stopped by the operator")
-            raise RuntimeError(f"AprilTag search for {pos} failed to find a tag")
+    # One pass. This used to run the search twice, closing in between them, so
+    # that the position was recorded from a close-range detection rather than
+    # from wherever the first pass happened to stop. The search now arrives
+    # there by itself: its descent loop reaches a true standoff (it only
+    # stopped short because AT_physical_size was wrong, which is set above),
+    # and the align_to_tag path closes to AT_SQUARE_UP_DISTANCE and squares up
+    # from there. A second pass re-ran the tilt grid, the roll, and -- for a
+    # tilted tag -- the whole probe-and-square loop, from a reference already
+    # sitting on the tag, for a result the first pass had already reached.
+    found = camera_tools.search_apriltag_by_tilt(
+        robot, ref_pos=ref_pos, align_to_tag=(pos in APRILTAG_NOT_FLAT),
+        stop_event=stop_event)
+    if not found:
+        # Previously this fell through to grab/bump/record a position even
+        # on a failed or aborted search -- since the robot could be
+        # anywhere the tilt search left it. Stop here instead: no position
+        # is worth recording without a confirmed tag detection.
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError(f"AprilTag search for {pos} was stopped by the operator")
+        # Say which step gave up and why, not just that the search did.
+        # camera_tools records the reason as it bails (no tag in the tilt
+        # range, the squaring not converging, the tilt response not being
+        # invertible, ...); without it this read "failed to find a tag" even
+        # when the tag had been found and it was the alignment that failed.
+        reason = getattr(camera_tools, 'last_search_failure', None)
+        raise RuntimeError("AprilTag alignment for %s failed: %s"
+                           % (pos, reason or "no reason reported"))
+    # Settle on a known standoff before the grab. Not for the recorded value --
+    # the bump below feels for contact, so it lands in the same place either
+    # way -- but so the bump always travels about the same distance, whether
+    # the search left off at its own descent granularity or at the closer
+    # AT_SQUARE_UP_DISTANCE a tilted tag needs.
+    print(f"Settling at the working standoff for {pos} ....")
+    if descend_to_apriltag(robot, stop_event=stop_event) is None:
+        raise RuntimeError(f"Lost the AprilTag for {pos} while settling")
     robot.put_tcp2camera()
 
     robot.grab()
@@ -676,15 +817,5 @@ def locate_apriltag(robot, pos = '', stop_event=None):
     robot.set_tcp(robot.tcp)
     p = robot.get_pose()
     v = p.get_pose_vector().tolist()
-    if pos == 'sample_table':
-        set_sampletable_position(v)
-    if pos == 'cleaning_station':
-        if flowcell_ID == 1:
-            set_cleaningstation_position(1, v)
-        else:
-            set_cleaningstation_position(2, v)
-    if pos == 'mixer_cleaning_station':
-        set_mixer_cleaningstation_position(v)
-    if pos == 'mixer_station':
-        set_mixerstation_position(v)
+    store_station_position(pos, v)
     return v

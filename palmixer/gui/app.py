@@ -27,7 +27,8 @@ from PyQt5.QtWidgets import (
 
 from .. import commands as cmd
 from .. import config
-from ..mqtt_status import MQTTSubscriber, motion_topic, state_topic, tracking_topic
+from ..mqtt_status import (MQTTSubscriber, PHASE_FAILURE, motion_topic,
+                           state_topic, tracking_topic)
 from ..zmq_transport import ZMQClient
 from .config_tab import ConfigTab
 from .experiment_tab import ExperimentTab
@@ -109,6 +110,16 @@ class MainWindow(QMainWindow):
         header.addStretch(1)
         layout.addLayout(header)
 
+        # How the last action ended, in colour and in words. Outcomes used to
+        # be one line in the log below, which scrolls away and is easy to
+        # miss -- an AprilTag search that gave up looked the same as one still
+        # running. This stays put until the next command is sent.
+        self.result_label = QLabel("")
+        self.result_label.setWordWrap(True)
+        self.result_label.hide()
+        self._last_result_stamp = None
+        layout.addWidget(self.result_label)
+
         self.log_list = QListWidget()
         self.log_list.setMaximumHeight(200)
         layout.addWidget(self.log_list)
@@ -125,6 +136,7 @@ class MainWindow(QMainWindow):
 
     # -- ZMQ (command sending) ------------------------------------------------
     def send_command(self, command):
+        self._clear_result()    # the banner describes the previous command
         self._log("-> %s" % command, QColor("black"))
         threading.Thread(target=self._send_worker, args=(command,), daemon=True).start()
 
@@ -138,6 +150,10 @@ class MainWindow(QMainWindow):
     def _on_zmq_reply(self, command, reply):
         color = QColor("darkred") if reply.startswith("ERROR") else QColor("gray")
         self._log("<- %s: %s" % (command, reply), color)
+        if reply.startswith("ERROR"):
+            # A command the server refused outright. Async actions that fail
+            # after being ACCEPTED come back through _on_mqtt_motion instead.
+            self._show_error("%s -- %s" % (command, reply[len("ERROR:"):].strip()))
         # This ERROR text only comes from the Experiment/Automation tabs'
         # transport, make_sample, and unload_sample commands (see server.py's
         # _require_positions) -- Configuration-tab commands are how a
@@ -166,6 +182,22 @@ class MainWindow(QMainWindow):
 
     def _on_tracking_updated(self, snapshot):
         self.workflow_tab.update_state(snapshot)
+        self.experiment_tab.update_state(snapshot)
+        # How the last action ended, carried on the ordinary 3 s get_state
+        # poll. This is the path that works with no MQTT broker -- an async
+        # failure otherwise reaches the GUI only over the motion topic, which
+        # is silent when telemetry is disabled. Keyed on the timestamp so the
+        # same failure is not re-shown on every poll, which would stop the
+        # operator from dismissing it by sending the next command.
+        last_result = snapshot.get("last_result")
+        if isinstance(last_result, dict):
+            stamp = last_result.get("time")
+            if stamp != self._last_result_stamp:
+                self._last_result_stamp = stamp
+                detail = last_result.get("detail", "")
+                self._show_result(bool(last_result.get("ok")),
+                                  "%s%s" % (last_result.get("action", "?"),
+                                            (" -- %s" % detail) if detail else ""))
         fc_in_use = snapshot.get("flowcell_in_use")
         if fc_in_use is not None:
             self.config_tab.flowcell.set_flowcell_in_use(fc_in_use)
@@ -206,6 +238,12 @@ class MainWindow(QMainWindow):
         if detail:
             text += " -- %s" % detail
         self._log(text, color)
+        # An action that failed after it was ACCEPTED -- an AprilTag search
+        # that could not square up to the tag, a transport that raised. The
+        # ZMQ reply for these was "ACCEPTED" long ago, so this topic is the
+        # only place the outcome arrives.
+        if phase == PHASE_FAILURE:
+            self._show_error("%s failed%s" % (action, (" -- %s" % detail) if detail else ""))
 
     # -- shared helpers ----------------------------------------------------------
     def _set_busy(self, busy):
@@ -214,6 +252,20 @@ class MainWindow(QMainWindow):
             "font-weight: bold; color: %s;" % ("darkred" if busy else "darkgreen"))
         for w in self._busy_widgets:
             w.setEnabled(not busy)
+
+    def _show_result(self, ok, text):
+        self.result_label.setText(("OK: " if ok else "FAILED: ") + text)
+        self.result_label.setStyleSheet(
+            "color: white; background-color: %s; font-weight: bold; padding: 3px;"
+            % ("darkgreen" if ok else "darkred"))
+        self.result_label.show()
+
+    def _show_error(self, text):
+        self._show_result(False, text)
+
+    def _clear_result(self):
+        self.result_label.clear()
+        self.result_label.hide()
 
     def _log(self, text, color=None):
         item = QListWidgetItem(text)
