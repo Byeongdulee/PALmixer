@@ -84,7 +84,13 @@ def set_flowcell_ID(n):
     flowcell_ID = int(n)
     state.set_flowcell_in_use(flowcell_ID)
 
-_POSITION_FIELDS = ('X', 'Y', 'Z', 'RX', 'RY', 'RZ')
+# Field names as the 12idUR IOC actually spells them: the rotations are mixed
+# case. Uppercase RX/RY/RZ named PVs that do not exist, so every push reported
+# "PV not writable" and every pull "no value from PV" for those three. Matches
+# UR_12idb's own copy of this file (nmarks, 6546228). These strings are also
+# the waypoints.ini section keys, and configparser lowercases those on write,
+# so the ini is unaffected by the case change.
+_POSITION_FIELDS = ('X', 'Y', 'Z', 'Rx', 'Ry', 'Rz')
 
 # waypoints.ini, next to this file, is the runtime source of truth for taught
 # positions: get_position()/set_position() touch the file and nothing else.
