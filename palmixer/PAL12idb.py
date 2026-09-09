@@ -12,6 +12,12 @@ except ImportError:
 ref_mixer_cleantable = [0.4, 0.1, 0.1, 2.231, -2.212, 0]
 ref_cleanstation = [0.38, -0.16, -0.1, 2.231, -2.212, 0]
 ref_sampletable = [-0.22, -0.37, 0.12, -2.18860535, 2.25379435, 0]
+# Intermediate pose for the sample table <-> mixer side traverse. A direct
+# point-to-point move between those two regions sweeps the arm through what
+# sits between them, so every such leg is routed through this pose instead
+# (see move_via_transferpoint). Not a taught position: it is a fixed corridor
+# waypoint, so it lives here rather than in waypoints.ini.
+transfer_point = [0.25, -0.16, 0.1, 2.231, -2.212, 0]
 distance_gripper_tag = 0.05
 # move sth out by 50 mm
 # move sav down by 30 mm
@@ -21,9 +27,30 @@ cleaning_station1 = []
 cleaning_station2 = []
 mixer_cleaning_station = []
 mixer_station = []
-needle_clear_height = 0.20
-mixer_height = 0.02
+needle_clear_height = 0.16
+# Clearance held over the sample table on approach. Lower than
+# needle_clear_height: the full lift overshoots the table, and nothing at the
+# table needs that much room. Only the approach is shortened -- the lift at
+# whichever station the flowcell came from still uses needle_clear_height.
+sampletable_clear_height = needle_clear_height - 0.03
+mixer_height = 0.05
 grab_depth = 0.01
+# Physical edge length of the AprilTag each station shows the camera: the tag
+# on the flowcell is 12 mm, the one on the mixer head is 16 mm. The camera
+# measures distance as AT_physical_size / (tag edge in pixels) * focal length
+# (urcamera.getATdistance), so this scales every distance reading linearly --
+# with the robot's default 7.5 mm left in place the camera believes it is much
+# closer to the tag than it is, and a descent aimed at 0.2 m stops well short.
+flowcell_apriltag_size = 0.012
+mixer_apriltag_size = 0.016
+APRILTAG_SIZES = {
+    'sample_table': flowcell_apriltag_size,
+    'cleaning_station': flowcell_apriltag_size,
+    'mixer_station': mixer_apriltag_size,
+    'mixer_cleaning_station': mixer_apriltag_size,
+}
+# Camera-to-tag distance the close-range pass of locate_apriltag works from.
+apriltag_view_distance = 0.2
 flowcell_ID = state.get_flowcell_in_use()
 from epics import caget, caput
 sampletableID = 1
@@ -282,6 +309,33 @@ def check_positions_defined(station_keys):
     return missing
 
 # Basic operation functions
+# Which robot object the gripper has already been activated on. Keyed on the
+# object rather than a plain bool so that a reconnect -- which hands out a new
+# robot object talking to a freshly powered gripper -- activates again instead
+# of the flag from the previous connection suppressing it.
+_gripper_activated_on = None
+
+
+def activate_gripper(robot):
+    """Activate the gripper, unless it has already been activated on `robot`.
+
+    Activation is a slow handshake and only has to happen once, so every
+    transport routine calls this instead of robot.activate_gripper() directly.
+    Call reset_gripper_activation() to force the next call to run it again.
+    """
+    global _gripper_activated_on
+    if _gripper_activated_on is robot:
+        return
+    robot.activate_gripper()
+    _gripper_activated_on = robot
+
+
+def reset_gripper_activation():
+    """Forget that the gripper was activated, so the next call activates it."""
+    global _gripper_activated_on
+    _gripper_activated_on = None
+
+
 def pickup(robot, height = needle_clear_height):
     robot.release()
     # cm go deeper from the standard height
@@ -292,10 +346,45 @@ def pickup(robot, height = needle_clear_height):
 
 def dropdown(robot, height = needle_clear_height):
     # move down
-    robot.mvr2z(-1*(height+grab_depth-0.005))
+    #robot.mvr2z(-1*(height+grab_depth-0.005))
+    robot.bump(z=-1, backoff=0)
     robot.release()
     # move back up to standard height
     robot.mvr2z(distance_gripper_tag)
+
+def dropdown_sampletable(robot):
+    # Release onto the sample table without bumping for contact: descend to a
+    # Z computed from the taught position and let go there. The full taught
+    # pose is sent rather than a relative Z move, so where the flowcell is set
+    # down does not depend on the clearance it was carried in at.
+    #
+    # The release Z is 0.005 m above where pickup() grabs -- pickup() descends
+    # distance_gripper_tag + grab_depth from the taught pose, so this is
+    # (taught Z - distance_gripper_tag) - grab_depth + 0.005. Same landing
+    # height the relative-move dropdown() used before it was changed to bump.
+    p = list(get_sampletable_position())
+    p[2] = p[2]-distance_gripper_tag-grab_depth+0.005
+    robot.moveto(p)
+    robot.release()
+    # move back up to standard height
+    robot.mvr2z(distance_gripper_tag)
+
+def transport2sampletable(robot, p1, height = needle_clear_height,
+                          via_transferpoint = False):
+    # transport() specialized to the sample table as the destination: the drop
+    # is dropdown_sampletable() rather than the bump-for-contact dropdown(),
+    # and the destination comes from the taught sample table position rather
+    # than from the caller. The robot is assumed to be empty.
+    #
+    # via_transferpoint routes both legs -- the empty approach to p1 and the
+    # carry to the table -- through transfer_point; see _move_leg.
+    activate_gripper(robot)
+    _move_leg(robot, p1, via_transferpoint)
+    pickup(robot, height=height)
+    p2 = list(get_sampletable_position())
+    p2[2] = p2[2]-distance_gripper_tag+sampletable_clear_height
+    _move_leg(robot, p2, via_transferpoint)
+    dropdown_sampletable(robot)
 
 def test_pickup(robot, height=needle_clear_height):
     pickup(robot, height=height)
@@ -307,19 +396,51 @@ def test_mixer_pickup(robot):
 def goto_default(robot):
     robot.moveto(ref_mixer_cleantable)
 
-def transport(robot, p1, p2, height = needle_clear_height):
+def move_via_transferpoint(robot, target):
+    # Move to `target` by way of transfer_point. Used for every leg that
+    # crosses between the sample table and the rest of the cell -- the mixer,
+    # the mixer cleaning station, or the flowcell cleaning station -- in either
+    # direction and whether or not the gripper is holding anything.
+    # transfer_point is sent as a copy so a caller cannot mutate the module
+    # constant through the robot API.
+    robot.moveto(list(transfer_point))
+    robot.moveto(target)
+
+def _move_leg(robot, target, via_transferpoint):
+    # One leg of a transport, routed through transfer_point or not. Both legs
+    # of a transport get the same treatment: the routing is a property of the
+    # two stations involved, and the robot's starting pose is not knowable here
+    # (a standalone command can be run with the arm parked anywhere), so the
+    # empty approach has to clear the same obstacles the carry does.
+    if via_transferpoint:
+        move_via_transferpoint(robot, target)
+    else:
+        robot.moveto(target)
+
+def transport(robot, p1, p2, height = needle_clear_height, drop_height = None,
+              via_transferpoint = False):
     # picking up the flowcell at p1 and dropping it at p2. The robot is assumed to be empty.
     # assuming robot is empty
-    robot.activate_gripper()
-    robot.moveto(p1)
-    pickup(robot)
+    # `drop_height` is the clearance held over p2, and defaults to `height`.
+    # It is separate so a station that wants a lower approach (the sample
+    # table) can have one without also shortening the lift at p1, which has to
+    # stay tall enough to clear the needle.
+    if drop_height is None:
+        drop_height = height
+    activate_gripper(robot)
+    _move_leg(robot, p1, via_transferpoint)
+    # `height` has to reach pickup()/dropdown() too, not just the travel Z
+    # below: the mixer head only needs to clear its post by mixer_height, and
+    # lifting it the full needle_clear_height instead swings it far higher
+    # than the move requires.
+    pickup(robot, height=height)
     # Z position should be the needle cleared position. Work on a copy: writing
     # p2[2] in place edits the caller's list, so a taught position passed in
     # (sample_table / cleaning_station) would creep upward on every transport.
     p2 = list(p2)
-    p2[2] = p2[2]-distance_gripper_tag+height
-    robot.moveto(p2)
-    dropdown(robot)
+    p2[2] = p2[2]-distance_gripper_tag+drop_height
+    _move_leg(robot, p2, via_transferpoint)
+    dropdown(robot, height=drop_height)
 # State tracking. Every transport function below is wrapped with @_tracks so
 # that wherever it is called from -- a workflow or a single button on the
 # Experiment tab -- the tracked location is updated the same way. The state
@@ -372,7 +493,9 @@ def load_flowcell_from_cleaningstation_to_beam(robot):
         cleaning_station = get_cleaningstation_position(1)
     else:
         cleaning_station = get_cleaningstation_position(2)
-    transport(robot, cleaning_station, get_sampletable_position(), height=needle_clear_height)
+    # cleaning station -> sample table: crosses between the two regions.
+    transport2sampletable(robot, cleaning_station, height=needle_clear_height,
+                          via_transferpoint=True)
 
 # Bring the flowcell from the beam to the cleaning station.
 @_tracks(_flowcell_setter, state.FC_AT_CLEANING)
@@ -381,7 +504,9 @@ def load_flowcell_from_beam_to_cleaningstation(robot):
         cleaning_station = get_cleaningstation_position(1)
     else:
         cleaning_station = get_cleaningstation_position(2)
-    transport(robot, get_sampletable_position(), cleaning_station, height=needle_clear_height)
+    # sample table -> cleaning station: crosses between the two regions.
+    transport(robot, get_sampletable_position(), cleaning_station,
+              height=needle_clear_height, via_transferpoint=True)
 
 # Bring the flowcell parked at the cleaning station to the mixing station,
 # Ready to draw solution from the mixer. The robot is assumed to be empty.
@@ -405,9 +530,10 @@ def ready_flowcell_to_draw(robot):
 def load_sample_to_beam(robot):
     robot.mvr2z(needle_clear_height)
     p2 = list(get_sampletable_position())
-    p2[2] = p2[2]-distance_gripper_tag+needle_clear_height
-    robot.moveto(p2)
-    dropdown(robot)
+    p2[2] = p2[2]-distance_gripper_tag+sampletable_clear_height
+    # mixer station -> sample table: crosses between the two regions.
+    move_via_transferpoint(robot, p2)
+    dropdown_sampletable(robot)
 
 # after data collection, pick up the flowcell from the beam and move it to the mixer to aspirate.
 @_tracks(_flowcell_setter, state.FC_IN_GRIPPER)
@@ -417,12 +543,16 @@ def return_sample(robot):
     sample_table_pos = get_sampletable_position()
     p[2] = sample_table_pos[2]
     robot.moveto(p)
-    # move to the sample table
-    robot.moveto(sample_table_pos)
+    # move to the sample table. Routed through the transfer point because the
+    # gripper is not necessarily starting from the sample table side: in
+    # unload_sample this runs straight after mixer2cleaningstation, so the
+    # approach can begin at the mixer cleaning station.
+    move_via_transferpoint(robot, sample_table_pos)
     pickup(robot)
     p2 = list(get_mixerstation_position())
     p2[2] = p2[2]-distance_gripper_tag+needle_clear_height
-    robot.moveto(p2)
+    # sample table -> mixer station: crosses between the two regions.
+    move_via_transferpoint(robot, p2)
     robot.bump(z=-1,backoff=0.005)
 
 # after aspirating, move the flowcell to the cleaning station and drop it.
@@ -447,6 +577,46 @@ def raise_to_sampletable_height(robot):
     robot.moveto(p)
 
 ## Configuration functions. These functions are used to locate the positions of the sample table and cleaning station using AprilTags.
+def descend_to_apriltag(robot, distance = apriltag_view_distance, tolerance = 0.005,
+                        max_steps = 4, max_descent = 0.4, stop_event = None):
+    """Move the camera until it sits `distance` m from the AprilTag in view.
+
+    Returns the last measured camera-to-tag distance, or None if no tag could
+    be read at all. robot.camera.AT_physical_size has to already be set to the
+    size of the tag being looked at -- locate_apriltag() does that from
+    APRILTAG_SIZES -- since the measurement is directly proportional to it.
+
+    Measure and move is iterated rather than done once, because each step is
+    only as good as the single frame behind it; the loop stops as soon as the
+    tag is within `tolerance` of the target. max_descent caps the total
+    downward travel this can ever command, so one bad reading (a misread tag,
+    a stale AT_physical_size) cannot walk the arm down into the station.
+    """
+    # _detect_apriltag is camera_tools' own helper rather than public API, but
+    # it is what every distance check in that module uses: it re-polls until
+    # the tag reads, reuses a live display loop's frame if one is running, and
+    # honours stop_event instead of waiting out its settle timeout.
+    measured = None
+    descended = 0.0
+    for _ in range(max_steps):
+        if stop_event is not None and stop_event.is_set():
+            return measured
+        if camera_tools._detect_apriltag(robot, stop_event=stop_event) is None:
+            return measured
+        measured = robot.camera.QRdistance
+        step = measured - distance
+        print(f"AprilTag is {measured:.3f} m from the camera (target {distance:.3f} m).")
+        if abs(step) <= tolerance:
+            break
+        if step > 0 and descended + step > max_descent:
+            step = max_descent - descended
+            if step <= 0:
+                print(f"Stopping at the {max_descent:.3f} m descent limit.")
+                break
+        robot.mvr2z(-step)
+        descended = descended + step
+    return measured
+
 def locate_apriltag(robot, pos = '', stop_event=None):
     # Record the taught position of a station. Returns the pose it found, and
     # also stores it in sample_table / cleaning_station. stop_event, if given,
@@ -465,15 +635,40 @@ def locate_apriltag(robot, pos = '', stop_event=None):
     print(f"Looking for {pos} ....")
     if len(ref_pos)==0:
         ref_pos = ref_sampletable
-    found = camera_tools.search_apriltag_by_tilt(robot, ref_pos=ref_pos, stop_event=stop_event)
-    if not found:
-        # Previously this fell through to grab/bump/record a position even on
-        # a failed or aborted search -- since the robot could be anywhere the
-        # tilt search left it. Stop here instead: no position is worth
-        # recording without a confirmed tag detection.
-        if stop_event is not None and stop_event.is_set():
-            raise RuntimeError(f"AprilTag search for {pos} was stopped by the operator")
-        raise RuntimeError(f"AprilTag search for {pos} failed to find a tag")
+    # Tell the camera how big the tag it is about to look at actually is,
+    # before anything measures a distance from it. This is read by every
+    # distance-based step downstream, not just the descent below: the tilt
+    # search's own "descend until the tag is 0.2 m away" loop, the pivot point
+    # roll_around_tag() sets, and the pixels-to-meters conversion in
+    # center_camera2apriltag() all scale with it.
+    robot.camera.AT_physical_size = APRILTAG_SIZES.get(pos, flowcell_apriltag_size)
+    # Two passes. The first finds the tag from wherever the reference position
+    # happens to leave the camera. The second is run from a measured
+    # apriltag_view_distance above the tag, so the position finally recorded
+    # comes from a close-range detection taken at a known standoff rather than
+    # from wherever the first pass happened to stop.
+    for refine in (False, True):
+        if refine:
+            print(f"Closing in on the {pos} tag ....")
+            if descend_to_apriltag(robot, stop_event=stop_event) is None:
+                raise RuntimeError(f"Lost the AprilTag for {pos} while closing in")
+            # Read the pose with the gripper TCP active: that is the frame
+            # search_apriltag_by_tilt() applies ref_pos in (it does
+            # set_tcp(rob.tcp) before its opening moveto). Reading it under
+            # whatever TCP the previous pass left active would hand the next
+            # pass a reference in the wrong frame.
+            robot.put_tcp2camera()
+            robot.set_tcp(robot.tcp)
+            ref_pos = robot.get_pose().get_pose_vector().tolist()
+        found = camera_tools.search_apriltag_by_tilt(robot, ref_pos=ref_pos, stop_event=stop_event)
+        if not found:
+            # Previously this fell through to grab/bump/record a position even
+            # on a failed or aborted search -- since the robot could be
+            # anywhere the tilt search left it. Stop here instead: no position
+            # is worth recording without a confirmed tag detection.
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError(f"AprilTag search for {pos} was stopped by the operator")
+            raise RuntimeError(f"AprilTag search for {pos} failed to find a tag")
     robot.put_tcp2camera()
 
     robot.grab()
