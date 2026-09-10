@@ -368,36 +368,49 @@ def pickup(robot, height = needle_clear_height):
     # move high enough so the needle is cleared
     robot.mvr2z(height)
 
-def dropdown(robot, height = needle_clear_height):
+def dropdown_at(robot, station_pos, acc=None, vel=None):
+    """Descend to `station_pos`'s release height and let go.
+
+    The release Z is 0.005 m above where pickup() grabs -- pickup() descends
+    distance_gripper_tag + grab_depth from the taught pose, so this is
+    (taught Z - distance_gripper_tag) - grab_depth + 0.005.
+
+    The full taught pose is sent rather than a relative Z move, so where the
+    flowcell is set down does not depend on the clearance it was carried in
+    at. No bump: feeling for contact was releasing high, because anything the
+    gripper brushes on the way -- a lip on the station, a slightly cocked
+    flowcell, the arm's own deceleration -- reads as arrival.
+    """
+    p = list(station_pos)
+    p[2] = p[2]-distance_gripper_tag-grab_depth+0.005
+    if acc is None or vel is None:
+        robot.moveto(p)
+    else:
+        robot.moveto(p, acc=acc, vel=vel)
+    robot.release()
+    # move back up to standard height
+    robot.mvr2z(distance_gripper_tag)
+
+def dropdown(robot, height = needle_clear_height, station_pos = None):
+    # Release onto a station. Given the destination's taught pose, this
+    # descends to a computed Z (dropdown_at); without one it falls back to a
+    # relative move down from wherever the caller left the arm, which is only
+    # right if that was the travel height `height` describes.
+    if station_pos is not None:
+        return dropdown_at(robot, station_pos)
     # move down
-    #robot.mvr2z(-1*(height+grab_depth-0.005))
-    robot.bump(z=-1, backoff=0)
+    robot.mvr2z(-1*(height+grab_depth-0.005))
     robot.release()
     # move back up to standard height
     robot.mvr2z(distance_gripper_tag)
 
 def dropdown_sampletable(robot):
-    # Release onto the sample table without bumping for contact: descend to a
-    # Z computed from the taught position and let go there. The full taught
-    # pose is sent rather than a relative Z move, so where the flowcell is set
-    # down does not depend on the clearance it was carried in at.
-    #
-    # The release Z is 0.005 m above where pickup() grabs -- pickup() descends
-    # distance_gripper_tag + grab_depth from the taught pose, so this is
-    # (taught Z - distance_gripper_tag) - grab_depth + 0.005. Same landing
-    # height the relative-move dropdown() used before it was changed to bump.
-    #
-    # The descent runs at half speed. It is the one move that sets the
-    # flowcell down on the beamline stage, open-loop -- no bump to feel for
-    # contact -- so anything the taught position is off by is taken up by the
-    # hardware. Halving the approach is cheap here: it is a 0.06 m move once
-    # per sample.
-    p = list(get_sampletable_position())
-    p[2] = p[2]-distance_gripper_tag-grab_depth+0.005
-    robot.moveto(p, acc=placement_accel, vel=placement_speed)
-    robot.release()
-    # move back up to standard height
-    robot.mvr2z(distance_gripper_tag)
+    # The sample table drop, at half speed: it is the one placement onto the
+    # beamline stage, open-loop, so anything the taught position is off by is
+    # taken up by the hardware. Halving the approach is cheap -- a 0.06 m move
+    # once per sample.
+    return dropdown_at(robot, get_sampletable_position(),
+                       acc=placement_accel, vel=placement_speed)
 
 def transport2sampletable(robot, p1, height = needle_clear_height,
                           via_transferpoint = False):
@@ -468,9 +481,10 @@ def transport(robot, p1, p2, height = needle_clear_height, drop_height = None,
     # p2[2] in place edits the caller's list, so a taught position passed in
     # (sample_table / cleaning_station) would creep upward on every transport.
     p2 = list(p2)
+    destination = list(p2)          # the taught pose, before the clearance
     p2[2] = p2[2]-distance_gripper_tag+drop_height
     _move_leg(robot, p2, via_transferpoint)
-    dropdown(robot, height=drop_height)
+    dropdown(robot, height=drop_height, station_pos=destination)
 # State tracking. Every transport function below is wrapped with @_tracks so
 # that wherever it is called from -- a workflow or a single button on the
 # Experiment tab -- the tracked location is updated the same way. The state
@@ -594,7 +608,12 @@ def wash_flowcell_after_return(robot):
         cleaning_station = get_cleaningstation_position(2)
     robot.mvr2z(needle_clear_height)
     robot.moveto(cleaning_station)
-    dropdown(robot, height=mixer_height)
+    # Pass the taught pose so the release Z is computed from it. The relative
+    # form only landed right here by coincidence: this moves to the taught
+    # pose itself rather than to a travel height above it, and the descent
+    # (height + grab_depth - 0.005) happened to come out correct because
+    # mixer_height and distance_gripper_tag are both 0.05.
+    dropdown(robot, height=mixer_height, station_pos=cleaning_station)
 
 # after washing, raise the robot to the sample table's height so it is clear
 # of the cleaning station before the next command moves it elsewhere. Uses the

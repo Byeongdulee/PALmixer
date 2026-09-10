@@ -67,7 +67,7 @@ _DEFAULTS = {
     # advisory (the dashboard owns the real mix speed); timeouts govern the
     # REQ/REP round-trip and the poll-to-completion wait in palmixer/pump.py.
     "pump": {"mixing_speed_rpm": 800.0, "min_rpm": 0.0, "max_rpm": 3000.0,
-             "host": "127.0.0.1", "mixer_port": 5555, "flowcell_port": 5556,
+             "host": "sec12b02.xray.aps.anl.gov", "mixer_port": 5555, "flowcell_port": 5556,
              "request_timeout_s": 5.0, "poll_interval_s": 0.5,
              "operation_timeout_s": 600.0},
 }
