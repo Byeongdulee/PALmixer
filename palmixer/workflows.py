@@ -518,9 +518,11 @@ class Workflows:
 
     # -- draw_load_sample ---------------------------------------------------------
     # draw_and_load's counterpart for a named slot: it turns the carousel to
-    # `slot` first instead of drawing from whatever vial the mixer was last
-    # left over. Still no mixing, so no slot is consumed and no ID is minted --
-    # the slot is expected to have been prepared already.
+    # `slot`'s *drawing* position (draw_offset_steps forward of its mixing
+    # position -- see _advance_carousel) first, instead of drawing from
+    # whatever vial the mixer was last left over. Still no mixing, so no slot
+    # is consumed and no ID is minted -- the slot is expected to have been
+    # prepared already.
     def _check_draw_load_sample(self, slot, sample_id=None):
         """Validate a preloaded slot without running the mixer."""
         try:
@@ -547,9 +549,9 @@ class Workflows:
         if self.simulate:
             fc = state.get_flowcell_in_use()
             for step, on_success in (
+                    ("advance_carousel", lambda: self._advance_carousel_state(slot)),
                     ("ready_flowcell_to_draw", lambda: state.set_flowcell_location(
                         fc, state.FC_IN_GRIPPER)),
-                    ("rotate_carousel", lambda: state.set_carousel_slot(slot)),
                     ("draw_to_flowcell", None),
                     ("load_sample_to_beam", lambda: state.set_flowcell_location(
                         fc, state.FC_AT_BEAM))):
@@ -558,8 +560,15 @@ class Workflows:
             return self._make_sample_detail("simulated draw_load_sample", slot,
                                             sample_id or "preloaded")
 
+        # Turn the carousel to `slot`'s *drawing* position -- draw_offset_steps
+        # forward of its mixing position, the same offset make_sample uses for
+        # the vial it just mixed (see _advance_carousel) -- before the
+        # flowcell comes down onto it. This has to run first: ready_flowcell_
+        # to_draw lowers the flowcell onto and bumps whatever is currently
+        # under the seat, so the requested slot has to already be there, not
+        # spun into place underneath a flowcell that has already landed.
+        self._step("advance_carousel", lambda: self._advance_carousel(slot, target_position))
         self._step("ready_flowcell_to_draw", lambda: self.pal.ready_flowcell_to_draw(self.robot))
-        self._step("rotate_carousel", lambda: self._rotate_carousel(slot, target_position))
         # The wash a preceding unload_sample left running is on this same pump,
         # and the arm holds the flowcell down on the vial until the draw
         # returns -- so it is waited out here, as a named step, rather than

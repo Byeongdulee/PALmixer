@@ -167,10 +167,31 @@ class WorkflowTab(QWidget):
         draw_btn.setToolTip(
             "Draw from the vial the mixer is already over and put the\n"
             "flowcell in the beam -- make_sample without the mixing.\n"
-            "Consumes no carousel slot and assigns no sample ID.")
+            "Consumes no carousel slot and assigns no sample ID.\n\n"
+            "Does NOT rotate the carousel: if you want a specific slot,\n"
+            "use \"Draw and Load Slot\" instead.")
         draw_btn.clicked.connect(lambda: self._send_command(cmd.draw_and_load_command()))
         layout.addWidget(draw_btn)
         self._all_buttons.append(draw_btn)
+
+        # The slot-aware counterpart: rotates the carousel to the Slot box's
+        # value (draw_offset_steps forward of its mixing position -- the same
+        # slot/ID boxes the Carousel group above uses) before drawing, rather
+        # than trusting whatever the carousel already happens to be sitting
+        # on. "Draw and Load" leaves that to the caller, which is exactly
+        # right just after "Aspirate back to mixer" recovers a sample (the
+        # carousel is already at that vial's draw point) but silently draws
+        # from the wrong vial otherwise.
+        draw_slot_btn = QPushButton("Draw and Load Slot")
+        draw_slot_btn.setToolTip(
+            "Turn the carousel to the Slot box's drawing position (4 steps\n"
+            "forward of its mixing position by default) and draw it into\n"
+            "the flowcell -- for an already-prepared slot, regardless of\n"
+            "where the carousel currently sits.\n\n"
+            "Consumes no carousel slot; the sample ID here is a label only.")
+        draw_slot_btn.clicked.connect(self._on_draw_load_sample)
+        layout.addWidget(draw_slot_btn)
+        self._all_buttons.append(draw_slot_btn)
 
         unload_btn = QPushButton("Unload Sample")
         unload_btn.clicked.connect(self._on_unload_sample)
@@ -226,6 +247,12 @@ class WorkflowTab(QWidget):
         # this consumes is recorded either way.
         self._send_command(cmd.make_sample_command(self.slot_box.value(),
                                                    self.sample_id_edit.text().strip()))
+
+    def _on_draw_load_sample(self):
+        # Unlike make_sample, a blank ID here is just left blank -- nothing
+        # mints one, since draw_load_sample records no ID at all.
+        self._send_command(cmd.draw_load_sample_command(
+            self.slot_box.value(), self.sample_id_edit.text().strip()))
 
     # -- tracking panel ---------------------------------------------------
     def _build_tracking_group(self):

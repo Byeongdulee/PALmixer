@@ -123,7 +123,8 @@ that call. See the docstring in `_winenv.py`.
 | `mount_carousel <id> [base64 {slot: sample_id}]` | fast | Declare which carousel is in the machine and everything on it, in **one** transition |
 | `get_carousel_id` | fast | The mounted carousel's ID, or `unknown` |
 | `make_sample <slot> [sample id]` | worker | Full mix-and-load sequence (see below), tagging `<slot>` with the sample ID -- a timestamp ID is assigned if none is given |
-| `draw_and_load` | worker | Draw an already-mixed vial into the flowcell and put it in the beam (see below) -- `make_sample` without the mixing, so no slot is consumed |
+| `draw_and_load` | worker | Draw an already-mixed vial into the flowcell and put it in the beam (see below) -- `make_sample` without the mixing, so no slot is consumed. Does **not** rotate the carousel |
+| `draw_load_sample <slot> [sample id]` | worker | Like `draw_and_load`, but rotates the carousel to `<slot>`'s drawing position first (see below) -- for a specific, already-prepared slot |
 | `unload_sample [aspirate]` | worker | Take the flowcell off the beam and wash it (see below). `aspirate` recovers the sample into its vial first; without it the sample is discarded with the wash |
 | `set_flowcell <1\|2>` | fast | Change which flowcell the transport functions and workflows act on -- a "Flowcell in Use" selector sending this lives on all three GUI tabs, kept in sync with each other from `get_state`/the tracking topic |
 | `get_state` | fast | JSON tracking snapshot (see below) |
@@ -483,7 +484,26 @@ sample just recovered by `unload_sample aspirate`. Requires the flowcell in use
 to be at the cleaning station and the mixer head's location to be known.
 Nothing here touches the carousel: no slot is consumed and no sample ID is
 assigned, so the vial drawn from is whichever one the last rotation left the
-mixer over.
+mixer over. **This does not rotate the carousel** -- if you want a specific
+slot, use `draw_load_sample` instead; pressing this without having first
+positioned the carousel there draws from whatever vial happens to already be
+at the draw point, silently.
+
+**`draw_load_sample <slot> [sample id]`**: advance carousel (to `<slot>`'s
+*drawing* position -- `draw_offset_steps` forward of its mixing position, same
+as `make_sample`'s advance) -> mixer2cleaningstation (if needed) ->
+ready_flowcell_to_draw -> pump draw_to_flowcell -> load_sample_to_beam -> park
+at the transfer point. `draw_and_load`'s slot-aware counterpart, for a named,
+already-prepared slot rather than whatever the carousel already happens to be
+sitting on. The rotation runs *before* `ready_flowcell_to_draw`, deliberately:
+that step lowers the flowcell onto and bumps whatever is currently under the
+seat, so the requested slot has to already be there. Requires the flowcell in
+use to be at the cleaning station and the mixer head's location to be known,
+same as `draw_and_load`. Nothing here touches the carousel's slot inventory
+either: no slot is consumed, and `sample id` is a label on the completion
+detail only, not recorded against the slot. The Automation tab's **Draw and
+Load Slot** button, next to **Draw and Load**, using the same Slot/Sample ID
+boxes as **Make a Sample**.
 
 **`unload_sample`**: load_flowcell_from_beam_to_cleaningstation -> pump
 wash_flowcell -> raise the robot back to sample-table height -> park at the

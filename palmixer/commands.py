@@ -24,6 +24,7 @@ strings, one request -> one reply.
     "stop_pump"                           -> "OK <detail>" | "ERROR: <reason>"
     "make_sample <slot> [sample id]"      -> "ACCEPTED" | "ERROR: <reason>"
     "draw_and_load"                       -> "ACCEPTED" | "ERROR: <reason>"
+    "draw_load_sample <slot> [sample id]" -> "ACCEPTED" | "ERROR: <reason>"
     "unload_sample [aspirate]"            -> "ACCEPTED" | "ERROR: <reason>"
     "set_flowcell <1|2>"                  -> "OK" | "ERROR: <reason>"
     "get_state"                           -> "<JSON snapshot>"
@@ -399,6 +400,20 @@ def make_sample_command(slot, sample_id=None):
 def draw_and_load_command():
     """Build the wire command to draw an already-mixed sample and load it."""
     return DRAW_AND_LOAD
+
+
+def draw_load_sample_command(slot, sample_id=None):
+    """Build the wire command to turn the carousel to ``slot``'s drawing
+    position (draw_offset_steps forward of its mixing position) and draw it.
+
+    Unlike ``draw_and_load``, which draws from wherever the carousel already
+    happens to be sitting, this rotates there first -- for a specific,
+    already-prepared slot rather than whatever a previous rotate left under
+    the seat. ``sample_id`` is a label only: no slot is consumed and no ID is
+    recorded in the carousel's inventory."""
+    if sample_id and str(sample_id).strip():
+        return "%s %s %s" % (DRAW_LOAD_SAMPLE, slot, str(sample_id).strip())
+    return "%s %s" % (DRAW_LOAD_SAMPLE, slot)
 
 
 def unload_sample_command(aspirate=False):
