@@ -516,6 +516,60 @@ class Workflows:
 
         return "draw_and_load complete"
 
+    # -- draw_load_sample ---------------------------------------------------------
+    # draw_and_load's counterpart for a named slot: it turns the carousel to
+    # `slot` first instead of drawing from whatever vial the mixer was last
+    # left over. Still no mixing, so no slot is consumed and no ID is minted --
+    # the slot is expected to have been prepared already.
+    def _check_draw_load_sample(self, slot, sample_id=None):
+        """Validate a preloaded slot without running the mixer."""
+        try:
+            state.validate_slot(slot)
+            if sample_id is not None:
+                state.clean_sample_id(sample_id)
+        except ValueError as e:
+            raise WorkflowError(str(e))
+        fc = state.get_flowcell_in_use()
+        self._require_known(state.get_flowcell_location(fc), "flowcell_%d" % fc,
+                            (state.FC_AT_CLEANING,))
+        if state.get_flowcell_location(fc) != state.FC_AT_CLEANING:
+            raise WorkflowError("flowcell %d must be at its cleaning station" % fc)
+        if state.get_mixer_head() == state.UNKNOWN:
+            raise WorkflowError("mixer head location is unknown")
+        try:
+            return state.slot_position(slot)
+        except KeyError as e:
+            raise WorkflowError(e.args[0])
+
+    def draw_load_sample(self, slot, sample_id=None):
+        """Draw an already-prepared slot into the selected flow cell without mixing."""
+        target_position = self._check_draw_load_sample(slot, sample_id)
+        if self.simulate:
+            fc = state.get_flowcell_in_use()
+            for step, on_success in (
+                    ("ready_flowcell_to_draw", lambda: state.set_flowcell_location(
+                        fc, state.FC_IN_GRIPPER)),
+                    ("rotate_carousel", lambda: state.set_carousel_slot(slot)),
+                    ("draw_to_flowcell", None),
+                    ("load_sample_to_beam", lambda: state.set_flowcell_location(
+                        fc, state.FC_AT_BEAM))):
+                self._simulated_step(step, on_success=on_success)
+            self._park()
+            return self._make_sample_detail("simulated draw_load_sample", slot,
+                                            sample_id or "preloaded")
+
+        self._step("ready_flowcell_to_draw", lambda: self.pal.ready_flowcell_to_draw(self.robot))
+        self._step("rotate_carousel", lambda: self._rotate_carousel(slot, target_position))
+        # The wash a preceding unload_sample left running is on this same pump,
+        # and the arm holds the flowcell down on the vial until the draw
+        # returns -- so it is waited out here, as a named step, rather than
+        # stalling inside the draw.
+        self._await_background_pump("draw_to_flowcell")
+        self._step("draw_to_flowcell", lambda: self._pump_op("draw_to_flowcell"))
+        self._step("load_sample_to_beam", lambda: self.pal.load_sample_to_beam(self.robot))
+        self._park()
+        return self._make_sample_detail("draw_load_sample", slot, sample_id or "preloaded")
+
     # -- unload_sample ------------------------------------------------------------
     def _check_unload_sample(self, aspirate=False):
         fc = state.get_flowcell_in_use()
@@ -536,7 +590,7 @@ class Workflows:
             self._require_known(mixer_loc, state.WHAT_MIXER_HEAD,
                                  (state.MIXER_AT_MIXER, state.MIXER_AT_CLEANING))
 
-    def unload_sample(self, aspirate=False):
+    def unload_sample(self, aspirate=False, wait_clean=True):
         """Take the flowcell off the beam, wash it, and clear the arm.
 
         By default the sample is not kept: the flowcell goes straight from the
@@ -545,6 +599,10 @@ class Workflows:
         mixer, push the contents back into the vial they were mixed in, and
         only then go on to the cleaning station -- which is what this workflow
         used to do on every run. See the module plan for both step lists.
+
+        `wait_clean` only bites on the aspirate path, which is the only one
+        that still holds the sequence open for the wash. The default path
+        backgrounds that wash either way, so there is nothing there to skip.
         """
         self._check_unload_sample(aspirate)
         mixer_loc = state.get_mixer_head()
@@ -599,7 +657,10 @@ class Workflows:
         self._await_background_pump("aspirate_from_flowcell")
         self._step("aspirate_from_flowcell", lambda: self._pump_op("aspirate_from_flowcell"))
         self._step("wash_flowcell_after_return", lambda: self.pal.wash_flowcell_after_return(self.robot))
-        self._step("wash_flowcell", lambda: self._pump_op("wash_flowcell"))
+        if wait_clean:
+            self._step("wash_flowcell", lambda: self._pump_op("wash_flowcell"))
+        else:
+            self._start_background_pump_op("wash_flowcell")
         self._step("raise_to_sampletable_height",
                     lambda: self.pal.raise_to_sampletable_height(self.robot))
         self._park()

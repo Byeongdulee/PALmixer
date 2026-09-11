@@ -511,6 +511,24 @@ class PALmixerServer:
                                  " (%s)" % sample_id if sample_id else "")
             return (lambda: self.workflows.make_sample(slot, sample_id)), label
 
+        if name == cmd.DRAW_LOAD_SAMPLE:
+            if not args:
+                raise ValueError("usage: %s <slot> [sample id]" % cmd.DRAW_LOAD_SAMPLE)
+            try:
+                slot = int(args[0])
+            except ValueError:
+                raise ValueError("slot must be an integer, got %r" % args[0])
+            sample_id = " ".join(args[1:]) if len(args) > 1 else None
+            self._require_positions(self.workflows._stations(
+                "ready_flowcell_to_draw", "load_sample_to_beam"))
+            try:
+                self.workflows._check_draw_load_sample(slot, sample_id)
+            except WorkflowError as e:
+                raise ValueError(str(e))
+            label = "%s %s (%s)" % (cmd.DRAW_LOAD_SAMPLE, slot,
+                                     sample_id or "preloaded")
+            return (lambda: self.workflows.draw_load_sample(slot, sample_id)), label
+
         if name == cmd.DRAW_AND_LOAD:
             if args:
                 raise ValueError("%s takes no arguments" % cmd.DRAW_AND_LOAD)
@@ -536,6 +554,17 @@ class PALmixerServer:
                 raise ValueError(str(e))
             label = "%s%s" % (cmd.UNLOAD_SAMPLE, " (aspirate)" if aspirate else "")
             return (lambda: self.workflows.unload_sample(aspirate)), label
+
+        if name == cmd.UNLOAD_SAMPLE_ASYNC:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.UNLOAD_SAMPLE_ASYNC)
+            self._require_positions(self.workflows.stations_for_unload_sample())
+            try:
+                self.workflows._check_unload_sample()
+            except WorkflowError as e:
+                raise ValueError(str(e))
+            return (lambda: self.workflows.unload_sample(wait_clean=False)), \
+                   cmd.UNLOAD_SAMPLE_ASYNC
 
         raise ValueError("unknown command %r" % name)
 

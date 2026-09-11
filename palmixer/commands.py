@@ -222,7 +222,9 @@ STOP_PUMP = "stop_pump"
 
 # -- automation workflows (make a full sample / unload a sample) -----------
 MAKE_SAMPLE = "make_sample"
+DRAW_LOAD_SAMPLE = "draw_load_sample"
 UNLOAD_SAMPLE = "unload_sample"
+UNLOAD_SAMPLE_ASYNC = "unload_sample_async"
 
 # make_sample's tail without the mixing: draw from the vial the mixer is
 # already sitting over and put the flowcell in the beam. For a vial that
