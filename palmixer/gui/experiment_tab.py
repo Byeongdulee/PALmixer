@@ -6,12 +6,13 @@ Configuration tab -- this tab has no direct hardware access of its own.
 """
 
 from PyQt5.QtWidgets import (
-    QDoubleSpinBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+    QDoubleSpinBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
     QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from .. import commands as cmd
 from .flowcell_selector import FlowcellSelector
+from .pump_status import PumpStatusPanel
 
 
 class ExperimentTab(QWidget):
@@ -21,6 +22,7 @@ class ExperimentTab(QWidget):
         self._all_buttons = []
 
         self.flowcell = FlowcellSelector(send_command)
+        self.pump_status = PumpStatusPanel()
 
         layout = QVBoxLayout()
         layout.addWidget(self.flowcell)
@@ -28,6 +30,7 @@ class ExperimentTab(QWidget):
         layout.addWidget(self._build_robot_group())
         layout.addWidget(self._build_motor_group())
         layout.addWidget(self._build_pump_group())
+        layout.addWidget(self.pump_status)
         layout.addStretch(1)
         self.setLayout(layout)
 
@@ -56,11 +59,49 @@ class ExperimentTab(QWidget):
             "aborted AprilTag search, or a jog from the pendant.")
         self.zalign_btn.clicked.connect(lambda: self._send_command(cmd.zalign_command()))
         layout.addWidget(self.zalign_btn)
+
+        self.release_btn = QPushButton("Release Gripper")
+        self.release_btn.setToolTip(
+            "Open the gripper where the arm is standing.\n\n"
+            "If it is holding the flowcell, that drops it -- so this asks "
+            "first, and afterwards the flowcell's tracked location is set to "
+            "unknown for you to reconcile.")
+        self.release_btn.clicked.connect(self._on_release_gripper)
+        layout.addWidget(self.release_btn)
+        self._all_buttons.append(self.release_btn)
+
+        # Not in _all_buttons, so it stays live while the server is BUSY -- a
+        # protective stop happens during a move, and the action it interrupted
+        # may still be holding the server busy. Same reasoning as the
+        # Configuration tab's Stop Search and the Automation tab's Stop Shake.
+        self.unlock_btn = QPushButton("Unlock Protective Stop")
+        self.unlock_btn.setStyleSheet("color: darkred; font-weight: bold;")
+        self.unlock_btn.setToolTip(
+            "Clear the robot's protective stop, so it will accept moves again.\n\n"
+            "Works while the server is BUSY -- that is when a protective stop\n"
+            "happens. Clear whatever caused it first; the reply says whether\n"
+            "the stop actually went away.")
+        self.unlock_btn.clicked.connect(
+            lambda: self._send_command(cmd.unlock_stop_command()))
+        layout.addWidget(self.unlock_btn)
+
         layout.addStretch(1)
 
         self._all_buttons.append(self.zalign_btn)
         box.setLayout(layout)
         return box
+
+    def _on_release_gripper(self):
+        # Opening the jaws is instant and unrecoverable if something is in
+        # them, and the button gives no clue whether anything is -- so ask.
+        if QMessageBox.question(
+                self, "Release Gripper",
+                "Open the gripper now?\n\n"
+                "If the robot is holding the flowcell, this drops it from "
+                "wherever the arm is standing.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._send_command(cmd.release_gripper_command())
 
     # -- motor ------------------------------------------------------------------
     def _build_motor_group(self):
@@ -123,6 +164,7 @@ class ExperimentTab(QWidget):
         a fast bookkeeping command answered synchronously, not an action, so it
         is enabled and disabled by this alone.
         """
+        self.pump_status.update_state(snapshot)
         size = snapshot.get("carousel_size", cmd.UNKNOWN)
         known = isinstance(size, int) and not isinstance(size, bool) and size >= 1
         self.slot_box.setEnabled(known)
@@ -134,7 +176,7 @@ class ExperimentTab(QWidget):
     def _build_pump_group(self):
         box = QGroupBox("Pump")
         layout = QHBoxLayout()
-        for op in cmd.PUMP_OPS:
+        for op in cmd.EXPERIMENT_PUMP_OPS:
             btn = QPushButton(cmd.PUMP_LABELS[op])
             btn.clicked.connect(lambda _checked, o=op: self._send_command(cmd.pump_command(o)))
             layout.addWidget(btn)

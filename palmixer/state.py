@@ -292,6 +292,24 @@ def get_carousel_step():
     return step if step else UNKNOWN
 
 
+def get_carousel_draw_offset_steps():
+    """How many steps the carousel advances between mixing and drawing.
+
+    In steps rather than motor units so it stays right if ``carousel.step``
+    changes; the distance moved is this times that. Configuration, not state,
+    like the two above -- it is fixed geometry (where the draw point sits
+    relative to the mixer head), not something a run decides.
+
+    Defaults to 4 rather than refusing when absent: unlike ``step``, a wrong
+    value here cannot send the carousel to the wrong slot, and 0 would be a
+    legitimate setting for hardware whose draw point is under the mixer.
+    """
+    try:
+        return int(config.get_section("carousel").get("draw_offset_steps", 4))
+    except (TypeError, ValueError):
+        return 4
+
+
 def require_carousel_step():
     step = get_carousel_step()
     if step == UNKNOWN:

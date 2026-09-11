@@ -9,13 +9,14 @@ tracking MQTT topic) via update_state().
 """
 
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QComboBox, QGridLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QGridLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .. import commands as cmd
 from .flowcell_selector import FlowcellSelector
+from .pump_status import PumpStatusPanel
 
 
 class WorkflowTab(QWidget):
@@ -29,11 +30,13 @@ class WorkflowTab(QWidget):
         self._samples = {}
 
         self.flowcell = FlowcellSelector(send_command)
+        self.pump_status = PumpStatusPanel()
 
         layout = QVBoxLayout()
         layout.addWidget(self.flowcell)
         layout.addWidget(self._build_carousel_group())
         layout.addWidget(self._build_workflow_group())
+        layout.addWidget(self.pump_status)
         layout.addWidget(self._build_tracking_group())
         layout.addStretch(1)
         self.setLayout(layout)
@@ -119,6 +122,23 @@ class WorkflowTab(QWidget):
         every time the 3 s get_state poll came back."""
         self.sample_id_edit.setText(self._samples.get(slot, ""))
 
+    def _show_assigned_sample_id(self, previous):
+        """Fill the ID box with an ID the server assigned, e.g. the timestamp
+        make_sample mints when its mix finishes and the operator named nothing.
+
+        Only on a change, and only into a box holding nothing or the value that
+        just changed. update_state() cannot simply write the selected slot's ID
+        every time -- the 3 s get_state poll would wipe a half-typed one
+        between keystrokes (see _on_slot_changed) -- but leaving the box empty
+        after a run means the ID the sample actually got is only visible in the
+        slot table, and pressing "Set ID" next would then tag the slot with
+        whatever stale text was there.
+        """
+        slot = self.slot_box.value()
+        was, now = previous.get(slot, ""), self._samples.get(slot, "")
+        if now != was and self.sample_id_edit.text().strip() in ("", was):
+            self.sample_id_edit.setText(now)
+
     def _on_reset_carousel(self):
         # Destructive and not obviously so: it discards the taught positions
         # too, so say that before doing it rather than after.
@@ -143,13 +163,63 @@ class WorkflowTab(QWidget):
         layout.addWidget(make_btn)
         self._all_buttons.append(make_btn)
 
+        draw_btn = QPushButton("Draw and Load")
+        draw_btn.setToolTip(
+            "Draw from the vial the mixer is already over and put the\n"
+            "flowcell in the beam -- make_sample without the mixing.\n"
+            "Consumes no carousel slot and assigns no sample ID.")
+        draw_btn.clicked.connect(lambda: self._send_command(cmd.draw_and_load_command()))
+        layout.addWidget(draw_btn)
+        self._all_buttons.append(draw_btn)
+
         unload_btn = QPushButton("Unload Sample")
-        unload_btn.clicked.connect(lambda: self._send_command(cmd.unload_sample_command()))
+        unload_btn.clicked.connect(self._on_unload_sample)
         layout.addWidget(unload_btn)
         self._all_buttons.append(unload_btn)
 
+        # Off by default: the usual run washes the sample away with the
+        # flowcell. Ticking this spends three extra legs and a pump operation
+        # to put the sample back in the vial it was mixed in first.
+        self.aspirate_box = QCheckBox("Aspirate back to mixer")
+        self.aspirate_box.setToolTip(
+            "Recover the sample into its carousel vial before washing.\n"
+            "Unticked, the flowcell goes straight to the cleaning station\n"
+            "and the sample is discarded with the wash.")
+        layout.addWidget(self.aspirate_box)
+        self._all_buttons.append(self.aspirate_box)
+
+        layout.addSpacing(12)
+        shake_btn = QPushButton("Shake Sample")
+        shake_btn.setToolTip(
+            "Cycle the sample back and forth inside the flowcell in use --\n"
+            "flow2_sample for flowcell 1, flow3_sample for flowcell 2.\n"
+            "Volume and cycle count come from the flowcell dashboard.")
+        shake_btn.clicked.connect(
+            lambda: self._send_command(cmd.shake_sample_command()))
+        layout.addWidget(shake_btn)
+        self._all_buttons.append(shake_btn)
+
+        # Deliberately NOT in _all_buttons, so it stays enabled while the
+        # server is BUSY -- the same reason the Configuration tab keeps "Stop
+        # Search" out of its busy list. A stop button greyed out for exactly
+        # the window in which it is useful would be worse than no button.
+        self.stop_shake_btn = QPushButton("Stop Shake")
+        self.stop_shake_btn.setStyleSheet("color: darkred; font-weight: bold;")
+        self.stop_shake_btn.setToolTip(
+            "End the active Shake Sample cycle. Answered even while a pump\n"
+            "operation is running -- that is what it is for.\n\n"
+            "Only interrupts an active shake; an unrelated draw, wash, or\n"
+            "aspirate keeps running.")
+        self.stop_shake_btn.clicked.connect(
+            lambda: self._send_command(cmd.stop_pump_command()))
+        layout.addWidget(self.stop_shake_btn)
+
         box.setLayout(layout)
         return box
+
+    def _on_unload_sample(self):
+        self._send_command(
+            cmd.unload_sample_command(self.aspirate_box.isChecked()))
 
     def _on_make_sample(self):
         # A blank ID is fine: the server assigns a timestamp one, so the slot
@@ -220,6 +290,7 @@ class WorkflowTab(QWidget):
 
         self._carousel_label.setText(str(snapshot.get("carousel_slot", cmd.UNKNOWN)))
         self._update_carousel(snapshot)
+        self.pump_status.update_state(snapshot)
 
         fc_in_use = snapshot.get("flowcell_in_use")
         if fc_in_use is not None:
@@ -227,7 +298,9 @@ class WorkflowTab(QWidget):
             self.flowcell.set_flowcell_in_use(fc_in_use)
 
     def _update_carousel(self, snapshot):
+        previous = self._samples
         self._samples = self._by_slot(snapshot.get("carousel_samples"))
+        self._show_assigned_sample_id(previous)
         positions = self._by_slot(snapshot.get("carousel_slots"))
         size = snapshot.get("carousel_size", cmd.UNKNOWN)
         step = snapshot.get("carousel_step", cmd.UNKNOWN)

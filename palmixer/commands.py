@@ -14,12 +14,17 @@ strings, one request -> one reply.
     "set_orientation_here <station>"      -> "OK <pose>" | "ERROR: <reason>"
     "tweak_orientation x|y|z <degrees>"   -> "ACCEPTED" | "ERROR: <reason>"
     "goto_position <station>"             -> "ACCEPTED" | "ERROR: <reason>"
+    "goto_transfer_point"                 -> "ACCEPTED" | "ERROR: <reason>"
     "<transport_name>"                    -> "ACCEPTED" | "ERROR: <reason>"
     "zalign"                              -> "ACCEPTED" | "ERROR: <reason>"
+    "release_gripper"                     -> "ACCEPTED" | "ERROR: <reason>"
+    "unlock_stop"                         -> "OK <detail>" | "ERROR: <reason>"
     "motor_tweak forward|reverse <step>"  -> "ACCEPTED" | "ERROR: <reason>"
     "pump <op>"                           -> "ACCEPTED" | "ERROR: <reason>"
+    "stop_pump"                           -> "OK <detail>" | "ERROR: <reason>"
     "make_sample <slot> [sample id]"      -> "ACCEPTED" | "ERROR: <reason>"
-    "unload_sample"                       -> "ACCEPTED" | "ERROR: <reason>"
+    "draw_and_load"                       -> "ACCEPTED" | "ERROR: <reason>"
+    "unload_sample [aspirate]"            -> "ACCEPTED" | "ERROR: <reason>"
     "set_flowcell <1|2>"                  -> "OK" | "ERROR: <reason>"
     "get_state"                           -> "<JSON snapshot>"
     "set_location <what> <value>"         -> "OK" | "ERROR: <reason>"
@@ -51,11 +56,23 @@ STATIONS = (
     STATION_MIXER_CLEANING_STATION,
 )
 
+# The sample seat beside the mixer cleaning station. Taught like the four
+# above, but not searchable: it carries no AprilTag of its own, so it is left
+# out of STATIONS (which is exactly the set locate_apriltag understands) and
+# reached instead by the flowcell_to_sample_on_mixer transport, which parks the
+# flowcell over it to be jogged on and recorded by hand.
+STATION_SAMPLE_ON_MIXER = "sample_on_mixer_station"
+
+# Every station with a taught position: what "go to", "teach here", and "save
+# orientation" work on. A superset of STATIONS.
+TAUGHT_STATIONS = STATIONS + (STATION_SAMPLE_ON_MIXER,)
+
 STATION_LABELS = {
     STATION_SAMPLE_TABLE: "Sample Table",
     STATION_CLEANING_STATION: "Flowcell Cleaning Station",
     STATION_MIXER_STATION: "Mixer Station",
     STATION_MIXER_CLEANING_STATION: "Mixer Cleaning Station",
+    STATION_SAMPLE_ON_MIXER: "Sample on Mixer Station",
 }
 
 SEARCH_APRILTAG = "search_apriltag"
@@ -88,13 +105,19 @@ ORIENTATION_AXES = ("x", "y", "z")
 # actually recorded (PAL12idb.goto_station).
 GOTO_POSITION = "goto_position"
 
+# Drive to the corridor waypoint every cross-cell leg routes through. A
+# separate command rather than a GOTO_POSITION station, because it is not a
+# taught position at all: nothing to search for, nothing in waypoints.ini, and
+# so nothing for the position pre-check to refuse.
+GOTO_TRANSFER_POINT = "goto_transfer_point"
+
 # Explicit sync between waypoints.ini (which every move reads) and the
 # 12idUR:WaypointL:* EPICS PVs (the beamline-wide interchange). These are the
 # only commands that do Channel Access on the waypoint PVs.
 PUSH_POSITIONS = "push_positions"
 PULL_POSITIONS = "pull_positions"
 
-# The 8 "actual transport functions" defined in PAL12idb.py.
+# The "actual transport functions" defined in PAL12idb.py.
 TRANSPORT_FUNCTIONS = (
     "mixer2cleaningstation",
     "mixer2mixingstation",
@@ -104,6 +127,7 @@ TRANSPORT_FUNCTIONS = (
     "load_sample_to_beam",
     "return_sample",
     "wash_flowcell_after_return",
+    "flowcell_to_sample_on_mixer",
 )
 
 TRANSPORT_LABELS = {
@@ -115,6 +139,7 @@ TRANSPORT_LABELS = {
     "load_sample_to_beam": "Load Sample to Beam",
     "return_sample": "Return Sample from Beam",
     "wash_flowcell_after_return": "Wash Flowcell After Return",
+    "flowcell_to_sample_on_mixer": "Flowcell -> Sample on Mixer (hold)",
 }
 
 # Straighten the tool's Z axis to point straight down, keeping the current
@@ -123,6 +148,21 @@ TRANSPORT_LABELS = {
 # tilt search, a manual jog on the pendant -- makes the next transport's
 # vertical moves go off at an angle, and this puts it back.
 ZALIGN = "zalign"
+
+# Manual robot recovery, both on the Experiment tab's Robot panel.
+#
+# RELEASE_GRIPPER opens the jaws where the arm stands. A worker command like
+# any other hardware action, so it is refused while one is running -- pressed
+# mid-carry it would drop whatever is being carried.
+#
+# UNLOCK_STOP clears a protective stop (robUR.unlock_stop -> dashboard.unlock).
+# Fast, and deliberately not gated on the busy flag: a protective stop happens
+# *during* a move, and the action thread it interrupted may still be sitting
+# there holding the server busy, which is exactly when this is needed. It
+# reaches the robot over the dashboard socket rather than the motion one, so a
+# stuck move does not block it either.
+RELEASE_GRIPPER = "release_gripper"
+UNLOCK_STOP = "unlock_stop"
 
 MOTOR_TWEAK = "motor_tweak"
 MOTOR_FORWARD = "forward"
@@ -137,7 +177,24 @@ PUMP_DRAW_TO_FLOWCELL = "draw_to_flowcell"
 PUMP_ASPIRATE_FROM_FLOWCELL = "aspirate_from_flowcell"
 PUMP_WASH_FLOWCELL = "wash_flowcell"
 
+# Cycle the sample back and forth inside the in-use flowcell. On the flowcell
+# server this is flow2_sample or flow3_sample -- the device is part of the
+# command name there rather than an argument, so Pump picks the name.
+PUMP_SHAKE_SAMPLE = "shake_sample"
+
 PUMP_OPS = (
+    PUMP_MIX,
+    PUMP_CLEAN_MIXER,
+    PUMP_DRAW_TO_FLOWCELL,
+    PUMP_ASPIRATE_FROM_FLOWCELL,
+    PUMP_WASH_FLOWCELL,
+    PUMP_SHAKE_SAMPLE,
+)
+
+# The subset the Experiment tab lays out as its Pump row. Shaking lives on the
+# Automation tab instead, next to the workflows it belongs with, so it is left
+# out here -- the server still accepts it as an ordinary `pump <op>`.
+EXPERIMENT_PUMP_OPS = (
     PUMP_MIX,
     PUMP_CLEAN_MIXER,
     PUMP_DRAW_TO_FLOWCELL,
@@ -151,11 +208,37 @@ PUMP_LABELS = {
     PUMP_DRAW_TO_FLOWCELL: "Draw to Flowcell",
     PUMP_ASPIRATE_FROM_FLOWCELL: "Aspirate from Flowcell",
     PUMP_WASH_FLOWCELL: "Wash Flowcell",
+    PUMP_SHAKE_SAMPLE: "Shake Sample",
 }
+
+# Stop an active shake_sample now. A command of its own rather than a pump op,
+# because it is the one pump command that has to be answerable *while* a pump
+# op is running -- so the server takes it on the fast path, like stop_search,
+# and Pump sends it on a socket the running op is not holding. Reaches the
+# flowcell server's own stop_shaking, which only interrupts an active
+# flow2_sample/flow3_sample cycle -- an unrelated draw/wash/aspirate keeps
+# running.
+STOP_PUMP = "stop_pump"
 
 # -- automation workflows (make a full sample / unload a sample) -----------
 MAKE_SAMPLE = "make_sample"
 UNLOAD_SAMPLE = "unload_sample"
+
+# make_sample's tail without the mixing: draw from the vial the mixer is
+# already sitting over and put the flowcell in the beam. For a vial that
+# already holds what is wanted -- mixed by an earlier run, or recovered by
+# "unload_sample aspirate" -- so it consumes no carousel slot and assigns no
+# sample ID, unlike make_sample.
+DRAW_AND_LOAD = "draw_and_load"
+
+# Optional trailing flag on unload_sample. Without it the flowcell comes off
+# the beam and goes straight to its cleaning station to be washed, and the
+# sample in it is discarded with the wash. With it, the sample is recovered
+# first: the flowcell is carried to the mixer, its contents pushed back into
+# the vial they were mixed in, and only then does it go to be washed. That
+# recovery is three extra legs and a pump operation, and it is only worth
+# running when the sample is wanted back, so it is off by default.
+ASPIRATE = "aspirate"
 
 # -- tracking / state commands ----------------------------------------------
 SET_FLOWCELL = "set_flowcell"
@@ -250,6 +333,11 @@ def goto_position_command(station):
     return "%s %s" % (GOTO_POSITION, station)
 
 
+def goto_transfer_point_command():
+    """Build the wire command to drive to the transfer point."""
+    return GOTO_TRANSFER_POINT
+
+
 def push_positions_command():
     """waypoints.ini -> EPICS waypoint PVs."""
     return PUSH_POSITIONS
@@ -265,6 +353,16 @@ def zalign_command():
     return ZALIGN
 
 
+def release_gripper_command():
+    """Build the wire command to open the gripper where the arm stands."""
+    return RELEASE_GRIPPER
+
+
+def unlock_stop_command():
+    """Build the wire command to clear the robot's protective stop."""
+    return UNLOCK_STOP
+
+
 def motor_tweak_command(direction, step):
     """Build the wire command for a motor tweak in ``direction`` by ``step``."""
     return "%s %s %s" % (MOTOR_TWEAK, direction, step)
@@ -273,6 +371,16 @@ def motor_tweak_command(direction, step):
 def pump_command(op):
     """Build the wire command for a pump operation."""
     return "%s %s" % (PUMP, op)
+
+
+def shake_sample_command():
+    """Build the wire command to shake the sample in the in-use flowcell."""
+    return pump_command(PUMP_SHAKE_SAMPLE)
+
+
+def stop_pump_command():
+    """Build the wire command to stop an active shake_sample."""
+    return STOP_PUMP
 
 
 def make_sample_command(slot, sample_id=None):
@@ -286,8 +394,19 @@ def make_sample_command(slot, sample_id=None):
     return "%s %s" % (MAKE_SAMPLE, slot)
 
 
-def unload_sample_command():
-    """Build the wire command to run the full unload-sample sequence."""
+def draw_and_load_command():
+    """Build the wire command to draw an already-mixed sample and load it."""
+    return DRAW_AND_LOAD
+
+
+def unload_sample_command(aspirate=False):
+    """Build the wire command to run the unload-sample sequence.
+
+    ``aspirate`` appends the ASPIRATE flag, recovering the sample into its
+    vial before the flowcell is washed instead of discarding it.
+    """
+    if aspirate:
+        return "%s %s" % (UNLOAD_SAMPLE, ASPIRATE)
     return UNLOAD_SAMPLE
 
 

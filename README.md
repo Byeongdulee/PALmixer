@@ -37,6 +37,29 @@ Edit `json/palmixer_config.json`, or override with environment variables:
 | `PALMIXER_UR12IDB_PATH` | Path to the `UR_12idb` checkout (importable `robot12idb`) |
 | `PALMIXER_MOTOR_PV` | EPICS motor PV base (default `12idb:m6`) |
 | `PALMIXER_CAROUSEL_SIZE` / `PALMIXER_CAROUSEL_STEP` | Carousel geometry: slot count, and motor travel between adjacent slots (see below) |
+| `PALMIXER_DAQ_HOST` / `PALMIXER_DAQ_PORT` | Beamline DAQ GUI address (`daq_client.py`; sample-stage motor alignment, see below) |
+
+`carousel.step` is in the motor's own engineering units, **not** degrees:
+`12idb:m6` reads in mm with 33 mm of travel, so one slot is `1.0`. A `step`
+whose slot positions fall outside the motor's soft limits makes every slot but
+the reference unreachable -- see [Soft limits](#the-carousel).
+`carousel.draw_offset_steps` (4) is how many slots `make_sample` advances
+between mixing a vial and drawing from it.
+
+`robot.ur12idb_path` holds one path per operating system, so the same config
+serves the beamline Linux host and the Windows control machine:
+
+```json
+"ur12idb_path": {
+    "linux":   "/home/beams15/S12STAFF/python_codes/UR_12idb",
+    "windows": "C:/Users/s12idb/Documents/GitHub/UR_12idb"
+}
+```
+
+A list of candidate paths, or a single path, works too. The first entry that
+exists is used, preferring this OS's; if none does, a `UR_12idb` checkout
+sitting next to this repo is picked up, so a fresh clone elsewhere needs no
+edit to the shared JSON.
 
 ## Running
 
@@ -87,16 +110,21 @@ that call. See the docstring in `_winenv.py`.
 | `status` | fast | `IDLE` or `BUSY` |
 | `search_apriltag <station>` | worker | Locate a station's AprilTag (`sample_table`, `cleaning_station`, `mixer_station`, `mixer_cleaning_station`) and record its position |
 | `stop_search` | fast | Abort an in-progress `search_apriltag`: stops the robot immediately (`stopj`) and signals the search loop to give up rather than continue to the next tilt/step. `ERROR: no AprilTag search is running` if nothing is searching |
+| `release_gripper` | worker | Open the gripper where the arm stands. Refused while busy, so it cannot be pressed mid-carry; a flowcell the tracking says was in the gripper is set to `unknown`, since after this it is wherever it fell. The Experiment tab's **Release Gripper** button, behind a confirmation |
+| `unlock_stop` | fast | Clear the robot's protective stop (`robUR.unlock_stop`). Fast and ungated by the busy flag: a protective stop happens *during* a move, and the action it interrupted may still be holding the server busy. It reaches the robot over the dashboard socket, not the motion one, so a wedged move does not block it. Reads the state back and says whether the stop actually cleared. The Experiment tab's **Unlock Protective Stop** button, which stays enabled while BUSY |
+| `goto_transfer_point` | worker | Move to the fixed corridor pose every cross-cell leg routes through. Not a taught position, so it needs no configuration and is never refused as unconfigured -- the Configuration tab's **Transfer Point** button, next to the per-station Go To buttons |
 | `push_positions` / `pull_positions` | worker | Sync taught positions with the EPICS waypoint PVs (see below) |
 | `mixer2cleaningstation` etc. (8 names) | worker | Run the matching `PAL12idb` transport function |
 | `motor_tweak forward\|reverse <step>` | worker | Tweak `12idb:m6` by `step` |
-| `pump mix\|clean_mixer\|draw_to_flowcell\|aspirate_from_flowcell\|wash_flowcell` | worker | Run a pump operation (ZMQ to apssector12_pump_control) |
+| `pump mix\|clean_mixer\|draw_to_flowcell\|aspirate_from_flowcell\|wash_flowcell\|shake_sample` | worker | Run a pump operation (ZMQ to apssector12_pump_control). `shake_sample` cycles the sample inside the flowcell in use -- `flow2_sample` for flowcell 1, `flow3_sample` for flowcell 2, since that server names the device in the command rather than as an argument. The Automation tab's **Shake Sample** button; the other five are the Experiment tab's Pump row |
+| `stop_pump` | fast | End an active `shake_sample` cycle now (sends the flowcell server's `stop_shaking`, not its plainer `stop` -- see [Pump concurrency](#pump-concurrency)). Fast and ungated by the busy flag, because the point is to reach a pump operation that is running -- exactly when a worker command would be refused; `Pump` sends it on a socket the running op is not holding. Does nothing to an unrelated draw/wash/aspirate. The Automation tab's **Stop Shake** button, which stays enabled while the server is BUSY |
 | `set_mixing_speed <rpm>` | fast | The speed the next `mix` runs at. Bounds-checked against `pump.min_rpm`/`max_rpm`; refused while an action is running |
 | `get_mixing_speed` | fast | That speed, in rpm |
 | `mount_carousel <id> [base64 {slot: sample_id}]` | fast | Declare which carousel is in the machine and everything on it, in **one** transition |
 | `get_carousel_id` | fast | The mounted carousel's ID, or `unknown` |
 | `make_sample <slot> [sample id]` | worker | Full mix-and-load sequence (see below), tagging `<slot>` with the sample ID -- a timestamp ID is assigned if none is given |
-| `unload_sample` | worker | Full return-and-wash sequence (see below) |
+| `draw_and_load` | worker | Draw an already-mixed vial into the flowcell and put it in the beam (see below) -- `make_sample` without the mixing, so no slot is consumed |
+| `unload_sample [aspirate]` | worker | Take the flowcell off the beam and wash it (see below). `aspirate` recovers the sample into its vial first; without it the sample is discarded with the wash |
 | `set_flowcell <1\|2>` | fast | Change which flowcell the transport functions and workflows act on -- a "Flowcell in Use" selector sending this lives on all three GUI tabs, kept in sync with each other from `get_state`/the tracking topic |
 | `get_state` | fast | JSON tracking snapshot (see below) |
 | `set_location <mixer_head\|flowcell_1\|flowcell_2> <value>` | fast | Reconcile a tracked location after manual intervention |
@@ -122,8 +150,7 @@ Only one worker action runs at a time; a worker command sent while busy gets
 
 ### Transport functions
 
-The eight `PAL12idb` transport functions above, each sent as its own bare
-command:
+The `PAL12idb` transport functions above, each sent as its own bare command:
 
 | Command | Move |
 |---|---|
@@ -131,13 +158,47 @@ command:
 | `mixer2mixingstation` | Cleaning Station -> Mixer |
 | `load_flowcell_from_cleaningstation_to_beam` | Cleaning Station -> Beam |
 | `load_flowcell_from_beam_to_cleaningstation` | Beam -> Cleaning Station |
-| `ready_flowcell_to_draw` | Ready Flowcell to Draw |
+| `ready_flowcell_to_draw` | Ready Flowcell to Draw (onto the sample seat) |
 | `load_sample_to_beam` | Load Sample to Beam |
 | `return_sample` | Return Sample from Beam |
 | `wash_flowcell_after_return` | Wash Flowcell After Return |
+| `flowcell_to_sample_on_mixer` | Flowcell -> Sample on Mixer (hold) |
 
 Each acts on the flowcell currently in use (`set_flowcell`) and records its
 own target location on success (see [State tracking](#state-tracking)).
+
+`flowcell_to_sample_on_mixer` is the odd one out: it picks the flowcell up
+from its cleaning station and **holds** it over the sample seat on the mixer
+station instead of setting it down, so the seat can be taught (see
+[Sample on Mixer Station](#sample-on-mixer-station)).
+
+`ready_flowcell_to_draw` and `return_sample` both work at that **sample seat**,
+not at the mixer station. The mixer head comes down where `rotate_carousel`
+leaves the carousel; the flowcell reaches the vial `draw_offset_steps` round
+from there, which is what the seat is. `make_sample` turns the vial it just
+mixed round to the seat before the draw, and `unload_sample aspirate` pushes
+the sample back into that same vial, so both have to aim at the same place.
+
+Three seats are set down by feel rather than at a computed release height
+(`PAL12idb.BUMP_RELEASE_STATIONS`): the mixer cleaning station, the sample seat
+beside it, and the **flowcell cleaning station**. How deep the piece sits there
+depends on how it is held, so the seat is found rather than computed.
+
+The descent is in two parts (`PAL12idb.dropdown_by_bump`): an ordinary move
+down to `bump_approach_clearance` (0.03 m) below the taught pose, then a bump
+for the rest -- touch, back off 2 mm, open, lift clear. A bump has to creep in
+order to read contact, so feeling out the whole carry clearance took most of a
+minute over travel that is known empty air; this leaves it the last ~25 mm,
+where the seat actually is. The fast part is open-loop but no more so than
+`dropdown_at`, which drives blind all the way to the release height. It only
+ever moves **down**, and skips itself entirely if the arm's pose cannot be read
+-- the bump then does the whole descent, slow but correct.
+
+The **sample table** keeps its computed release Z, deliberately. Out there a
+bump reads contact off anything the gripper brushes on the way in, and
+releasing high drops the flowcell onto the stage. What makes the difference is
+the approach: the three bump seats are come down on vertically from directly
+overhead, so there is nothing to brush.
 
 The GUI greys its flowcell selectors out while the server is BUSY, even
 though `set_flowcell` is one of the fast commands the server would answer
@@ -158,10 +219,11 @@ of only logging it -- better than discovering it minutes into a workflow
 that was never going to succeed.
 
 Which stations a command needs is derived from the transport functions it
-actually runs, not a hand-kept list, and it follows the current tracked
-state: `unload_sample` only needs the mixer cleaning station when the mixer
-head is sitting at the mixer station and therefore has to be parked out of
-the way first.
+actually runs, not a hand-kept list, and it follows both the flags it was
+given and the current tracked state: `unload_sample` needs no mixer position
+at all unless `aspirate` was asked for, and even then it only needs the mixer
+cleaning station when the mixer head is sitting at the mixer station and
+therefore has to be parked out of the way first.
 
 ## Taught positions and the EPICS waypoint PVs
 
@@ -194,6 +256,76 @@ and only fail outright when no station synced at all.
 | 2 / 3 | Flowcell cleaning station 1 / 2 | `cleaning_station_1` / `_2` |
 | 4 | Mixer station | `mixer_station` |
 | 5 | Mixer cleaning station | `mixer_cleaning_station` |
+| 6 | Sample on mixer station | `sample_on_mixer_station` |
+
+### Sample table alignment with the DAQ GUI
+
+The sample table is where the beam is, and the beam's actual position there is
+set by a separate control system -- the beamline's own DAQ GUI, driving its
+sample-stage motors (`sth`, `sav`, `stv`) -- not by anything the robot knows.
+`palmixer/daq_client.py` is a small ZMQ client to that GUI
+(`json/palmixer_config.json`'s `daq` section: `host`, `port`,
+`request_timeout_s`; env overrides `PALMIXER_DAQ_HOST` / `PALMIXER_DAQ_PORT`),
+and PAL12idb.py uses it to keep the two systems from drifting apart:
+
+- **Recording.** Every time the robot's `sample_table` waypoint is (re)taught
+  -- searching its AprilTag, teaching it by hand, or replacing just its
+  orientation -- the DAQ motors' current positions are read and saved to
+  `palmixer/daq_positions.ini` (git-ignored, like `waypoints.ini`). Best
+  effort: a DAQ GUI that happens to be unreachable at that moment prints a
+  warning but does not stop the robot position from being taught.
+- **Alignment.** Every transport that moves the flowcell onto or off of the
+  sample table -- `load_flowcell_from_cleaningstation_to_beam`,
+  `load_flowcell_from_beam_to_cleaningstation`, `load_sample_to_beam`,
+  `return_sample` -- calls `daq_client.align_sample_table()` as its very first
+  step, before the robot moves at all. It sends the DAQ motors back to the
+  recorded positions and waits for them to arrive, so a stage nudged by
+  something else in between is put back before the robot approaches, and a
+  slow DAQ move overlaps with nothing (this runs first, not concurrently).
+- **Restoring.** `load_flowcell_from_beam_to_cleaningstation` -- the one that
+  takes the flowcell *off* the sample table -- reads the DAQ motors' current
+  positions before it aligns anything, and once the flowcell has actually
+  reached its cleaning station, sends the stage back to that reading. The beam
+  is not looking at the sample table once the flowcell has left it, so nothing
+  is served by leaving the stage parked at the sample-table alignment
+  indefinitely. Best-effort in the other direction from recording: the robot's
+  own work is already done and successful by that point, so a DAQ failure here
+  is printed rather than raised -- it must not turn an actually-successful
+  transport into one that looks failed, or mark the flowcell's location
+  `unknown` when it is not.
+
+If `sample_table` has never been taught with the DAQ GUI reachable,
+`align_sample_table()` raises before any robot motion -- the sample table
+positions are recorded but the DAQ ones are not, so nothing has run to capture
+them yet. Search (or teach) `sample_table` once with `daq_client` able to
+reach the GUI to fix this.
+
+### Sample on Mixer Station
+
+The sample seat beside the mixer cleaning station. Unlike the other five it
+carries **no AprilTag**, so `search_apriltag` cannot teach it and it is not
+one of that command's stations. It is taught by hand instead:
+
+1. **Experiment tab -> Flowcell -> Sample on Mixer (hold)**
+   (`flowcell_to_sample_on_mixer`). The flowcell is picked up from its
+   cleaning station and carried to the seat, and the arm stops holding it
+   there -- at the seat's reference pose, so the flowcell hangs
+   `distance_gripper_tag + grab_depth` (60 mm) clear of it.
+2. Jog the arm until the flowcell sits over the seat the way you want it.
+3. **Configuration tab -> Set Current Robot Position As -> Sample on Mixer
+   Station** to record it. Use **Save Orientation** instead if you only mean
+   to replace RX/RY/RZ and keep the taught X/Y/Z -- that button does not
+   record position.
+
+Until it has been taught, the target is the mixer cleaning station's taught
+pose shifted by `PAL12idb.sample_on_mixer_offset` (-0.0395 m X, -0.0894 m Y,
++0.0202 m Z -- measured from a seat found by hand), which is what makes step 1
+land on the seat rather than merely near it. That
+fallback is also why the position pre-check accepts the station as configured
+as long as the mixer cleaning station is: refusing the very move that exists
+to get the arm close enough to teach it would be circular. With neither
+taught, the error names the mixer cleaning station -- the one to go and
+search for.
 
 ## State tracking
 
@@ -214,7 +346,7 @@ moving anything:
 `unknown` is a first-class state, not an error -- a fresh install, or any
 manual/hardware intervention, leaves the affected item `unknown` until the
 operator reconciles it with `set_location` (or a workflow completes and sets
-it itself). Each of the 8 `PAL12idb` transport functions records its own
+it itself). Each `PAL12idb` transport function records its own
 target location on success and resets to `unknown` on a failed move, so
 state stays correct whether a transport function is run directly (e.g. from
 the Experiment tab) or as part of a workflow.
@@ -275,6 +407,16 @@ is the quickest way to catch a wrong `step`.
 A reference for a slot outside the configured size (a differently-sized
 carousel was configured since) reads as untaught rather than being trusted.
 
+**Soft limits.** Every slot position, and the post-mix advance, must be inside
+the motor's `.LLM`/`.HLM`. The EPICS motor record does **not** report a refusal
+in any way a client would otherwise notice -- a `.VAL` outside its limits is
+simply not acted on, `.DMOV` stays 1, and the move appears to succeed instantly
+with the motor exactly where it started. `Motor.check_in_range` therefore
+refuses out-of-range targets itself, with `.LVIO` checked after the write as a
+backstop, and `rotate_carousel` checks the *advance* target before the mix so an
+unreachable advance costs no vial. If `make_sample` reports "outside the soft
+limits", either widen `.LLM`/`.HLM` or fix `carousel.step`.
+
 **Sample IDs.** A slot is "used" exactly when it holds a sample ID -- the two
 are the same fact, so they cannot disagree about whether a slot is spent.
 `make_sample <slot> [sample id]` tags the slot the moment its `mix` step
@@ -309,16 +451,125 @@ caught before an out-of-place flowcell is.
 **`make_sample <slot> [sample id]`**: mixer2cleaningstation (if needed) ->
 rotate carousel to `<slot>` -> mixer2mixingstation -> pump mix (**slot tagged
 with the sample ID here**) -> mixer2cleaningstation -> pump clean_mixer (fired
-on a background thread, not awaited) -> ready_flowcell_to_draw -> pump
-draw_to_flowcell (blocks until clean_mixer finishes, since pump ops serialize
-on one lock) -> load_sample_to_beam. Requires the flowcell in use to be at its
-cleaning station, the slot to be within the configured carousel size, and the
-carousel to have been located (one taught reference).
+on a background thread, not awaited) -> advance carousel -> ready_flowcell_to_draw
+-> pump draw_to_flowcell -> load_sample_to_beam -> park at the transfer point.
+Requires the flowcell in use to be at its cleaning station, the slot to be
+within the configured carousel size, and the carousel to have been located (one
+taught reference).
 
-**`unload_sample`**: mixer2cleaningstation (if needed) -> return_sample ->
-pump aspirate_from_flowcell -> wash_flowcell_after_return -> pump
-wash_flowcell -> raise the robot back to sample-table height. Requires the
-flowcell in use to be at the sample table.
+The mixer clean (**5555**) and the flowcell draw (**5556**) are on independent
+pumps and **run at the same time** -- the draw does not wait for the clean. See
+[Pump concurrency](#pump-concurrency).
+
+The **advance** is `carousel.draw_offset_steps` (4) steps forward of the
+position the vial was mixed at -- `draw_offset_steps x carousel.step` in motor
+units, so it follows the slot spacing rather than being fixed in code. The
+mixer head comes down where `rotate_carousel` left the carousel, but the
+flowcell draws from a slot further on, so the vial has to come round to it. It
+runs once the head is
+parked and washing -- the carousel cannot turn under the head -- and unlike the
+wash it **is** awaited: the flowcell descends onto whatever slot is underneath
+it, so the next step must not start until the motor has stopped. The move is
+absolute (`mixed position + 4 x carousel.step`), like `rotate_carousel`, so
+rounding cannot accumulate across runs. The tracked carousel slot follows the
+motion and wraps around the ring, so it keeps meaning "the slot the carousel is
+turned to" rather than "the slot last mixed".
+
+**`draw_and_load`**: mixer2cleaningstation (if needed) ->
+ready_flowcell_to_draw -> pump draw_to_flowcell -> load_sample_to_beam -> park
+at the transfer point. The tail of `make_sample` without the mixing, for a
+vial that already holds what is wanted -- one mixed by an earlier run, or a
+sample just recovered by `unload_sample aspirate`. Requires the flowcell in use
+to be at the cleaning station and the mixer head's location to be known.
+Nothing here touches the carousel: no slot is consumed and no sample ID is
+assigned, so the vial drawn from is whichever one the last rotation left the
+mixer over.
+
+**`unload_sample`**: load_flowcell_from_beam_to_cleaningstation -> pump
+wash_flowcell -> raise the robot back to sample-table height -> park at the
+transfer point. Requires the flowcell in use to be at the sample table. The
+wash is **not awaited**: it needs the flowcell sitting in the station rather
+than the arm that put it there, so the lift runs alongside it and the sequence
+returns without waiting. The next call to the **same** pump waits for it in
+its turn -- the `draw_to_flowcell` of a following `make_sample`, for instance.
+The `mix` of that run does not: that is the other pump.
+
+**Parking.** Every workflow's last step, `park_at_transfer_point`, sends the
+arm to the fixed corridor pose (`goto_transfer_point`) once everything before
+it has finished cleanly -- see [Transport functions](#transport-functions) for
+what that pose is. It leaves the arm somewhere known and out of the way for
+the *next* command, from either side of the cell, instead of wherever the
+workflow's last real step happened to leave it. It only runs on a clean
+finish: an exception from any step above it propagates instead, since an arm
+that stopped mid-sequence may still be holding the flowcell or mid-descent,
+and driving it to the corridor is not obviously safe then -- the same
+reasoning that already leaves every other mid-workflow failure for the
+operator to look at rather than trying to recover from automatically.
+
+### Pump status panel
+
+Both the Experiment and Automation tabs carry a **Pumps** panel listing all
+four physical pumps -- `pump0` and `pump1` on the mixing server, `flowcell2`
+and `flowcell3` on the flowcell server -- with each one's status and plunger
+position, plus a summary line naming any dashboard that is unreachable or whose
+pumps are not connected.
+
+It rides on the ordinary `get_state` snapshot as `pump_status`, filled by a
+background thread in the server that polls both dashboards' ZMQ `status` every
+2 s (`PUMP_STATUS_INTERVAL_S`). Polled on a thread rather than fetched when
+asked, because `get_state` is answered on the ZMQ reply thread: two round trips
+to the dashboards there would stall every other command behind them, and a
+dashboard that is down would stall them for its whole timeout. The poll uses
+its own sockets inside `Pump`, separate from the operation ones, so it keeps
+reporting *during* an operation -- which is when it is worth reading -- and
+never waits on one. Status reads also get a shorter timeout than operations
+(`pump.STATUS_TIMEOUT_S`, 2 s): a slow status read is a stale panel, not a
+failed move.
+
+The two servers report quite differently -- the flowcell one has a per-pump
+list, the mixing one has parallel arrays plus a single multi-line `operation`
+string shared by both its pumps -- so `Pump.status_snapshot()` flattens them
+into one row per pump and the GUI only draws rows.
+
+### Pump concurrency
+
+There are two pump servers, and they are independent hardware:
+
+| Port | Dashboard | Operations |
+|---|---|---|
+| 5555 | `pump_dashboard.py` | `mix`, `clean_mixer` |
+| 5556 | `flowcell_dashboard.py` | `draw_to_flowcell`, `aspirate_from_flowcell`, `wash_flowcell` |
+
+`Pump` holds **one lock per server**, on the endpoint itself. Within a server
+everything serializes -- the ZMQ REQ socket cannot be shared and neither can the
+pump behind it. Across the two, nothing does: cleaning the mixer and drawing
+into the flowcell happen at the same time, which is the whole reason
+`make_sample` fires `clean_mixer` on a background thread.
+
+Where a workflow *does* have to wait for a not-awaited op, it waits as an
+explicit `wait_for_<op>` step rather than stalling inside the next one, and only
+when the two ops share a server (`pump.server_for`). A step that sits for
+minutes with no command sent is otherwise indistinguishable from one aimed at
+the wrong pump server.
+
+**Stopping a shake.** The flowcell server has two different stop commands, and
+`Pump.stop_shaking()` (the Automation tab's **Stop Shake** button, via
+`stop_pump`) deliberately sends the narrower one: `stop_shaking`, which only
+ends an active `flow2_sample`/`flow3_sample` cycle and reports
+`accepted: false` if the running action is not one. Its plain `stop` finishes
+*whatever* recipe happens to be active -- a draw, a wash, an aspirate -- which
+is not what a button labelled "Stop Shake" should be able to reach into and
+interrupt. (There is a third, `emergency_stop`, for an immediate hardware halt
+of both pumps; nothing in PALmixer sends it.)
+
+**`unload_sample aspirate`**: mixer2cleaningstation (if needed) ->
+return_sample -> pump aspirate_from_flowcell -> wash_flowcell_after_return ->
+pump wash_flowcell -> raise the robot back to sample-table height. The
+sequence this workflow always ran before the flag existed: it recovers the
+sample into the vial it was mixed in instead of washing it away, at the cost
+of three extra legs and a pump operation. The Automation tab exposes it as an
+"Aspirate back to mixer" checkbox next to the Unload Sample button, unticked
+by default.
 
 ## Pump driver
 

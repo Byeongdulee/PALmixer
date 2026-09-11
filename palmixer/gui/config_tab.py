@@ -80,7 +80,7 @@ class ConfigTab(QWidget):
         box = QGroupBox("Go To Position")
         layout = QHBoxLayout()
         self.goto_buttons = []
-        for station in cmd.STATIONS:
+        for station in cmd.TAUGHT_STATIONS:
             btn = QPushButton(cmd.STATION_LABELS[station])
             btn.setToolTip(
                 "Move the robot to the taught %s position and stop there, going "
@@ -90,6 +90,24 @@ class ConfigTab(QWidget):
             btn.clicked.connect(lambda _checked, s=station: self._on_goto(s))
             layout.addWidget(btn)
             self.goto_buttons.append(btn)
+
+        # The corridor waypoint, kept apart from the stations because it is not
+        # one: nothing is taught for it and nothing can be unconfigured about
+        # it, so this button works on a fresh install where the others refuse.
+        layout.addSpacing(12)
+        self.transfer_point_btn = QPushButton("Transfer Point")
+        self.transfer_point_btn.setToolTip(
+            "Move the robot to the transfer point -- the fixed corridor pose "
+            "every move between the sample table and the mixer side routes "
+            "through.\n\nNot a taught position, so this works before anything "
+            "has been configured. Useful to park the arm clear, or to start "
+            "from a known place: from here every station is one ordinary move "
+            "away.")
+        self.transfer_point_btn.clicked.connect(
+            lambda: self._send_command(cmd.goto_transfer_point_command()))
+        layout.addWidget(self.transfer_point_btn)
+        self.goto_buttons.append(self.transfer_point_btn)
+
         layout.addStretch(1)
         box.setLayout(layout)
         return box
@@ -105,7 +123,7 @@ class ConfigTab(QWidget):
         box = QGroupBox("Set Current Robot Position As")
         layout = QHBoxLayout()
         self.teach_buttons = []
-        for station in cmd.STATIONS:
+        for station in cmd.TAUGHT_STATIONS:
             btn = QPushButton(cmd.STATION_LABELS[station])
             btn.setToolTip(
                 "Record the robot's current pose as the %s position, replacing "
@@ -173,7 +191,7 @@ class ConfigTab(QWidget):
 
         layout.addSpacing(12)
         self.orient_station = QComboBox()
-        for station in cmd.STATIONS:
+        for station in cmd.TAUGHT_STATIONS:
             self.orient_station.addItem(cmd.STATION_LABELS[station], station)
         # Opens on the station this exists for.
         default = self.orient_station.findData(cmd.STATION_CLEANING_STATION)

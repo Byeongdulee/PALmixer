@@ -35,6 +35,12 @@ from .zmq_transport import ZMQCommandServer
 STATE_IDLE = "IDLE"
 STATE_BUSY = "BUSY"
 
+#: How often the pump dashboards are asked for their status. A little under the
+#: GUI's own 3 s get_state poll, so a panel refresh rarely shows the same
+#: snapshot twice, without making the dashboards answer more often than anyone
+#: reads.
+PUMP_STATUS_INTERVAL_S = 2.0
+
 
 class PALmixerServer:
     """Wires the ZMQ command server to robot/pump/motor actions, with MQTT status."""
@@ -48,6 +54,20 @@ class PALmixerServer:
         self._busy = False
         self._current_action = None
         self._current_trace = None  # trace id of the action running now, for _publish_step
+        # Which step of a multi-step workflow is running right now, so the GUI
+        # can name it in the Server state box. Rides on the get_state snapshot
+        # for the same reason _last_result does: the motion MQTT topic is the
+        # only other place a step is reported, and it is silent whenever paho
+        # is missing or the broker is unreachable -- which left a ten-minute
+        # make_sample showing nothing but "BUSY" for its whole run.
+        self._current_step = None
+        # Latest pump status, refreshed by a background thread and served from
+        # here. Polled rather than fetched on demand because get_state runs on
+        # the ZMQ reply thread: two round trips to the pump dashboards there
+        # would stall every other command behind them, and a dashboard that is
+        # down would stall them for its whole timeout.
+        self._pump_status = None
+        self._stopping = threading.Event()
         # How the last action ended -- {action, ok, detail, time}, success as
         # well as failure. Rides on the get_state snapshot so a client learns
         # about it from its ordinary poll: the motion MQTT topic is the only
@@ -71,7 +91,26 @@ class PALmixerServer:
             ur12idb_path = cfg["robot"].get("ur12idb_path")
             if ur12idb_path and ur12idb_path not in sys.path:
                 sys.path.insert(0, ur12idb_path)
-            import robot12idb  # noqa: E402  (path must be set first)
+            try:
+                import robot12idb  # noqa: E402  (path must be set first)
+            except ImportError as e:
+                # The bare ModuleNotFoundError names only `robot12idb`, which
+                # says nothing about *which* path was searched -- and the usual
+                # cause is a ur12idb_path belonging to a different machine. A
+                # failure naming some *other* module is UR_12idb's own import
+                # of a dependency: the checkout was found, the environment is
+                # short a package, and pointing the path elsewhere would not
+                # help.
+                if getattr(e, "name", None) in (None, "robot12idb"):
+                    hint = ("Point PALMIXER_UR12IDB_PATH (or robot.ur12idb_path "
+                            "in json/palmixer_config.json) at your UR_12idb "
+                            "checkout")
+                else:
+                    hint = ("UR_12idb was found there but needs %s; install it "
+                            "(the aps12robot environment has it)" % e.name)
+                raise ImportError("cannot import robot12idb from %r (%s). %s, "
+                                  "or start the server with --simulate."
+                                  % (ur12idb_path, e, hint)) from e
             from . import PAL12idb as pal
 
             # Pass `ip` explicitly so the connection uses *our* config
@@ -118,10 +157,30 @@ class PALmixerServer:
                                    mixing_speed=self.pump.speed,
                                    mixing_speed_limits=[self.pump.min_rpm,
                                                         self.pump.max_rpm],
+                                   current_action=self._current_action,
+                                   current_step=self._current_step,
+                                   pump_status=self._pump_status,
                                    last_result=self._last_result))
 
         if name == cmd.STOP_SEARCH:
             return self._stop_search()
+
+        if name == cmd.UNLOCK_STOP:
+            if args:
+                return "ERROR: %s takes no arguments" % cmd.UNLOCK_STOP
+            return self._unlock_stop()
+
+        if name == cmd.STOP_PUMP:
+            if args:
+                return "ERROR: %s takes no arguments" % cmd.STOP_PUMP
+            # Fast, and deliberately not guarded by the busy flag: the whole
+            # point is to reach a pump operation that is running, which is
+            # exactly when dispatch() would refuse a worker command. Pump sends
+            # it on a socket that operation is not holding. Harmless when
+            # nothing is shaking -- the flowcell server just reports it was
+            # not accepted rather than touching an unrelated action.
+            ok, detail = self.pump.stop_shaking()
+            return ("OK %s" % detail) if ok else ("ERROR: %s" % detail)
 
         if name in (cmd.SET_POSITION_HERE, cmd.SET_ORIENTATION_HERE):
             return self._set_position_here(args, orientation_only=(
@@ -281,7 +340,20 @@ class PALmixerServer:
 
     def _publish_step(self, step, phase, detail=""):
         """Wired as Workflows' on_step: one motion message per workflow step,
-        correlated to the parent make_sample/unload_sample action by trace id."""
+        correlated to the parent make_sample/unload_sample action by trace id.
+
+        Also records the step as the current one, for clients that poll
+        get_state rather than listen to MQTT. Only "started" sets it: a step
+        that has finished is no longer what the machine is doing, and the next
+        one announces itself a moment later. Background steps (the not-awaited
+        wash and mixer clean) report their success out of order by design, so
+        their late "success" must not clear a step that is genuinely running --
+        hence only clearing when the name still matches.
+        """
+        if phase == PHASE_STARTED:
+            self._current_step = step
+        elif self._current_step == step:
+            self._current_step = None
         self._mqtt.publish(motion_topic(self._beamline),
                             motion_payload(step, phase, phase != PHASE_FAILURE,
                                            detail=detail, trace=self._current_trace))
@@ -355,8 +427,9 @@ class PALmixerServer:
             return (lambda: self._run_transport(name)), name
 
         if name == cmd.GOTO_POSITION:
-            if len(args) != 1 or args[0] not in cmd.STATIONS:
-                raise ValueError("usage: %s <%s>" % (cmd.GOTO_POSITION, "|".join(cmd.STATIONS)))
+            if len(args) != 1 or args[0] not in cmd.TAUGHT_STATIONS:
+                raise ValueError("usage: %s <%s>" % (
+                    cmd.GOTO_POSITION, "|".join(cmd.TAUGHT_STATIONS)))
             station = args[0]
             # Refuse an untaught station here rather than letting the move fail
             # once it has already been ACCEPTED -- same check, and the same
@@ -364,6 +437,14 @@ class PALmixerServer:
             self._require_positions((station,))
             label = "%s %s" % (cmd.GOTO_POSITION, station)
             return (lambda: self._goto_position(station)), label
+
+        if name == cmd.GOTO_TRANSFER_POINT:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.GOTO_TRANSFER_POINT)
+            # No _require_positions: the transfer point is a fixed pose in
+            # PAL12idb, not a taught one, so there is nothing that could be
+            # unconfigured about it.
+            return self._goto_transfer_point, cmd.GOTO_TRANSFER_POINT
 
         if name == cmd.TWEAK_ORIENTATION:
             if len(args) != 2 or args[0].lower() not in cmd.ORIENTATION_AXES:
@@ -381,6 +462,11 @@ class PALmixerServer:
             if args:
                 raise ValueError("%s takes no arguments" % cmd.ZALIGN)
             return self._zalign, cmd.ZALIGN
+
+        if name == cmd.RELEASE_GRIPPER:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.RELEASE_GRIPPER)
+            return self._release_gripper, cmd.RELEASE_GRIPPER
 
         if name == cmd.MOTOR_TWEAK:
             if len(args) != 2 or args[0] not in (cmd.MOTOR_FORWARD, cmd.MOTOR_REVERSE):
@@ -407,27 +493,49 @@ class PALmixerServer:
                 slot = int(args[0])
             except ValueError:
                 raise ValueError("slot must be an integer, got %r" % args[0])
-            # Assigned here rather than deep in the workflow so the ID the slot
-            # will be tagged with appears in the ACCEPTED log line and in every
-            # MQTT motion payload for the run.
-            sample_id = " ".join(args[1:]) if len(args) > 1 else state.new_sample_id()
+            # None means "assign one", and the workflow does that when the mix
+            # finishes rather than here. An auto ID is a timestamp, so minting
+            # it at accept time dated the sample to when the run was requested
+            # -- several minutes of transport and mixing before the sample
+            # existed. The cost is that the ID cannot appear in this label or
+            # in the MQTT payloads of the steps that precede the mix; it
+            # reaches clients on the tracking snapshot the moment it is
+            # assigned, and in the completion detail at the end.
+            sample_id = " ".join(args[1:]) if len(args) > 1 else None
             self._require_positions(self.workflows.stations_for_make_sample())
             try:
                 self.workflows._check_make_sample(slot, sample_id)
             except WorkflowError as e:
                 raise ValueError(str(e))
-            label = "%s %s (%s)" % (cmd.MAKE_SAMPLE, slot, sample_id)
+            label = "%s %s%s" % (cmd.MAKE_SAMPLE, slot,
+                                 " (%s)" % sample_id if sample_id else "")
             return (lambda: self.workflows.make_sample(slot, sample_id)), label
 
-        if name == cmd.UNLOAD_SAMPLE:
+        if name == cmd.DRAW_AND_LOAD:
             if args:
-                raise ValueError("%s takes no arguments" % cmd.UNLOAD_SAMPLE)
-            self._require_positions(self.workflows.stations_for_unload_sample())
+                raise ValueError("%s takes no arguments" % cmd.DRAW_AND_LOAD)
+            self._require_positions(self.workflows.stations_for_draw_and_load())
             try:
-                self.workflows._check_unload_sample()
+                self.workflows._check_draw_and_load()
             except WorkflowError as e:
                 raise ValueError(str(e))
-            return (lambda: self.workflows.unload_sample()), cmd.UNLOAD_SAMPLE
+            return (lambda: self.workflows.draw_and_load()), cmd.DRAW_AND_LOAD
+
+        if name == cmd.UNLOAD_SAMPLE:
+            aspirate = args == [cmd.ASPIRATE]
+            if args and not aspirate:
+                raise ValueError("usage: %s [%s]" % (cmd.UNLOAD_SAMPLE, cmd.ASPIRATE))
+            # Both the required positions and the guard depend on the flag:
+            # without it nothing goes near the mixer, so neither its stations
+            # nor its tracked location can refuse the run.
+            self._require_positions(
+                self.workflows.stations_for_unload_sample(aspirate))
+            try:
+                self.workflows._check_unload_sample(aspirate)
+            except WorkflowError as e:
+                raise ValueError(str(e))
+            label = "%s%s" % (cmd.UNLOAD_SAMPLE, " (aspirate)" if aspirate else "")
+            return (lambda: self.workflows.unload_sample(aspirate)), label
 
         raise ValueError("unknown command %r" % name)
 
@@ -468,6 +576,7 @@ class PALmixerServer:
                 self._busy = False
                 self._current_action = None
             self._current_trace = None
+            self._current_step = None
             self._publish_state(STATE_IDLE)
 
     # -- individual actions --------------------------------------------------
@@ -504,8 +613,10 @@ class PALmixerServer:
         orient.
         """
         verb = cmd.SET_ORIENTATION_HERE if orientation_only else cmd.SET_POSITION_HERE
-        if len(args) != 1 or args[0] not in cmd.STATIONS:
-            return "ERROR: usage: %s <%s>" % (verb, "|".join(cmd.STATIONS))
+        # TAUGHT_STATIONS, not STATIONS: teaching by hand is the only way a
+        # station with no AprilTag of its own gets a position at all.
+        if len(args) != 1 or args[0] not in cmd.TAUGHT_STATIONS:
+            return "ERROR: usage: %s <%s>" % (verb, "|".join(cmd.TAUGHT_STATIONS))
         station = args[0]
         if self._busy:
             return ("ERROR: busy (running %r); the robot has to be standing still "
@@ -567,6 +678,13 @@ class PALmixerServer:
         pose = self.PAL12idb.goto_station(self.rob, station)
         return "at %s (%s)" % (station, pose)
 
+    def _goto_transfer_point(self):
+        if self.simulate:
+            time.sleep(1)
+            return "simulated goto transfer point"
+        pose = self.PAL12idb.goto_transfer_point(self.rob)
+        return "at the transfer point (%s)" % (pose,)
+
     def _tweak_orientation(self, axis, degrees):
         if self.simulate:
             time.sleep(0.3)
@@ -584,6 +702,67 @@ class PALmixerServer:
         pose = self.rob.Zalign()
         return "z-aligned at %s" % (pose,)
 
+    def _release_gripper(self):
+        """Open the gripper where the arm is standing.
+
+        A worker action, so it cannot be pressed part-way through a transport.
+        It can still be pressed with something held -- ready_flowcell_to_draw
+        and flowcell_to_sample_on_mixer both finish holding the flowcell -- so
+        anything the tracking says is in the gripper becomes unknown: after
+        this it is wherever it fell, which is not something this can know.
+        """
+        if self.simulate:
+            time.sleep(0.2)
+            what = "simulated gripper release"
+        else:
+            self.PAL12idb.activate_gripper(self.rob)
+            self.rob.release()
+            what = "gripper released"
+        # Same bookkeeping and the same wording either way: a simulated run is
+        # there to rehearse what the real one reports.
+        dropped = self._forget_held_flowcell()
+        if dropped:
+            return ("%s; flowcell %d was being held, so its location is now "
+                    "unknown -- reconcile it with set_location" % (what, dropped))
+        return what
+
+    @staticmethod
+    def _forget_held_flowcell():
+        """Mark a flowcell the tracking believes is in the gripper as unknown.
+        Returns its id, or None if nothing was being held."""
+        for fc in state.FLOWCELL_IDS:
+            if state.get_flowcell_location(fc) == state.FC_IN_GRIPPER:
+                state.set_flowcell_location(fc, state.UNKNOWN)
+                return fc
+        return None
+
+    def _unlock_stop(self):
+        """Clear a protective stop. A fast command -- see cmd.UNLOCK_STOP.
+
+        Answered synchronously, so it is kept short: one dashboard call and a
+        brief look at whether it took. The look is worth the half second,
+        because "I pressed it and nothing said otherwise" is not the same as
+        knowing the robot is free again.
+        """
+        if self.simulate:
+            return "OK simulated protective-stop unlock"
+        if self.rob is None:
+            return "ERROR: no robot connection"
+        try:
+            self.rob.unlock_stop()
+        except Exception as e:                          # noqa: BLE001
+            return "ERROR: could not unlock the protective stop: %s" % e
+        # secmon lags the unlock slightly, so give it a moment before asking.
+        time.sleep(0.5)
+        try:
+            still_stopped = self.rob.is_protective_stopped()
+        except Exception:                               # noqa: BLE001
+            return "OK protective-stop unlock sent (could not read the state back)"
+        if still_stopped:
+            return ("OK protective-stop unlock sent, but the robot still reports "
+                    "one -- clear the cause and press it again")
+        return "OK protective stop cleared"
+
     def _motor_tweak(self, direction, step):
         if self.simulate:
             time.sleep(0.5)
@@ -597,13 +776,32 @@ class PALmixerServer:
             raise RuntimeError(detail)
         return detail
 
+    # -- pump status polling ---------------------------------------------------
+    def _poll_pump_status(self):
+        """Refresh self._pump_status forever, on its own thread.
+
+        Its own thread, and its own sockets inside Pump, so neither the ZMQ
+        reply path nor a running pump operation ever waits on it -- and so the
+        panel keeps updating *during* an operation, which is when it is worth
+        looking at. Failures are data, not errors: status_snapshot() reports an
+        unreachable dashboard as such, which is what the panel should show.
+        """
+        while not self._stopping.is_set():
+            try:
+                self._pump_status = self.pump.status_snapshot()
+            except Exception as e:                       # noqa: BLE001
+                self._pump_status = {"error": str(e), "time": time.time()}
+            self._stopping.wait(PUMP_STATUS_INTERVAL_S)
+
     # -- lifecycle ------------------------------------------------------------
     def start(self):
         self._publish_state(STATE_IDLE)
         self._publish_tracking(state.snapshot())
+        threading.Thread(target=self._poll_pump_status, daemon=True).start()
         self.zmq_server.start()
 
     def stop(self):
+        self._stopping.set()
         self.zmq_server.stop()
         self._mqtt.close()
 

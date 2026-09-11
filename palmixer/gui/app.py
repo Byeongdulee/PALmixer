@@ -183,6 +183,13 @@ class MainWindow(QMainWindow):
     def _on_tracking_updated(self, snapshot):
         self.workflow_tab.update_state(snapshot)
         self.experiment_tab.update_state(snapshot)
+        # What the server is doing right now, named rather than just "BUSY".
+        # Carried on the same 3 s poll as the outcome below, so it works with
+        # no MQTT broker -- which is the case here (paho is not installed), and
+        # was why a ten-minute workflow showed nothing but a red BUSY badge for
+        # its whole run.
+        self._set_activity(snapshot.get("current_action"),
+                           snapshot.get("current_step"))
         # How the last action ended, carried on the ordinary 3 s get_state
         # poll. This is the path that works with no MQTT broker -- an async
         # failure otherwise reaches the GUI only over the motion topic, which
@@ -247,11 +254,35 @@ class MainWindow(QMainWindow):
 
     # -- shared helpers ----------------------------------------------------------
     def _set_busy(self, busy):
-        self.state_badge.setText("BUSY" if busy else "IDLE")
-        self.state_badge.setStyleSheet(
-            "font-weight: bold; color: %s;" % ("darkred" if busy else "darkgreen"))
+        self._busy = busy
+        self._refresh_state_badge()
         for w in self._busy_widgets:
             w.setEnabled(not busy)
+
+    def _set_activity(self, action, step):
+        """Name what the server is running, for the state badge.
+
+        Kept separate from _set_busy because the two arrive on different
+        signals -- the busy flag from the `status` poll, the names from the
+        `get_state` one -- and either can land first.
+        """
+        self._current_action, self._current_step = action, step
+        self._refresh_state_badge()
+
+    def _refresh_state_badge(self):
+        busy = getattr(self, "_busy", False)
+        text = "BUSY" if busy else "IDLE"
+        if busy:
+            # The step alone is the useful half for a workflow (it is the thing
+            # actually moving); the action alone is all there is for a single
+            # transport, which has no steps. Show whichever exist.
+            parts = [p for p in (getattr(self, "_current_action", None),
+                                 getattr(self, "_current_step", None)) if p]
+            if parts:
+                text += " -- " + " / ".join(dict.fromkeys(parts))
+        self.state_badge.setText(text)
+        self.state_badge.setStyleSheet(
+            "font-weight: bold; color: %s;" % ("darkred" if busy else "darkgreen"))
 
     def _show_result(self, ok, text):
         self.result_label.setText(("OK: " if ok else "FAILED: ") + text)

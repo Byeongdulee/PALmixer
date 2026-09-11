@@ -12,12 +12,80 @@ move anything, so server.py calls them synchronously, before accepting a
 instead of accepting and failing several steps into a multi-minute
 sequence. `make_sample`/`unload_sample` re-run the same check before moving,
 so calling either directly (e.g. from a test) is still safe on its own.
+
+make_sample mixes a fresh vial and puts it in the beam:
+
+    mixer2cleaningstation               (only if the head is at the mixer)
+    rotate_carousel                     (to the slot being mixed)
+    mixer2mixingstation
+    mix                                 (pump; the sample ID is assigned here)
+    mixer2cleaningstation
+    clean_mixer                         (pump 5555, not awaited)
+    advance_carousel                    (draw_offset_steps forward, awaited)
+    ready_flowcell_to_draw              (onto sample_on_mixer_station)
+    draw_to_flowcell                    (pump 5556, runs while 5555 cleans)
+    load_sample_to_beam
+    park_at_transfer_point
+
+A wait_for_<op> step appears only where a not-awaited op is still running on
+the pump the next step needs; the mixer clean and the flowcell draw are on
+different servers and overlap, so it does not appear between those two.
+
+draw_and_load is make_sample's tail without the mixing, for a vial that
+already holds what is wanted:
+
+    mixer2cleaningstation               (only if the head is at the mixer)
+    ready_flowcell_to_draw
+    draw_to_flowcell                    (pump)
+    load_sample_to_beam
+    park_at_transfer_point
+
+unload_sample runs one of two sequences. The default discards the sample:
+
+    load_flowcell_from_beam_to_cleaningstation
+    wash_flowcell                       (pump, not awaited)
+    raise_to_sampletable_height
+    park_at_transfer_point
+
+With `aspirate`, the sample is recovered into its vial first, which is what
+this workflow did on every run before the flag existed:
+
+    mixer2cleaningstation               (only if the head is at the mixer)
+    return_sample
+    aspirate_from_flowcell              (pump)
+    wash_flowcell_after_return
+    wash_flowcell                       (pump, awaited)
+    raise_to_sampletable_height
+    park_at_transfer_point
+
+park_at_transfer_point (Workflows._park) runs only on a clean finish, as the
+last step of each workflow -- never from a `finally`, and never after a step
+above it raises. An arm that stopped partway through a sequence may still be
+holding the flowcell or mid-descent, and a blind move to the corridor is not
+obviously safe then; the operator's own judgement decides what to do with it,
+the way every other mid-workflow failure already leaves that to them.
 """
 
 import threading
 import time
 
 from . import state
+# Imported as a bare name rather than through the module, because `pump` is
+# also the name of a constructor argument and an attribute here.
+from .pump import server_for as _pump_server_for
+
+# How far the carousel advances between mixing a vial and drawing from it, in
+# carousel steps -- `carousel.draw_offset_steps` in json/palmixer_config.json,
+# 4 by default. The mixer head and the flowcell's draw point are not over the
+# same slot: the head comes down where rotate_carousel left the carousel, and
+# the flowcell reaches the vial some steps on. So once the head is clear and
+# washing, the carousel is advanced this far to bring the vial just mixed round
+# to the draw point (see Workflows._advance_carousel).
+#
+# Configured rather than hard-coded, and in steps rather than motor units, so
+# the distance follows `carousel.step` and neither has to be changed in code.
+def _draw_offset_steps():
+    return state.get_carousel_draw_offset_steps()
 
 
 class WorkflowError(Exception):
@@ -63,8 +131,9 @@ class Workflows:
     def _start_background_pump_op(self, op):
         """Fire `op` on a daemon thread; its own on_step trio lands whenever
         it finishes, without the caller waiting for it. Safe to overlap with
-        later steps because Pump serializes its operations on its own lock --
-        a later blocking pump call simply waits for this one."""
+        later steps because Pump serializes per server -- a later call to the
+        *same* pump waits for this one, and a call to the other pump does not
+        (the mixer and the flowcell are independent hardware)."""
         def run():
             try:
                 detail = self._pump_op(op)
@@ -72,7 +141,53 @@ class Workflows:
             except Exception as e:
                 self.on_step(op, "failure", str(e))
         self.on_step(op, "started", "(not awaited)")
-        threading.Thread(target=run, daemon=True).start()
+        thread = threading.Thread(target=run, daemon=True)
+        self._background_pump = (op, thread)
+        thread.start()
+
+    def _await_background_pump(self, before_op):
+        """Wait out a background pump op, but only if it would block `before_op`.
+
+        Two ops on different pump servers cannot block each other, so waiting
+        for one before the other is pure lost time -- the mixer clean and the
+        flowcell draw are meant to overlap. Only a background op on the *same*
+        server is a real constraint, and that one is waited for here rather
+        than inside the pump call, so a wait of minutes is a named step instead
+        of a step that appears to have stalled.
+        """
+        entry = getattr(self, "_background_pump", None)
+        if entry is None:
+            return
+        op, thread = entry
+        if not thread.is_alive():
+            self._background_pump = None
+            return
+        if _pump_server_for(op) != _pump_server_for(before_op):
+            return                      # different pump: they run side by side
+        self._background_pump = None
+        self._step("wait_for_%s" % op, lambda: self._join_pump(thread, op))
+
+    @staticmethod
+    def _join_pump(thread, op):
+        thread.join()
+        # The op reports its own success or failure through its own on_step
+        # trio; this step only ever says the waiting is over.
+        return "%s finished; the pump is free" % op
+
+    def _park(self):
+        """Move the arm to the transfer point. The last step of a workflow
+        that finished cleanly -- see the module plan for why only then.
+
+        Every workflow ends here rather than wherever its last real step left
+        the arm, so the next command, from either side of the cell, starts
+        from a known, out-of-the-way pose instead of one specific to whatever
+        ran last.
+        """
+        if self.simulate:
+            self._simulated_step("park_at_transfer_point")
+        else:
+            self._step("park_at_transfer_point",
+                        lambda: self.pal.goto_transfer_point(self.robot))
 
     # -- position requirements -------------------------------------------------
     # Composed from PAL12idb.TRANSPORT_STATIONS rather than listed separately,
@@ -93,18 +208,35 @@ class Workflows:
         return self._stations('mixer2cleaningstation', 'mixer2mixingstation',
                                'ready_flowcell_to_draw', 'load_sample_to_beam')
 
-    def stations_for_unload_sample(self):
+    def stations_for_draw_and_load(self):
+        # Same conditional as make_sample's opener, and for the same reason:
+        # the mixer cleaning station is only involved when the head is sitting
+        # at the mixer and has to be parked before the flowcell can come in.
+        if self.pal is None:
+            return ()
+        names = ('ready_flowcell_to_draw', 'load_sample_to_beam')
+        if state.get_mixer_head() == state.MIXER_AT_MIXER:
+            names = ('mixer2cleaningstation',) + names
+        return self._stations(*names)
+
+    def stations_for_unload_sample(self, aspirate=False):
+        # raise_to_sampletable_height reads the sample table directly rather
+        # than through a transport function, so it is not in the table above
+        # and is added by hand to both paths.
+        if self.pal is None:
+            return ()
+        if not aspirate:
+            # One leg, sample table -> cleaning station. Nothing here goes
+            # near the mixer, so neither mixer position is required.
+            return (self._stations('load_flowcell_from_beam_to_cleaningstation')
+                    + ('sample_table',))
         # The mixer head only has to be parked out of the way when it is
         # actually sitting at the mixer station; otherwise the opening
         # mixer2cleaningstation is skipped and the mixer cleaning station is
         # never touched, so requiring it would refuse a run that would work.
-        if self.pal is None:
-            return ()
         names = ('return_sample', 'wash_flowcell_after_return')
         if state.get_mixer_head() == state.MIXER_AT_MIXER:
             names = ('mixer2cleaningstation',) + names
-        # raise_to_sampletable_height reads the sample table directly rather
-        # than through a transport function, so it is not in the table above.
         return self._stations(*names) + ('sample_table',)
 
     @staticmethod
@@ -163,60 +295,96 @@ class Workflows:
 
     def make_sample(self, slot, sample_id=None):
         """Mix a fresh sample and load it at the beam. See the module plan
-        for the full 9-step sequence; each PAL12idb call updates `state`.
+        for the full step list; each PAL12idb call updates `state`.
 
-        `sample_id` tags the carousel slot the sample is mixed in. Generated
-        here when the caller did not supply one, so a slot consumed by a direct
-        call (a script, a test) is never left anonymous either."""
-        if sample_id is None:
-            sample_id = state.new_sample_id()
+        `sample_id` tags the carousel slot the sample is mixed in. None means
+        assign one, which happens when the mix finishes rather than now -- an
+        auto ID is a timestamp, and it should name the moment the sample came
+        into existence, not the moment a run was requested several minutes of
+        transport earlier. A slot consumed by a direct call (a script, a test)
+        is never left anonymous either way."""
         target_position = self._check_make_sample(slot, sample_id)
         mixer_loc = state.get_mixer_head()
 
         if self.simulate:
             fc = state.get_flowcell_in_use()
+            # The ID is minted inside the mix step, so it has to come back out
+            # of the closure to reach the completion detail below.
+            minted = []
             steps = (
                 ("mixer2cleaningstation", lambda: state.set_mixer_head(state.MIXER_AT_CLEANING)),
                 ("rotate_carousel", lambda: state.set_carousel_slot(slot)),
                 ("mixer2mixingstation", lambda: state.set_mixer_head(state.MIXER_AT_MIXER)),
-                ("mix", lambda: self._mark_slot_used(slot, sample_id)),
+                ("mix", lambda: minted.append(self._assign_sample_id(slot, sample_id))),
                 ("mixer2cleaningstation", lambda: state.set_mixer_head(state.MIXER_AT_CLEANING)),
                 ("clean_mixer", None),
+                ("advance_carousel", lambda: self._advance_carousel_state(slot)),
                 ("ready_flowcell_to_draw", lambda: state.set_flowcell_location(fc, state.FC_IN_GRIPPER)),
                 ("draw_to_flowcell", None),
                 ("load_sample_to_beam", lambda: state.set_flowcell_location(fc, state.FC_AT_BEAM)),
             )
             for step, on_success in steps:
                 self._simulated_step(step, on_success=on_success)
-            return self._make_sample_detail("simulated make_sample", slot, sample_id)
+            self._park()
+            return self._make_sample_detail("simulated make_sample", slot,
+                                            minted[0] if minted else sample_id)
 
         if mixer_loc == state.MIXER_AT_MIXER:
             self._step("mixer2cleaningstation", lambda: self.pal.mixer2cleaningstation(self.robot))
 
         self._step("rotate_carousel", lambda: self._rotate_carousel(slot, target_position))
         self._step("mixer2mixingstation", lambda: self.pal.mixer2mixingstation(self.robot))
+        # A clean_mixer left running by the previous make_sample is on this
+        # same pump, so it has to finish before this one can mix.
+        self._await_background_pump("mix")
         self._step("mix", lambda: self._pump_op("mix"))
         # The vial is spent the moment it has been mixed, so the slot is marked
         # here rather than at the end: a later step failing does not un-consume
-        # it, and the record must not depend on the run finishing.
-        self._mark_slot_used(slot, sample_id)
+        # it, and the record must not depend on the run finishing. An unnamed
+        # sample is named here too, for the same reason -- this is the instant
+        # it became a sample.
+        sample_id = self._assign_sample_id(slot, sample_id)
         self._step("mixer2cleaningstation", lambda: self.pal.mixer2cleaningstation(self.robot))
 
         # No need to wait for the mixer to finish cleaning before moving on.
         self._start_background_pump_op("clean_mixer")
 
+        # Now that the head is off the carousel and washing, turn the vial
+        # round to the draw point. Awaited, unlike the wash: the flowcell comes
+        # down onto whatever slot is underneath it, so the next step must not
+        # start until the carousel has actually stopped there.
+        self._step("advance_carousel",
+                    lambda: self._advance_carousel(slot, target_position))
+
         self._step("ready_flowcell_to_draw", lambda: self.pal.ready_flowcell_to_draw(self.robot))
-        # Blocks on the pump's lock until clean_mixer (if still running) finishes.
+        # The clean_mixer started above is on the other pump and is left to run
+        # alongside this. Only a flowcell-side leftover -- the wash fired by a
+        # preceding unload_sample -- is waited for here.
+        self._await_background_pump("draw_to_flowcell")
         self._step("draw_to_flowcell", lambda: self._pump_op("draw_to_flowcell"))
         self._step("load_sample_to_beam", lambda: self.pal.load_sample_to_beam(self.robot))
+        self._park()
 
         return self._make_sample_detail("make_sample", slot, sample_id)
+
+    def _assign_sample_id(self, slot, sample_id):
+        """Name the sample just mixed into `slot` and record it. Returns the ID.
+
+        `sample_id` None mints a timestamp one. Writing it through state is
+        what publishes it: the write fires the tracking listener, so the ID
+        reaches every client on the next tracking snapshot -- which is how the
+        GUI fills in an ID it did not type.
+        """
+        if sample_id is None:
+            sample_id = state.new_sample_id()
+        return self._mark_slot_used(slot, sample_id)
 
     @staticmethod
     def _mark_slot_used(slot, sample_id):
         """Record which sample now occupies the carousel slot, marking it used.
-        Overwrites an existing ID -- re-mixing a slot is allowed."""
-        state.set_sample_id(slot, sample_id)
+        Overwrites an existing ID -- re-mixing a slot is allowed. Returns the
+        ID as stored (state.set_sample_id normalises the text)."""
+        return state.set_sample_id(slot, sample_id)
 
     @staticmethod
     def _make_sample_detail(what, slot, sample_id):
@@ -230,12 +398,126 @@ class Workflows:
         return detail
 
     def _rotate_carousel(self, slot, target_position):
+        # The advance that follows the mix has to be reachable too, and this is
+        # the last moment at which finding out costs nothing: after the mix it
+        # costs the vial. A motor record silently ignores a move past its soft
+        # limits, so an unreachable advance is not something the run would
+        # otherwise notice going wrong -- see Motor.check_in_range.
+        self.motor.check_in_range(
+            target_position + _draw_offset_steps() * state.require_carousel_step())
         self.motor.move_to(target_position)
         state.set_carousel_slot(slot)
         return "carousel at slot %s (%.4f)" % (slot, target_position)
 
+    def _advance_carousel(self, slot, mixed_position):
+        """Turn the carousel draw_offset_steps forward of `mixed_position`.
+
+        Blocks until the motor stops: Motor.move_to waits on .DMOV, so this
+        returns only once the carousel is actually there, and a stage that
+        never gets there raises MotorError rather than letting the flowcell
+        come down on a slot still in motion.
+
+        Absolute, computed from the position this run mixed at rather than
+        from wherever the motor happens to read -- the same reason
+        rotate_carousel is absolute. A relative tweak would fold every
+        rounding error of every previous run into the next one.
+        """
+        step = state.require_carousel_step()
+        steps = _draw_offset_steps()
+        target = mixed_position + steps * step
+        self.motor.move_to(target)
+        now = self._slot_after_advance(slot)
+        if now is not None:
+            state.set_carousel_slot(now)
+        return "carousel advanced %d steps (%.4f) to %.4f (slot %s at the mixer, " \
+               "slot %s at the draw point)" % (steps, steps * step, target,
+                                               now if now is not None else "?", slot)
+
+    def _advance_carousel_state(self, slot):
+        """The bookkeeping half of _advance_carousel, for the simulate path:
+        no motor, but the tracked slot still moves so the GUI shows what a real
+        run would."""
+        now = self._slot_after_advance(slot)
+        if now is not None:
+            state.set_carousel_slot(now)
+
+    @staticmethod
+    def _slot_after_advance(slot):
+        """Which slot sits at the mixing point after the advance, or None.
+
+        The tracked slot means "the slot the carousel is turned to", so it has
+        to move with the carousel. It wraps: the carousel is a ring, and past
+        the last slot the numbering comes back round to the first. None when
+        the carousel size is not configured -- there is no ring to wrap around
+        then, and a wrong slot number is worse than none.
+        """
+        size = state.get_carousel_size()
+        if size == state.UNKNOWN:
+            return None
+        return (int(slot) - 1 + _draw_offset_steps()) % size + 1
+
+    # -- draw_and_load ------------------------------------------------------------
+    def _check_draw_and_load(self):
+        """Validate preconditions without moving anything. Raises WorkflowError."""
+        fc = state.get_flowcell_in_use()
+        fc_loc = state.get_flowcell_location(fc)
+        what = "flowcell_%d" % fc
+        self._require_known(fc_loc, what, (state.FC_AT_CLEANING, state.FC_AT_BEAM))
+        if fc_loc != state.FC_AT_CLEANING:
+            raise WorkflowError(
+                "flowcell %d must be at the cleaning station to draw into "
+                "(currently %s)" % (fc, fc_loc))
+
+        # Unlike the default unload, this one does go to the mixer -- to draw
+        # from it -- so where the head is has to be known either way: to decide
+        # whether to park it first, and because the flowcell is set down on the
+        # station it would otherwise still be occupying.
+        mixer_loc = state.get_mixer_head()
+        self._require_known(mixer_loc, state.WHAT_MIXER_HEAD,
+                             (state.MIXER_AT_MIXER, state.MIXER_AT_CLEANING))
+
+    def draw_and_load(self):
+        """Draw an already-mixed sample into the flowcell and put it in the beam.
+
+        The tail of make_sample without the mixing: for a vial that already
+        holds what is wanted -- one mixed by an earlier run, or a sample just
+        recovered by `unload_sample aspirate`. Nothing here touches the
+        carousel, so no slot is consumed and no sample ID is assigned; the
+        vial the mixer is sitting over is whatever the last rotate left there.
+        See the module plan for the step list.
+        """
+        self._check_draw_and_load()
+        mixer_loc = state.get_mixer_head()
+
+        if self.simulate:
+            fc = state.get_flowcell_in_use()
+            steps = (
+                ("mixer2cleaningstation", lambda: state.set_mixer_head(state.MIXER_AT_CLEANING)),
+                ("ready_flowcell_to_draw", lambda: state.set_flowcell_location(fc, state.FC_IN_GRIPPER)),
+                ("draw_to_flowcell", None),
+                ("load_sample_to_beam", lambda: state.set_flowcell_location(fc, state.FC_AT_BEAM)),
+            )
+            for step, on_success in steps:
+                self._simulated_step(step, on_success=on_success)
+            self._park()
+            return "simulated draw_and_load complete"
+
+        if mixer_loc == state.MIXER_AT_MIXER:
+            self._step("mixer2cleaningstation", lambda: self.pal.mixer2cleaningstation(self.robot))
+
+        self._step("ready_flowcell_to_draw", lambda: self.pal.ready_flowcell_to_draw(self.robot))
+        # Awaited, unlike unload's wash: the arm is holding the flowcell down
+        # on the mixer for the duration, and it must not be carried to the beam
+        # until the draw has actually finished putting sample in it.
+        self._await_background_pump("draw_to_flowcell")
+        self._step("draw_to_flowcell", lambda: self._pump_op("draw_to_flowcell"))
+        self._step("load_sample_to_beam", lambda: self.pal.load_sample_to_beam(self.robot))
+        self._park()
+
+        return "draw_and_load complete"
+
     # -- unload_sample ------------------------------------------------------------
-    def _check_unload_sample(self):
+    def _check_unload_sample(self, aspirate=False):
         fc = state.get_flowcell_in_use()
         fc_loc = state.get_flowcell_location(fc)
         what = "flowcell_%d" % fc
@@ -245,38 +527,81 @@ class Workflows:
                 "flowcell %d must be at the sample table to unload "
                 "(currently %s)" % (fc, fc_loc))
 
-        mixer_loc = state.get_mixer_head()
-        self._require_known(mixer_loc, state.WHAT_MIXER_HEAD,
-                             (state.MIXER_AT_MIXER, state.MIXER_AT_CLEANING))
+        # Where the mixer head is only matters when the sample is going back
+        # into it. The default run never approaches the mixer, so an unknown
+        # mixer position there is no reason to refuse a sequence that would
+        # not have touched it.
+        if aspirate:
+            mixer_loc = state.get_mixer_head()
+            self._require_known(mixer_loc, state.WHAT_MIXER_HEAD,
+                                 (state.MIXER_AT_MIXER, state.MIXER_AT_CLEANING))
 
-    def unload_sample(self):
-        """Return the sample to the mixer, wash the flowcell, and clear the
-        beam. See the module plan for the full 6-step sequence."""
-        self._check_unload_sample()
+    def unload_sample(self, aspirate=False):
+        """Take the flowcell off the beam, wash it, and clear the arm.
+
+        By default the sample is not kept: the flowcell goes straight from the
+        sample table to its cleaning station, and the wash takes the sample
+        with it. `aspirate` recovers it first -- carry the flowcell to the
+        mixer, push the contents back into the vial they were mixed in, and
+        only then go on to the cleaning station -- which is what this workflow
+        used to do on every run. See the module plan for both step lists.
+        """
+        self._check_unload_sample(aspirate)
         mixer_loc = state.get_mixer_head()
 
         if self.simulate:
             fc = state.get_flowcell_in_use()
-            steps = (
-                ("mixer2cleaningstation", lambda: state.set_mixer_head(state.MIXER_AT_CLEANING)),
-                ("return_sample", lambda: state.set_flowcell_location(fc, state.FC_IN_GRIPPER)),
-                ("aspirate_from_flowcell", None),
-                ("wash_flowcell_after_return", lambda: state.set_flowcell_location(fc, state.FC_AT_CLEANING)),
-                ("wash_flowcell", None),
-                ("raise_to_sampletable_height", None),
-            )
+            if aspirate:
+                steps = (
+                    ("mixer2cleaningstation", lambda: state.set_mixer_head(state.MIXER_AT_CLEANING)),
+                    ("return_sample", lambda: state.set_flowcell_location(fc, state.FC_IN_GRIPPER)),
+                    ("aspirate_from_flowcell", None),
+                    ("wash_flowcell_after_return", lambda: state.set_flowcell_location(fc, state.FC_AT_CLEANING)),
+                    ("wash_flowcell", None),
+                    ("raise_to_sampletable_height", None),
+                )
+            else:
+                # wash_flowcell is awaited here where the real run does not.
+                # Simulation exists to pace the GUI through the same named
+                # steps, and a background sleep would only report them out of
+                # order for no gain.
+                steps = (
+                    ("load_flowcell_from_beam_to_cleaningstation",
+                     lambda: state.set_flowcell_location(fc, state.FC_AT_CLEANING)),
+                    ("wash_flowcell", None),
+                    ("raise_to_sampletable_height", None),
+                )
             for step, on_success in steps:
                 self._simulated_step(step, on_success=on_success)
+            self._park()
             return "simulated unload_sample complete"
+
+        if not aspirate:
+            self._step("load_flowcell_from_beam_to_cleaningstation",
+                        lambda: self.pal.load_flowcell_from_beam_to_cleaningstation(self.robot))
+            # The wash needs the flowcell to be sitting in the station, not the
+            # arm that put it there, and nothing after this touches the pump --
+            # so it runs alongside the lift rather than holding the sequence
+            # open. Pump serializes on its own lock, so whatever pump operation
+            # comes next (the mix of the following make_sample, typically)
+            # waits for it in its turn.
+            self._start_background_pump_op("wash_flowcell")
+            self._step("raise_to_sampletable_height",
+                        lambda: self.pal.raise_to_sampletable_height(self.robot))
+            self._park()
+            return "unload_sample complete (sample discarded with the wash)"
 
         if mixer_loc == state.MIXER_AT_MIXER:
             self._step("mixer2cleaningstation", lambda: self.pal.mixer2cleaningstation(self.robot))
 
         self._step("return_sample", lambda: self.pal.return_sample(self.robot))
+        # A wash left running by a previous unload is on this same pump.
+        self._await_background_pump("aspirate_from_flowcell")
         self._step("aspirate_from_flowcell", lambda: self._pump_op("aspirate_from_flowcell"))
         self._step("wash_flowcell_after_return", lambda: self.pal.wash_flowcell_after_return(self.robot))
         self._step("wash_flowcell", lambda: self._pump_op("wash_flowcell"))
         self._step("raise_to_sampletable_height",
                     lambda: self.pal.raise_to_sampletable_height(self.robot))
+        self._park()
 
         return "unload_sample complete"
