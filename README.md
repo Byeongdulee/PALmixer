@@ -453,10 +453,10 @@ caught before an out-of-place flowcell is.
 rotate carousel to `<slot>` -> mixer2mixingstation -> pump mix (**slot tagged
 with the sample ID here**) -> mixer2cleaningstation -> pump clean_mixer (fired
 on a background thread, not awaited) -> advance carousel -> ready_flowcell_to_draw
--> pump draw_to_flowcell -> load_sample_to_beam -> park at the transfer point.
-Requires the flowcell in use to be at its cleaning station, the slot to be
-within the configured carousel size, and the carousel to have been located (one
-taught reference).
+-> pump draw_to_flowcell -> load_sample_to_beam -> shake_sample (auto, not
+awaited) -> park at the transfer point. Requires the flowcell in use to be at
+its cleaning station, the slot to be within the configured carousel size, and
+the carousel to have been located (one taught reference).
 
 The mixer clean (**5555**) and the flowcell draw (**5556**) are on independent
 pumps and **run at the same time** -- the draw does not wait for the clean. See
@@ -477,23 +477,24 @@ motion and wraps around the ring, so it keeps meaning "the slot the carousel is
 turned to" rather than "the slot last mixed".
 
 **`draw_and_load`**: mixer2cleaningstation (if needed) ->
-ready_flowcell_to_draw -> pump draw_to_flowcell -> load_sample_to_beam -> park
-at the transfer point. The tail of `make_sample` without the mixing, for a
-vial that already holds what is wanted -- one mixed by an earlier run, or a
-sample just recovered by `unload_sample aspirate`. Requires the flowcell in use
-to be at the cleaning station and the mixer head's location to be known.
-Nothing here touches the carousel: no slot is consumed and no sample ID is
-assigned, so the vial drawn from is whichever one the last rotation left the
-mixer over. **This does not rotate the carousel** -- if you want a specific
-slot, use `draw_load_sample` instead; pressing this without having first
-positioned the carousel there draws from whatever vial happens to already be
-at the draw point, silently.
+ready_flowcell_to_draw -> pump draw_to_flowcell -> load_sample_to_beam ->
+shake_sample (auto, not awaited) -> park at the transfer point. The tail of
+`make_sample` without the mixing, for a vial that already holds what is
+wanted -- one mixed by an earlier run, or a sample just recovered by
+`unload_sample aspirate`. Requires the flowcell in use to be at the cleaning
+station and the mixer head's location to be known. Nothing here touches the
+carousel: no slot is consumed and no sample ID is assigned, so the vial drawn
+from is whichever one the last rotation left the mixer over. **This does not
+rotate the carousel** -- if you want a specific slot, use `draw_load_sample`
+instead; pressing this without having first positioned the carousel there
+draws from whatever vial happens to already be at the draw point, silently.
 
 **`draw_load_sample <slot> [sample id]`**: advance carousel (to `<slot>`'s
 *drawing* position -- `draw_offset_steps` forward of its mixing position, same
 as `make_sample`'s advance) -> mixer2cleaningstation (if needed) ->
-ready_flowcell_to_draw -> pump draw_to_flowcell -> load_sample_to_beam -> park
-at the transfer point. `draw_and_load`'s slot-aware counterpart, for a named,
+ready_flowcell_to_draw -> pump draw_to_flowcell -> load_sample_to_beam ->
+shake_sample (auto, not awaited) -> park at the transfer point. `draw_and_load`'s
+slot-aware counterpart, for a named,
 already-prepared slot rather than whatever the carousel already happens to be
 sitting on. The rotation runs *before* `ready_flowcell_to_draw`, deliberately:
 that step lowers the flowcell onto and bumps whatever is currently under the
@@ -525,6 +526,42 @@ that stopped mid-sequence may still be holding the flowcell or mid-descent,
 and driving it to the corridor is not obviously safe then -- the same
 reasoning that already leaves every other mid-workflow failure for the
 operator to look at rather than trying to recover from automatically.
+
+### Auto-shake
+
+`make_sample`, `draw_and_load`, and `draw_load_sample` all fire
+`Workflows._start_auto_shake()` right after `load_sample_to_beam`, not
+awaited -- parking, and whatever the operator does next, runs while the
+sample is agitated at the beam. Unlike every other pump op used here, a shake
+is not one bounded call: `flow2_sample`/`flow3_sample` runs a single fixed
+recipe and then stops, so "keep shaking" means re-firing it in a loop, on its
+own daemon thread, for as long as the sample sits at the beam.
+
+The loop is **pinned** to the flowcell that was actually just loaded
+(`Pump.shake_sample`'s `flowcell_id`), read once when the loop starts --
+switching the "Flowcell in Use" selector afterward, to work on the other
+flowcell, does not retarget an already-running shake.
+
+`Workflows.stop_auto_shake()` ends it, called from two places:
+
+- The start of `unload_sample`, either sequence -- before its own first real
+  step, since aspirate's `return_sample` picks the flowcell straight up and a
+  shake still running then would jostle it during exactly that.
+- `server.py`'s `_run_transport`, specifically when
+  `load_flowcell_from_beam_to_cleaningstation` runs on its own (the
+  Experiment tab's transport button) rather than through `unload_sample`.
+
+Either way, once the flowcell is leaving the sample table there is nothing
+left to agitate. `stop_auto_shake()` also reaches into a shake that a plain
+press of the Automation tab's **Shake Sample** button started, not only one
+the loop itself began -- it calls `Pump.stop_shaking()` unconditionally,
+which is what actually interrupts whatever cycle happens to be running right
+now rather than waiting for it to finish on its own; the loop only checks
+whether to start *another* cycle in between. Starting a second auto-shake
+(loading a different sample while an old one is somehow still shaking) stops
+the first rather than letting two loops fight over the same hardware -- only
+one flowcell can physically be mid-shake at a time regardless, since the
+flowcell dashboard serializes both its pumps through one recipe thread.
 
 ### Pump status panel
 

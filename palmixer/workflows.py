@@ -25,19 +25,23 @@ make_sample mixes a fresh vial and puts it in the beam:
     ready_flowcell_to_draw              (onto sample_on_mixer_station)
     draw_to_flowcell                    (pump 5556, runs while 5555 cleans)
     load_sample_to_beam
+    shake_sample                        (pump, auto, not awaited)
     park_at_transfer_point
 
 A wait_for_<op> step appears only where a not-awaited op is still running on
 the pump the next step needs; the mixer clean and the flowcell draw are on
 different servers and overlap, so it does not appear between those two.
 
-draw_and_load is make_sample's tail without the mixing, for a vial that
-already holds what is wanted:
+draw_and_load and draw_load_sample are make_sample's tail without the mixing,
+for a vial that already holds what is wanted -- draw_load_sample additionally
+turns the carousel to a named slot's drawing position first:
 
+    advance_carousel                    (draw_load_sample only, to <slot>)
     mixer2cleaningstation               (only if the head is at the mixer)
     ready_flowcell_to_draw
     draw_to_flowcell                    (pump)
     load_sample_to_beam
+    shake_sample                        (pump, auto, not awaited)
     park_at_transfer_point
 
 unload_sample runs one of two sequences. The default discards the sample:
@@ -64,6 +68,17 @@ above it raises. An arm that stopped partway through a sequence may still be
 holding the flowcell or mid-descent, and a blind move to the corridor is not
 obviously safe then; the operator's own judgement decides what to do with it,
 the way every other mid-workflow failure already leaves that to them.
+
+shake_sample (Workflows._start_auto_shake) is a loop, not a single pump call:
+once the flowcell is loaded it re-fires `shake_sample` on a background thread
+for as long as the sample sits at the beam, pinned to the flowcell that was
+just loaded regardless of later changes to the "flowcell in use" selector.
+Workflows.stop_auto_shake() ends it -- called at the start of unload_sample
+(either sequence) and from the server whenever
+load_flowcell_from_beam_to_cleaningstation runs on its own (the Experiment
+tab's transport button), since the flowcell is about to leave the beam either
+way. It also interrupts a shake started by the plain Shake Sample button, not
+only one this loop started itself.
 """
 
 import threading
@@ -86,6 +101,12 @@ from .pump import server_for as _pump_server_for
 # the distance follows `carousel.step` and neither has to be changed in code.
 def _draw_offset_steps():
     return state.get_carousel_draw_offset_steps()
+
+# How long an auto-shake loop pauses between cycles once one finishes on its
+# own (not stopped). Purely a breather -- stop_auto_shake() interrupts a
+# cycle already in progress via Pump.stop_shaking() rather than waiting for
+# this gap, so it does not control how quickly a stop takes effect.
+AUTO_SHAKE_PAUSE_S = 0.5
 
 
 class WorkflowError(Exception):
@@ -173,6 +194,64 @@ class Workflows:
         # The op reports its own success or failure through its own on_step
         # trio; this step only ever says the waiting is over.
         return "%s finished; the pump is free" % op
+
+    def _start_auto_shake(self):
+        """Begin shaking the flowcell just loaded, repeating until
+        stop_auto_shake() is called. Fired after load_sample_to_beam in
+        make_sample, draw_and_load, and draw_load_sample -- not awaited, so
+        parking (and whatever the operator does next) runs while the sample
+        is agitated at the beam.
+
+        Pinned to the flowcell that was just loaded (Pump.shake_sample's
+        `flowcell_id`), not whatever the "flowcell in use" selector reads
+        later: switching that selector to work on the other flowcell must not
+        silently retarget a shake already running for this one.
+        """
+        # Only one flowcell can physically be mid-shake at a time (the
+        # flowcell dashboard serializes both its pumps through one recipe
+        # thread), so a second auto-shake starting is a hand-off, not two
+        # loops sharing the hardware.
+        self.stop_auto_shake()
+        fc = state.get_flowcell_in_use()
+        stop_event = threading.Event()
+
+        def run():
+            try:
+                while not stop_event.is_set():
+                    ok, detail = self.pump.shake_sample(flowcell_id=fc)
+                    if not ok:
+                        self.on_step("shake_sample", "failure", detail)
+                        return
+                    if stop_event.wait(AUTO_SHAKE_PAUSE_S):
+                        return
+            except Exception as e:
+                self.on_step("shake_sample", "failure", str(e))
+                return
+            self.on_step("shake_sample", "success", "stopped")
+
+        thread = threading.Thread(target=run, daemon=True)
+        self._auto_shake = (stop_event, thread)
+        self.on_step("shake_sample", "started",
+                    "(auto, flowcell %s, not awaited)" % fc)
+        thread.start()
+
+    def stop_auto_shake(self):
+        """Stop shaking now, whatever started it -- an auto-shake loop or a
+        one-off press of the plain Shake Sample button -- and stop an
+        auto-shake loop from starting another cycle. Safe to call when
+        nothing is shaking.
+
+        Called at the start of unload_sample (either sequence) and by the
+        server whenever load_flowcell_from_beam_to_cleaningstation runs on
+        its own: once the flowcell is leaving the sample table, there is
+        nothing left for a shake to agitate.
+        """
+        entry = getattr(self, "_auto_shake", None)
+        if entry is not None:
+            stop_event, _thread = entry
+            self._auto_shake = None
+            stop_event.set()
+        return self.pump.stop_shaking()
 
     def _park(self):
         """Move the arm to the transfer point. The last step of a workflow
@@ -322,6 +401,7 @@ class Workflows:
                 ("ready_flowcell_to_draw", lambda: state.set_flowcell_location(fc, state.FC_IN_GRIPPER)),
                 ("draw_to_flowcell", None),
                 ("load_sample_to_beam", lambda: state.set_flowcell_location(fc, state.FC_AT_BEAM)),
+                ("shake_sample", None),
             )
             for step, on_success in steps:
                 self._simulated_step(step, on_success=on_success)
@@ -363,6 +443,7 @@ class Workflows:
         self._await_background_pump("draw_to_flowcell")
         self._step("draw_to_flowcell", lambda: self._pump_op("draw_to_flowcell"))
         self._step("load_sample_to_beam", lambda: self.pal.load_sample_to_beam(self.robot))
+        self._start_auto_shake()
         self._park()
 
         return self._make_sample_detail("make_sample", slot, sample_id)
@@ -496,6 +577,7 @@ class Workflows:
                 ("ready_flowcell_to_draw", lambda: state.set_flowcell_location(fc, state.FC_IN_GRIPPER)),
                 ("draw_to_flowcell", None),
                 ("load_sample_to_beam", lambda: state.set_flowcell_location(fc, state.FC_AT_BEAM)),
+                ("shake_sample", None),
             )
             for step, on_success in steps:
                 self._simulated_step(step, on_success=on_success)
@@ -512,6 +594,7 @@ class Workflows:
         self._await_background_pump("draw_to_flowcell")
         self._step("draw_to_flowcell", lambda: self._pump_op("draw_to_flowcell"))
         self._step("load_sample_to_beam", lambda: self.pal.load_sample_to_beam(self.robot))
+        self._start_auto_shake()
         self._park()
 
         return "draw_and_load complete"
@@ -554,7 +637,8 @@ class Workflows:
                         fc, state.FC_IN_GRIPPER)),
                     ("draw_to_flowcell", None),
                     ("load_sample_to_beam", lambda: state.set_flowcell_location(
-                        fc, state.FC_AT_BEAM))):
+                        fc, state.FC_AT_BEAM)),
+                    ("shake_sample", None)):
                 self._simulated_step(step, on_success=on_success)
             self._park()
             return self._make_sample_detail("simulated draw_load_sample", slot,
@@ -576,6 +660,7 @@ class Workflows:
         self._await_background_pump("draw_to_flowcell")
         self._step("draw_to_flowcell", lambda: self._pump_op("draw_to_flowcell"))
         self._step("load_sample_to_beam", lambda: self.pal.load_sample_to_beam(self.robot))
+        self._start_auto_shake()
         self._park()
         return self._make_sample_detail("draw_load_sample", slot, sample_id or "preloaded")
 
@@ -614,6 +699,13 @@ class Workflows:
         backgrounds that wash either way, so there is nothing there to skip.
         """
         self._check_unload_sample(aspirate)
+        # The flowcell is coming off the beam either way, so any shake --
+        # auto-started after a load, or a one-off Shake Sample press -- has
+        # nothing left to agitate. Stopped before either sequence below runs,
+        # not after: aspirate's own return_sample is the first real step, and
+        # a shake still running while that happens would jostle the flowcell
+        # exactly as it is being picked up.
+        self.stop_auto_shake()
         mixer_loc = state.get_mixer_head()
 
         if self.simulate:

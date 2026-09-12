@@ -697,6 +697,13 @@ class PALmixerServer:
         if self.simulate:
             time.sleep(2)
             return "simulated transport %s" % name
+        if name == "load_flowcell_from_beam_to_cleaningstation":
+            # The flowcell is leaving the sample table -- same reason
+            # unload_sample stops a shake at its own start (see
+            # Workflows.stop_auto_shake), but this is the path reached when
+            # the Experiment tab's transport button is pressed directly
+            # rather than through unload_sample.
+            self.workflows.stop_auto_shake()
         getattr(self.PAL12idb, name)(self.rob)
         return "%s complete" % name
 

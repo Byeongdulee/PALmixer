@@ -368,8 +368,8 @@ class Pump:
                                 {"device": d},
                                 "wash_flowcell (device %d)" % d)
 
-    def shake_sample(self):
-        """Shake the sample in the in-use flowcell by cycling it back and forth.
+    def shake_sample(self, flowcell_id=None):
+        """Shake the sample in a flowcell by cycling it back and forth.
 
         The one flowcell op whose target is named by the command rather than by
         a ``device`` field: the flowcell server has ``flow2_sample`` for
@@ -378,10 +378,17 @@ class Pump:
         id 1 -> ``flow2_sample``, id 2 -> ``flow3_sample``, the same mapping
         _flowcell_device() makes.
 
+        ``flowcell_id`` pins the target explicitly instead of reading the
+        "flowcell in use" setting -- Workflows' auto-shake loop passes the
+        flowcell that was actually just loaded, so an operator switching that
+        setting later to work on the other flowcell cannot silently retarget a
+        shake already running. The manual Shake Sample button omits it, and
+        gets today's behaviour: whichever flowcell is currently selected.
+
         Volume and cycle count come from the flowcell dashboard's own settings,
         like every other op's speeds and ports.
         """
-        d = self._flowcell_device()
+        d = self._flowcell_device(flowcell_id)
         command = "flow2_sample" if d == 0 else "flow3_sample"
         return self._run_remote(self._flowcell, command, None,
                                 "shake_sample (%s)" % command)
@@ -521,12 +528,15 @@ class Pump:
 
     # -- internals ------------------------------------------------------------
     @staticmethod
-    def _flowcell_device():
-        """Map PALmixer's in-use flowcell id (1/2) to the 0-based device int.
+    def _flowcell_device(flowcell_id=None):
+        """Map a PALmixer flowcell id (1/2) to the 0-based device int.
 
-        id 1 -> device 0 (flowcell2), id 2 -> device 1 (flowcell3).
+        id 1 -> device 0 (flowcell2), id 2 -> device 1 (flowcell3). Uses the
+        "flowcell in use" setting when `flowcell_id` is not given -- every
+        caller except an auto-shake loop wants that (see Pump.shake_sample).
         """
-        return 0 if state.get_flowcell_in_use() == 1 else 1
+        fc = flowcell_id if flowcell_id is not None else state.get_flowcell_in_use()
+        return 0 if fc == 1 else 1
 
     def _run_remote(self, endpoint, command, extra, label):
         """Send one motion command and block until that server goes idle.
