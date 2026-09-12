@@ -855,6 +855,36 @@ def _flowcell_setter():
     return lambda location: state.set_flowcell_location(fc, location)
 
 
+def _restore_stage(restore_to, what):
+    """Put the DAQ sample-stage motors back where they were before we aligned.
+
+    align_sample_table() drives the stage to where the robot's sample_table
+    waypoint was taught, because that is where the gripper knows how to reach.
+    That is a handoff position, not a measuring position -- leaving the stage
+    parked there means the next acquisition looks at wherever the robot likes
+    rather than wherever the beam was set up to look, and the data comes back
+    perfectly plausible and wrong.
+
+    Best-effort, and deliberately so: every caller is wrapped in @_tracks, which
+    records the flowcell's location as UNKNOWN if the function raises. By the
+    time this runs the robot has already done its physical work and the flowcell
+    really is where it was put, so raising here would condemn a cell that is
+    exactly where it should be and block everything after it. The warning is
+    loud instead, and it says what is wrong with the data rather than only what
+    failed -- if the DAQ GUI were unreachable, align_sample_table() at the top of
+    the same function would already have raised before anything moved.
+    """
+    if restore_to is None:
+        return
+    try:
+        daq_client.set_pos(restore_to)
+    except Exception as e:
+        print('PAL12idb: could not restore the DAQ sample-table motors after %s: '
+              '%s\n  The stage is still at the robot handoff position, so anything '
+              'measured now is at the wrong place. Put %s back by hand before '
+              'acquiring.' % (what, e, dict(zip(daq_client.MOTORS, restore_to))))
+
+
 # Actual transport functions. These functions are used to move the flowcell between the cleaning station, mixer station, and sample table.
 # mixer head to its cleaning station. The robot is assumed to be empty.
 @_tracks(lambda: state.set_mixer_head, state.MIXER_AT_CLEANING)
@@ -873,6 +903,12 @@ def mixer2mixingstation(robot):
 # This is for measuring water background. The flowcell is not loaded with sample.
 @_tracks(_flowcell_setter, state.FC_AT_BEAM)
 def load_flowcell_from_cleaningstation_to_beam(robot):
+    # Captured before align_sample_table() moves anything, so the stage can go
+    # back to the measuring position once the flowcell is seated -- see
+    # _restore_stage(). Read first for the same reason as in
+    # load_flowcell_from_beam_to_cleaningstation: it fails here, before either
+    # the stage or the robot has moved, if the DAQ GUI cannot be reached.
+    restore_to = daq_client.get_pos()
     # Bring the DAQ sample stage back to where it was when the robot's
     # sample_table waypoint was taught, before the robot approaches it --
     # see daq_client.align_sample_table(). Raises before anything moves if
@@ -886,6 +922,10 @@ def load_flowcell_from_cleaningstation_to_beam(robot):
     # cleaning station -> sample table: crosses between the two regions.
     transport2sampletable(robot, cleaning_station, height=needle_clear_height,
                           via_transferpoint=True, pickup_from_above=True)
+    # The flowcell is seated and the gripper is clear, so the stage is free to
+    # go back to where the beam is set up to look -- and it has to happen here,
+    # before the background acquisition that follows this call.
+    _restore_stage(restore_to, 'loading the flowcell to the beam')
 
 # Bring the flowcell from the beam to the cleaning station.
 @_tracks(_flowcell_setter, state.FC_AT_CLEANING)
@@ -913,14 +953,8 @@ def load_flowcell_from_beam_to_cleaningstation(robot):
     # The flowcell is off the sample table now, so nothing is left for the
     # stage to be aligned to it for; put it back where it was before this
     # function touched it, rather than leaving it parked at the sample table
-    # position indefinitely. Best-effort: the robot has already done its
-    # physical work by this point, and @_tracks records that outcome -- a DAQ
-    # failure here should not make a transport that actually succeeded look
-    # like it failed (or mark the flowcell's location UNKNOWN when it is not).
-    try:
-        daq_client.set_pos(restore_to)
-    except Exception as e:
-        print('PAL12idb: could not restore DAQ sample-table motors: %s' % e)
+    # position indefinitely.
+    _restore_stage(restore_to, 'returning the flowcell to its cleaning station')
 
 # Bring the flowcell parked at the cleaning station to the sample seat, ready
 # to draw solution from the vial standing there. The robot is assumed to be
@@ -952,6 +986,10 @@ def ready_flowcell_to_draw(robot):
 # after drawing, the robot is holding the flowcell. Move it to the beam and drop it.
 @_tracks(_flowcell_setter, state.FC_AT_BEAM)
 def load_sample_to_beam(robot):
+    # Captured before the alignment moves the stage: this is the position the
+    # sample is actually measured at, and it is what the stage goes back to once
+    # the flowcell is down. See _restore_stage().
+    restore_to = daq_client.get_pos()
     # See daq_client.align_sample_table().
     daq_client.align_sample_table()
     robot.mvr2z(needle_clear_height)
@@ -960,10 +998,20 @@ def load_sample_to_beam(robot):
     # mixer station -> sample table: crosses between the two regions.
     move_via_transferpoint(robot, p2)
     dropdown_sampletable(robot)
+    # Last step of the load, and the last thing before the campaign acquires:
+    # the sample is in the beam only once the stage is back where the beam is.
+    _restore_stage(restore_to, 'loading the sample to the beam')
 
 # after data collection, pick up the flowcell from the beam and move it to the mixer to aspirate.
 @_tracks(_flowcell_setter, state.FC_IN_GRIPPER)
 def return_sample(robot):
+    # Captured before the alignment, and restored at the end once the flowcell
+    # has left the sample table. Without this the stage would be left standing
+    # at the handoff position, and the *next* load_sample_to_beam would read
+    # that as the position to go back to -- so the measuring position would be
+    # lost after the first sample and every one after it measured in the wrong
+    # place. See _restore_stage().
+    restore_to = daq_client.get_pos()
     # See daq_client.align_sample_table().
     daq_client.align_sample_table()
     # move up to the sample table height.
@@ -986,6 +1034,10 @@ def return_sample(robot):
     # sample table -> mixer side: crosses between the two regions.
     move_via_transferpoint(robot, p2)
     robot.bump(z=-1,backoff=0.005)
+    # The flowcell is off the sample table and over the mixer side, so the stage
+    # is free again -- and has to be put back, or the next load would take the
+    # handoff position for the measuring one.
+    _restore_stage(restore_to, 'returning the sample from the beam')
 
 # after aspirating, move the flowcell to the cleaning station and drop it.
 @_tracks(_flowcell_setter, state.FC_AT_CLEANING)
