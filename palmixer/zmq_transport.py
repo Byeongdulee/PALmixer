@@ -99,12 +99,40 @@ class ZMQCommandServer:
         return self._port
 
     def start(self, port=None):
+        """Bind the REP socket, then serve on a background thread.
+
+        The bind happens here, on the caller's thread, so that a failure --
+        almost always the port still held by an older server -- is raised at
+        the caller. Bound inside ``_serve`` instead, the exception killed only
+        the daemon thread, while ``start`` had already announced it was
+        listening and the caller's ``while True`` loop kept a process alive
+        that answered nothing.
+        """
         if port is not None:
             self._port = port
         if self._thread and self._thread.is_alive():
             return
+
+        try:
+            import zmq
+        except ImportError as e:
+            raise ZMQError("pyzmq not installed - run: pip install pyzmq (%s)" % e)
+
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.REP)
+        try:
+            sock.bind("tcp://*:%d" % self._port)
+        except zmq.ZMQError as e:
+            sock.close(0)
+            ctx.term()
+            raise ZMQError("cannot bind tcp://*:%d (%s) -- another server is "
+                           "probably already running on that port"
+                           % (self._port, e))
+        sock.setsockopt(zmq.RCVTIMEO, 500)  # poll every 500 ms for clean shutdown
+
         self._running = True
-        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread = threading.Thread(target=self._serve, args=(ctx, sock),
+                                        daemon=True)
         self._thread.start()
         print("ZMQ command server listening on tcp://*:%d" % self._port)
 
@@ -114,17 +142,9 @@ class ZMQCommandServer:
     def is_alive(self):
         return self._thread is not None and self._thread.is_alive()
 
-    def _serve(self):
-        try:
-            import zmq
-        except ImportError:
-            print("ZMQ server: pyzmq not installed - run: pip install pyzmq")
-            return
-
-        ctx = zmq.Context()
-        sock = ctx.socket(zmq.REP)
-        sock.bind("tcp://*:%d" % self._port)
-        sock.setsockopt(zmq.RCVTIMEO, 500)  # poll every 500 ms for clean shutdown
+    def _serve(self, ctx, sock):
+        """Poll the socket bound by :meth:`start` until :meth:`stop`."""
+        import zmq
 
         while self._running:
             try:

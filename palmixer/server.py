@@ -30,7 +30,7 @@ from .mqtt_status import (
 from .pump import Pump
 from .motor import Motor
 from .workflows import Workflows, WorkflowError
-from .zmq_transport import ZMQCommandServer
+from .zmq_transport import ZMQCommandServer, ZMQError
 
 STATE_IDLE = "IDLE"
 STATE_BUSY = "BUSY"
@@ -849,7 +849,14 @@ def main():
     args = parser.parse_args()
 
     server = PALmixerServer(simulate=args.simulate)
-    server.start()
+    try:
+        server.start()
+    except ZMQError as e:
+        # No client can reach this server, so do not hold the port-less process
+        # open in the loop below as if one could.
+        print("\nFAILED TO START: %s" % e)
+        server.stop()
+        return 1
     print("PALmixer server running. Press Ctrl+C to stop.")
     try:
         while True:
@@ -858,7 +865,8 @@ def main():
         pass
     finally:
         server.stop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
