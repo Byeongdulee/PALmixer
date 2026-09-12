@@ -42,6 +42,23 @@ PHASE_COLORS = {
     "failure": QColor("darkred"),
 }
 
+#: Longest text shown in the state badge / result banner before it is elided
+#: with "..." (the full text still reaches the operator, as the widget's
+#: tooltip). Both are single-line, unwrapped labels precisely so a long step
+#: name or completion detail cannot grow the Status panel by wrapping onto a
+#: second line -- eliding keeps the line, and so the panel's height, constant
+#: regardless of what is being reported.
+BADGE_TEXT_LIMIT = 60
+RESULT_TEXT_LIMIT = 100
+
+
+def _elide(text, limit):
+    """(shown, tooltip) -- tooltip is None when nothing was cut."""
+    text = str(text)
+    if len(text) <= limit:
+        return text, None
+    return text[:limit - 3] + "...", text
+
 
 class MainWindow(QMainWindow):
     _zmq_reply = pyqtSignal(str, str)       # (command, reply)
@@ -114,14 +131,24 @@ class MainWindow(QMainWindow):
         # be one line in the log below, which scrolls away and is easy to
         # miss -- an AprilTag search that gave up looked the same as one still
         # running. This stays put until the next command is sent.
+        #
+        # Always visible (never hidden) and never word-wrapped: this used to
+        # be hidden between results and shown with wrapping enabled, and both
+        # changed the Status panel's height -- hiding removed it from the
+        # layout's size calculation entirely, and wrapping let a long
+        # completion detail grow it onto a second or third line. Either way
+        # the tabs above (the only stretch="1" widget sharing this window)
+        # visibly shrank to make room. See _show_result/_clear_result.
         self.result_label = QLabel("")
-        self.result_label.setWordWrap(True)
-        self.result_label.hide()
+        self.result_label.setWordWrap(False)
+        self.result_label.setStyleSheet("padding: 3px;")
         self._last_result_stamp = None
         layout.addWidget(self.result_label)
 
         self.log_list = QListWidget()
-        self.log_list.setMaximumHeight(200)
+        # Fixed, not a maximum: a maximum still lets the widget shrink below
+        # it, which a QListWidget with few or no items does.
+        self.log_list.setFixedHeight(200)
         layout.addWidget(self.log_list)
 
         box.setLayout(layout)
@@ -280,23 +307,30 @@ class MainWindow(QMainWindow):
                                  getattr(self, "_current_step", None)) if p]
             if parts:
                 text += " -- " + " / ".join(dict.fromkeys(parts))
-        self.state_badge.setText(text)
+        shown, tooltip = _elide(text, BADGE_TEXT_LIMIT)
+        self.state_badge.setText(shown)
+        self.state_badge.setToolTip(tooltip or "")
         self.state_badge.setStyleSheet(
             "font-weight: bold; color: %s;" % ("darkred" if busy else "darkgreen"))
 
     def _show_result(self, ok, text):
-        self.result_label.setText(("OK: " if ok else "FAILED: ") + text)
+        shown, tooltip = _elide(("OK: " if ok else "FAILED: ") + text, RESULT_TEXT_LIMIT)
+        self.result_label.setText(shown)
+        self.result_label.setToolTip(tooltip or "")
         self.result_label.setStyleSheet(
             "color: white; background-color: %s; font-weight: bold; padding: 3px;"
             % ("darkgreen" if ok else "darkred"))
-        self.result_label.show()
 
     def _show_error(self, text):
         self._show_result(False, text)
 
     def _clear_result(self):
-        self.result_label.clear()
-        self.result_label.hide()
+        # Left visible with empty text, not hidden -- see the comment where
+        # this label is built. The stylesheet is reset too, so a cleared
+        # result does not sit there in yesterday's red/green.
+        self.result_label.setText("")
+        self.result_label.setToolTip("")
+        self.result_label.setStyleSheet("padding: 3px;")
 
     def _log(self, text, color=None):
         item = QListWidgetItem(text)

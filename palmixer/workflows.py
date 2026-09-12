@@ -79,6 +79,22 @@ load_flowcell_from_beam_to_cleaningstation runs on its own (the Experiment
 tab's transport button), since the flowcell is about to leave the beam either
 way. It also interrupts a shake started by the plain Shake Sample button, not
 only one this loop started itself.
+
+mixer2cleaningstation and mixer2mixingstation move the mixer head, which
+clean_mixer washes by running liquid through it while it sits docked at the
+cleaning station -- moving it away mid-wash risks spilling that, damaging the
+tubing, or fouling the needle alignment. clean_mixer is fired without being
+awaited (see above), so it can still be running well after the make_sample
+that started it has returned and the server has gone idle again; nothing else
+here waits for it to finish on its own the way a same-server pump op does.
+Workflows.mixer_head_busy() answers whether it still is, checked fresh every
+time (not cached), and Workflows._move_mixer_head() is the one place every
+internal call to either transport goes through, refusing with a WorkflowError
+if so. server.py additionally refuses outright, before ACCEPTED, for the two
+cases an operator can trigger directly: the Experiment tab's own buttons for
+either transport, and make_sample (_check_make_sample) -- so those get
+"ERROR: ..." immediately rather than an ACCEPTED that then fails once the
+sequence reaches the step that would have moved the head.
 """
 
 import threading
@@ -166,6 +182,24 @@ class Workflows:
         self._background_pump = (op, thread)
         thread.start()
 
+    def _background_pump_status(self):
+        """(op, thread) of a still-running background pump op, or None.
+
+        Freshly checks `thread.is_alive()` rather than trusting the bookkeeping
+        left by _start_background_pump_op: nothing proactively clears that once
+        the thread actually finishes, only the next caller that asks. Clears it
+        here when it finds a dead thread, so a stale entry cannot linger and
+        make something look busy that has long since finished.
+        """
+        entry = getattr(self, "_background_pump", None)
+        if entry is None:
+            return None
+        op, thread = entry
+        if not thread.is_alive():
+            self._background_pump = None
+            return None
+        return entry
+
     def _await_background_pump(self, before_op):
         """Wait out a background pump op, but only if it would block `before_op`.
 
@@ -176,13 +210,10 @@ class Workflows:
         than inside the pump call, so a wait of minutes is a named step instead
         of a step that appears to have stalled.
         """
-        entry = getattr(self, "_background_pump", None)
+        entry = self._background_pump_status()
         if entry is None:
             return
         op, thread = entry
-        if not thread.is_alive():
-            self._background_pump = None
-            return
         if _pump_server_for(op) != _pump_server_for(before_op):
             return                      # different pump: they run side by side
         self._background_pump = None
@@ -194,6 +225,32 @@ class Workflows:
         # The op reports its own success or failure through its own on_step
         # trio; this step only ever says the waiting is over.
         return "%s finished; the pump is free" % op
+
+    def mixer_head_busy(self):
+        """Is the mixer head currently being washed (a background clean_mixer
+        still running)?
+
+        True while the head is docked at the cleaning station with liquid
+        actively flowing through it -- moving it away mid-wash risks spilling
+        it, damaging the tubing, or fouling the needle alignment. Unlike a
+        pump-to-pump wait, nothing else here waits for this on its own, so
+        anything that is about to move the head has to check fresh.
+        """
+        entry = self._background_pump_status()
+        return entry is not None and entry[0] == "clean_mixer"
+
+    def _move_mixer_head(self, name, fn):
+        """Run a mixer-head transport (mixer2cleaningstation /
+        mixer2mixingstation), refused while mixer_head_busy(). The one place
+        every internal call to either goes through, so the refusal applies
+        everywhere the head could be moved, not just the two cases with their
+        own pre-flight check (the Experiment tab's buttons, in server.py, and
+        make_sample, in _check_make_sample).
+        """
+        if self.mixer_head_busy():
+            raise WorkflowError(
+                "mixer head cannot be moved while it is being washed")
+        return self._step(name, fn)
 
     def _start_auto_shake(self):
         """Begin shaking the flowcell just loaded, repeating until
@@ -352,6 +409,16 @@ class Workflows:
         self._require_known(mixer_loc, state.WHAT_MIXER_HEAD,
                              (state.MIXER_AT_MIXER, state.MIXER_AT_CLEANING))
 
+        # Refused outright rather than accepted-then-failed: a wash left
+        # running by a previous make_sample can still be going once this one
+        # would otherwise reach mixer2mixingstation (make_sample's own
+        # opening mixer2cleaningstation runs before this, so this alone would
+        # not catch it there -- _move_mixer_head is the backstop for that gap
+        # and for every other internal call to either mixer transport).
+        if self.mixer_head_busy():
+            raise WorkflowError(
+                "cannot start make_sample while the mixer head is being washed")
+
         # Every slot position is derived from one taught reference, so a reference
         # taught on a different carousel sends the robot to where that one's slot
         # was. Refused rather than warned: the failure is a collision, not a bad
@@ -410,10 +477,12 @@ class Workflows:
                                             minted[0] if minted else sample_id)
 
         if mixer_loc == state.MIXER_AT_MIXER:
-            self._step("mixer2cleaningstation", lambda: self.pal.mixer2cleaningstation(self.robot))
+            self._move_mixer_head("mixer2cleaningstation",
+                                  lambda: self.pal.mixer2cleaningstation(self.robot))
 
         self._step("rotate_carousel", lambda: self._rotate_carousel(slot, target_position))
-        self._step("mixer2mixingstation", lambda: self.pal.mixer2mixingstation(self.robot))
+        self._move_mixer_head("mixer2mixingstation",
+                              lambda: self.pal.mixer2mixingstation(self.robot))
         # A clean_mixer left running by the previous make_sample is on this
         # same pump, so it has to finish before this one can mix.
         self._await_background_pump("mix")
@@ -424,7 +493,8 @@ class Workflows:
         # sample is named here too, for the same reason -- this is the instant
         # it became a sample.
         sample_id = self._assign_sample_id(slot, sample_id)
-        self._step("mixer2cleaningstation", lambda: self.pal.mixer2cleaningstation(self.robot))
+        self._move_mixer_head("mixer2cleaningstation",
+                              lambda: self.pal.mixer2cleaningstation(self.robot))
 
         # No need to wait for the mixer to finish cleaning before moving on.
         self._start_background_pump_op("clean_mixer")
@@ -585,7 +655,8 @@ class Workflows:
             return "simulated draw_and_load complete"
 
         if mixer_loc == state.MIXER_AT_MIXER:
-            self._step("mixer2cleaningstation", lambda: self.pal.mixer2cleaningstation(self.robot))
+            self._move_mixer_head("mixer2cleaningstation",
+                                  lambda: self.pal.mixer2cleaningstation(self.robot))
 
         self._step("ready_flowcell_to_draw", lambda: self.pal.ready_flowcell_to_draw(self.robot))
         # Awaited, unlike unload's wash: the arm is holding the flowcell down
@@ -751,7 +822,8 @@ class Workflows:
             return "unload_sample complete (sample discarded with the wash)"
 
         if mixer_loc == state.MIXER_AT_MIXER:
-            self._step("mixer2cleaningstation", lambda: self.pal.mixer2cleaningstation(self.robot))
+            self._move_mixer_head("mixer2cleaningstation",
+                                  lambda: self.pal.mixer2cleaningstation(self.robot))
 
         self._step("return_sample", lambda: self.pal.return_sample(self.robot))
         # A wash left running by a previous unload is on this same pump.

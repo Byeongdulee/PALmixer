@@ -456,7 +456,9 @@ on a background thread, not awaited) -> advance carousel -> ready_flowcell_to_dr
 -> pump draw_to_flowcell -> load_sample_to_beam -> shake_sample (auto, not
 awaited) -> park at the transfer point. Requires the flowcell in use to be at
 its cleaning station, the slot to be within the configured carousel size, and
-the carousel to have been located (one taught reference).
+the carousel to have been located (one taught reference). Also refused
+outright while a previous run's mixer clean is still going -- see
+[Mixer wash safety](#mixer-wash-safety).
 
 The mixer clean (**5555**) and the flowcell draw (**5556**) are on independent
 pumps and **run at the same time** -- the draw does not wait for the clean. See
@@ -562,6 +564,32 @@ whether to start *another* cycle in between. Starting a second auto-shake
 the first rather than letting two loops fight over the same hardware -- only
 one flowcell can physically be mid-shake at a time regardless, since the
 flowcell dashboard serializes both its pumps through one recipe thread.
+
+### Mixer wash safety
+
+`clean_mixer` washes the mixer head by running liquid through it while it sits
+docked at the cleaning station. It is fired without being awaited (`make_sample`
+starts it on a background thread and moves straight on), so it can still be
+running well after `make_sample` has returned and the server has gone idle
+again -- nothing else waits for it to finish on its own the way a same-server
+pump op does. Moving the head off the station while that is happening risks
+spilling the liquid actively flowing through it, damaging the tubing, or
+fouling the needle alignment.
+
+`Workflows.mixer_head_busy()` answers whether a `clean_mixer` is still
+running, checked fresh every time rather than cached, and two things refuse
+while it is:
+
+- **Moving the mixer head at all** -- `mixer2cleaningstation` and
+  `mixer2mixingstation`, whichever way they are reached: the Experiment tab's
+  own buttons for either (refused outright by the server, before ACCEPTED),
+  or a step inside `make_sample`, `draw_and_load`, or `unload_sample aspirate`
+  (refused with a `WorkflowError` at the point that step would have run --
+  `Workflows._move_mixer_head` is the one place every internal call to either
+  transport goes through).
+- **Starting `make_sample`** -- refused outright by `_check_make_sample`, the
+  same synchronous pre-flight path as its other guards. The realistic case is
+  a second `make_sample` fired before the first one's wash has finished.
 
 ### Pump status panel
 

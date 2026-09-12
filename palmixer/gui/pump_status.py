@@ -24,23 +24,48 @@ SERVER_ORDER = ("mixer", "flowcell")
 _BUSY_STYLE = "color: darkred; font-weight: bold;"
 _ERROR_STYLE = "color: darkred; font-weight: bold;"
 
+#: Table rows: exactly the two mixer pumps plus the two flowcell pumps, never
+#: more or fewer -- the row count itself must not vary once data is flowing,
+#: or the table (and this panel) would change height with it.
+ROW_COUNT = 4
+#: Longest summary text shown before it is elided with "...", full text in
+#: the tooltip. The summary can carry up to three "|"-joined notes (one per
+#: server, plus a stop-requested one), which word-wrapping let grow this
+#: panel by one or two lines depending on how many applied at the moment --
+#: eliding to one line keeps the panel's height constant regardless.
+SUMMARY_TEXT_LIMIT = 100
+
+
+def _elide(text, limit):
+    """(shown, tooltip) -- tooltip is None when nothing was cut."""
+    text = str(text)
+    if len(text) <= limit:
+        return text, None
+    return text[:limit - 3] + "...", text
+
 
 class PumpStatusPanel(QGroupBox):
     def __init__(self, parent=None):
         super().__init__("Pumps", parent)
 
         layout = QVBoxLayout()
+        # Single line, never wrapped: this panel's height must not change as
+        # status arrives, and a 1-3 line summary (depending how many "|"-
+        # joined notes apply right now) did exactly that. Long text is
+        # elided instead, with the full text in the tooltip.
         self._summary = QLabel("waiting for the server ...")
-        self._summary.setWordWrap(True)
+        self._summary.setWordWrap(False)
         layout.addWidget(self._summary)
 
-        self.table = QTableWidget(0, 4)
+        self.table = QTableWidget(ROW_COUNT, 4)
         self.table.setHorizontalHeaderLabels(["Pump", "Server", "Status", "Position"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.NoSelection)
-        # Four rows and no more, so it can be sized to fit rather than scroll.
-        self.table.setMaximumHeight(140)
+        # Fixed at exactly ROW_COUNT rows (set once, never resized -- see
+        # _draw) and a fixed height, not a maximum: a maximum still lets the
+        # table shrink below it before the first snapshot arrives.
+        self.table.setFixedHeight(140)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -96,13 +121,22 @@ class PumpStatusPanel(QGroupBox):
                               warn=bool(active))
 
     def _set_summary(self, text, warn):
-        self._summary.setText(text)
+        shown, tooltip = _elide(text, SUMMARY_TEXT_LIMIT)
+        self._summary.setText(shown)
+        self._summary.setToolTip(tooltip or "")
         self._summary.setStyleSheet(_ERROR_STYLE if warn else "")
 
     def _draw(self, rows):
-        if self.table.rowCount() != len(rows):
-            self.table.setRowCount(len(rows))
-        for r, (name, server, status, position, active) in enumerate(rows):
+        # Always exactly ROW_COUNT rows -- never resized to len(rows), so a
+        # partial snapshot (a server missing from `servers` entirely, say)
+        # leaves the remaining rows blank rather than changing the table's,
+        # and so this panel's, height.
+        for r in range(ROW_COUNT):
+            if r < len(rows):
+                name, server, status, position, active = rows[r]
+            else:
+                name = server = status = position = ""
+                active = False
             for c, text in enumerate((name, server, status, position)):
                 item = self.table.item(r, c)
                 if item is None:
