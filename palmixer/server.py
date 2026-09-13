@@ -21,6 +21,7 @@ import time
 
 from . import commands as cmd
 from . import config
+from . import pvapp
 from . import state
 from .mqtt_status import (
     MQTTPublisher, PHASE_FAILURE, PHASE_STARTED, PHASE_SUCCESS,
@@ -86,6 +87,10 @@ class PALmixerServer:
         self.PAL12idb = None
         self.pump = Pump(simulate=self.simulate)
         self.motor = Motor(cfg["motor"].get("pv", "12idb:m6"))
+        #: Confirms a mix in PVapp once make_sample actually finishes. Credentials come
+        #: from the environment at startup and may be replaced for the process's
+        #: lifetime by a campaign's set_credentials -- see PVappUpdater.
+        self.pvapp = pvapp.PVappUpdater()
 
         if not self.simulate:
             ur12idb_path = cfg["robot"].get("ur12idb_path")
@@ -161,6 +166,9 @@ class PALmixerServer:
                                    current_step=self._current_step,
                                    pump_status=self._pump_status,
                                    last_result=self._last_result))
+
+        if name == cmd.SET_CREDENTIALS:
+            return self._set_credentials(args)
 
         if name == cmd.STOP_SEARCH:
             return self._stop_search()
@@ -514,7 +522,16 @@ class PALmixerServer:
                 raise ValueError(str(e))
             label = "%s %s%s" % (cmd.MAKE_SAMPLE, slot,
                                  " (%s)" % sample_id if sample_id else "")
-            return (lambda: self.workflows.make_sample(slot, sample_id)), label
+
+            def run_make_sample():
+                detail = self.workflows.make_sample(slot, sample_id)
+                # After, not before: the final id (minted inside make_sample when
+                # none was given) is only in `state` once the mix has actually
+                # happened, and PALmixer confirming a mix that has not is worse
+                # than not confirming one at all.
+                self._confirm_mix_in_pvapp(slot)
+                return detail
+            return run_make_sample, label
 
         if name == cmd.DRAW_LOAD_SAMPLE:
             if not args:
@@ -614,6 +631,45 @@ class PALmixerServer:
             self._publish_state(STATE_IDLE)
 
     # -- individual actions --------------------------------------------------
+    def _set_credentials(self, args):
+        """A campaign handing over the PVapp login it already has, so it does not
+        have to be exported separately on this host too. Takes effect on the *next*
+        PVapp confirmation, in memory only -- never logged, never returned, never on
+        the get_state snapshot. The only trace this leaves is a console line naming
+        the username, never the password.
+        """
+        if len(args) != 1:
+            return "ERROR: usage: %s <base64 json>" % cmd.SET_CREDENTIALS
+        try:
+            payload = cmd.decode_credentials(args[0])
+        except ValueError as e:
+            return "ERROR: %s" % e
+        username = str(payload.get("username") or "").strip()
+        if not username:
+            return "ERROR: username must not be empty"
+        self.pvapp.username = username
+        self.pvapp.password = str(payload.get("password") or "")
+        print("PALmixerServer: PVapp credentials received for %s" % username)
+        return "OK"
+
+    def _confirm_mix_in_pvapp(self, slot):
+        """After make_sample finishes: tell PVapp what PALsystem's own record could
+        not know yet -- which slot it actually came out of, which flow cell it went
+        to the beam in, and that the mix genuinely happened.
+
+        Never raises: a lost confirmation costs provenance, not the sample -- it is
+        real and in the beam either way. Printed once, like every other PVapp
+        failure in this system, rather than surfaced through the action's result.
+        """
+        sample_id = state.get_sample_id(slot)
+        if not sample_id:
+            return
+        try:
+            self.pvapp.confirm_mix(sample_id, slot, state.get_flowcell_in_use())
+        except pvapp.PVappError as e:
+            print("WARNING: PVapp mix confirmation for %s not recorded (%s)"
+                  % (sample_id, e))
+
     def _stop_search(self):
         """Abort an in-progress search_apriltag: sets the cooperative stop
         event the search loop polls between moves, and -- the part that

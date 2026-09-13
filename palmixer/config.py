@@ -16,6 +16,7 @@ Sections:
     carousel {size, step}                       -- carousel geometry
     pump  {host, mixer_port, flowcell_port, ...}-- apssector12_pump_control ZMQ
     daq   {host, port, request_timeout_s}       -- beamline DAQ GUI ZMQ (sample stage motors)
+    pvapp {base_url, username, owner_badge, required, timeout_s} -- sample register
 
 Env overrides (take precedence over the JSON):
     PALMIXER_ZMQ_HOST   PALMIXER_ZMQ_PORT
@@ -25,6 +26,8 @@ Env overrides (take precedence over the JSON):
     PALMIXER_CAROUSEL_SIZE  PALMIXER_CAROUSEL_STEP
     PALMIXER_PUMP_HOST  PALMIXER_PUMP_MIXER_PORT  PALMIXER_PUMP_FLOWCELL_PORT
     PALMIXER_DAQ_HOST   PALMIXER_DAQ_PORT
+    PALMIXER_PVAPP_URL  PALMIXER_PVAPP_BADGE
+    PVAPP_USERNAME      PVAPP_PASSWORD
 
 The pump section points at the two loopback ZMQ servers run by the
 apssector12_pump_control dashboards (mixing on 5555, flowcell on 5556). Its
@@ -41,6 +44,13 @@ and how far the motor moves between two adjacent ones. Both defaults here are
 wrong slot, so an absent one refuses the move instead of guessing. What is in
 each slot right now (the taught reference position and the sample IDs) is
 live state and lives in palmixer/palmixer_state.ini, not here.
+
+**The PVapp password is only ever read from the environment**, same as
+``PALsystem/palsystem/config.py`` -- this file lives in git and gets copied
+between beamlines, and a badge number is not a secret but the password that
+goes with it is. A campaign can also hand it over live, over ZMQ
+(``set_credentials``, see :mod:`palmixer.commands`); that overrides the
+environment for the running process only and is never written back here.
 """
 
 import json
@@ -91,6 +101,13 @@ _DEFAULTS = {
     # before every transport that touches the sample table.
     "daq": {"host": "purple.xray.aps.anl.gov", "port": 9876,
             "request_timeout_s": 5.0},
+    "pvapp": {
+        "base_url": "http://bleepc.xray.aps.anl.gov:5000",
+        "username": "",          # password NEVER here -- see the module docstring
+        "owner_badge": "",       # required when logging in as staff rather than a badge
+        "required": False,       # a lost mix-confirmation costs provenance, not the sample
+        "timeout_s": 10.0,
+    },
 }
 
 
@@ -192,6 +209,12 @@ def _merged():
         cfg["daq"]["host"] = env("PALMIXER_DAQ_HOST")
     if env("PALMIXER_DAQ_PORT"):
         cfg["daq"]["port"] = int(env("PALMIXER_DAQ_PORT"))
+    if env("PALMIXER_PVAPP_URL"):
+        cfg["pvapp"]["base_url"] = env("PALMIXER_PVAPP_URL")
+    if env("PALMIXER_PVAPP_BADGE"):
+        cfg["pvapp"]["owner_badge"] = env("PALMIXER_PVAPP_BADGE")
+    if env("PVAPP_USERNAME"):
+        cfg["pvapp"]["username"] = env("PVAPP_USERNAME")
 
     # Collapse the per-OS mapping to a single path, so every consumer
     # (server.py's sys.path insert, the GUI's AprilTag detector import) still
@@ -209,3 +232,8 @@ def get_section(name):
 def get_config():
     """Return the whole merged config."""
     return _merged()
+
+
+def pvapp_password():
+    """The PVapp password, from the environment only. Never from the config file."""
+    return os.environ.get("PVAPP_PASSWORD", "")

@@ -34,9 +34,18 @@ strings, one request -> one reply.
     "set_sample_id <slot> <sample id>"    -> "OK" | "ERROR: <reason>"
     "get_sample_id <slot>"                -> "<sample id>" | "unknown" | "ERROR: <reason>"
     "clear_sample_id <slot>"              -> "OK" | "ERROR: <reason>"
+    "set_credentials <base64 json>"       -> "OK" | "ERROR: <reason>"
 
 A sample ID is the rest of the line, so it may contain spaces; runs of
 whitespace in it collapse to one. Every other argument is a single token.
+
+``set_credentials`` hands PALmixer the PVapp login a campaign already has, for
+confirming a mix once ``make_sample`` finishes (see :mod:`palmixer.pvapp`). Fast,
+like ``get_sample_id`` -- it takes effect on the next confirmation, not whatever
+mix is already running. Base64'd for the same reason ``mount_carousel`` is: a
+password may hold characters this whitespace-delimited wire can't carry raw. That
+is encoding, not secrecy -- this socket is unauthenticated plain text like every
+other command on it. Held in memory only; never logged, returned, or persisted.
 """
 
 from . import state as _state
@@ -281,6 +290,12 @@ GET_CAROUSEL_ID = "get_carousel_id"
 SET_MIXING_SPEED = "set_mixing_speed"
 GET_MIXING_SPEED = "get_mixing_speed"
 
+# -- PVapp -------------------------------------------------------------------
+# The sample register's login, handed over by a campaign rather than exported
+# separately on this host. Only used to confirm a mix after make_sample; see
+# palmixer/pvapp.py.
+SET_CREDENTIALS = "set_credentials"
+
 FLOWCELL_IDS = _state.FLOWCELL_IDS               # (1, 2)
 LOCATION_KEYS = _state.LOCATION_KEYS             # mixer_head, flowcell_1, flowcell_2
 MIXER_LOCATIONS = _state.MIXER_LOCATIONS
@@ -513,6 +528,39 @@ def decode_inventory(token):
 
 def get_carousel_id_command():
     return GET_CAROUSEL_ID
+
+
+def set_credentials_command(username, password):
+    """Build the wire command handing PALmixer a PVapp login.
+
+    Base64'd like ``mount_carousel``'s inventory -- not for secrecy, only because a
+    password may contain characters this whitespace-delimited wire can't carry raw.
+    """
+    import base64
+    import json
+
+    payload = {"username": str(username), "password": str(password)}
+    token = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+    return "%s %s" % (SET_CREDENTIALS, token)
+
+
+def decode_credentials(token):
+    """The inverse. Returns ``{"username": ..., "password": ...}``. Raises ValueError.
+
+    The error deliberately says nothing about the payload's contents: a malformed
+    credential blob should not put any part of itself in a log.
+    """
+    import base64
+    import json
+
+    try:
+        raw = base64.b64decode(token, validate=True)
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise ValueError("credentials are not base64'd JSON")
+    if not isinstance(payload, dict):
+        raise ValueError("credentials must be a JSON object")
+    return payload
 
 
 def set_mixing_speed_command(rpm):

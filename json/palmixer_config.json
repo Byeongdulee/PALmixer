@@ -42,5 +42,12 @@
         "host": "purple.xray.aps.anl.gov",
         "port": 9876,
         "request_timeout_s": 5.0
+    },
+    "pvapp": {
+        "base_url": "http://bleepc.xray.aps.anl.gov:5000",
+        "username": "",
+        "owner_badge": "",
+        "required": false,
+        "timeout_s": 10.0
     }
 }
