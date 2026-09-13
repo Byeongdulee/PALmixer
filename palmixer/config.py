@@ -103,6 +103,11 @@ _DEFAULTS = {
             "request_timeout_s": 5.0},
     "pvapp": {
         "base_url": "http://bleepc.xray.aps.anl.gov:5000",
+        # badge + gup (proposal) are one credential: from a beamline address PVapp takes
+        # the pair in place of a username and password. A campaign may also hand them over
+        # live with set_credentials, which overrides these.
+        "badge": "",
+        "gup": "",
         "username": "",          # password NEVER here -- see the module docstring
         "owner_badge": "",       # required when logging in as staff rather than a badge
         "required": False,       # a lost mix-confirmation costs provenance, not the sample
@@ -215,6 +220,11 @@ def _merged():
         cfg["pvapp"]["owner_badge"] = env("PALMIXER_PVAPP_BADGE")
     if env("PVAPP_USERNAME"):
         cfg["pvapp"]["username"] = env("PVAPP_USERNAME")
+    # Unprefixed: the same two numbers every component here authenticates with.
+    if env("PVAPP_BADGE"):
+        cfg["pvapp"]["badge"] = env("PVAPP_BADGE")
+    if env("PVAPP_GUP"):
+        cfg["pvapp"]["gup"] = env("PVAPP_GUP")
 
     # Collapse the per-OS mapping to a single path, so every consumer
     # (server.py's sys.path insert, the GUI's AprilTag detector import) still

@@ -530,16 +530,29 @@ def get_carousel_id_command():
     return GET_CAROUSEL_ID
 
 
-def set_credentials_command(username, password):
+def set_credentials_command(username="", password="", badge="", gup="",
+                            source="campaign"):
     """Build the wire command handing PALmixer a PVapp login.
+
+    Two shapes, matching PVapp's two routes: a ``username``/``password`` pair, or a
+    ``badge``/``gup`` pair that needs no password at all on the beamline network. Send
+    whichever the campaign itself is using; sending both is allowed but pointless, since
+    the badge pair wins on the receiving side.
 
     Base64'd like ``mount_carousel``'s inventory -- not for secrecy, only because a
     password may contain characters this whitespace-delimited wire can't carry raw.
+
+    ``source`` picks the slot: ``"campaign"`` is the run's own identity and outranks
+    everything, ``"user"`` is what was typed into the GUI's User tab and is used only
+    while no campaign has provided one.
     """
     import base64
     import json
 
-    payload = {"username": str(username), "password": str(password)}
+    payload = {"username": str(username), "password": str(password),
+               "source": str(source)}
+    if badge not in (None, "") and gup not in (None, ""):
+        payload["badge"], payload["gup"] = str(badge), str(gup)
     token = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
     return "%s %s" % (SET_CREDENTIALS, token)
 

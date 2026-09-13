@@ -33,6 +33,7 @@ from ..zmq_transport import ZMQClient
 from .config_tab import ConfigTab
 from .experiment_tab import ExperimentTab
 from .workflow_tab import WorkflowTab
+from .user_tab import UserTab
 
 STATUS_POLL_INTERVAL_MS = 3000
 
@@ -104,7 +105,11 @@ class MainWindow(QMainWindow):
         self.workflow_tab = WorkflowTab(self.send_command)
         self.tabs.addTab(self.config_tab, "Configuration")
         self.tabs.addTab(self.experiment_tab, "Experiment")
+        # One command, only on a button press, so it is not disabled while the robot is
+        # busy: saying who you are is not an action on the rig.
+        self.user_tab = UserTab(self.send_command)
         self.tabs.addTab(self.workflow_tab, "Automation")
+        self.tabs.addTab(self.user_tab, "User")
         layout.addWidget(self.tabs, stretch=1)
 
         layout.addWidget(status_panel)

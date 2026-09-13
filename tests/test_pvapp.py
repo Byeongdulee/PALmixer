@@ -154,7 +154,10 @@ def test_a_login_survives_the_wire_intact():
     as bare tokens on a whitespace-delimited protocol."""
     password = "p ss:w rd with spaces"
     token = cmd.set_credentials_command("12345", password).split()[1]
-    assert cmd.decode_credentials(token) == {"username": "12345", "password": password}
+    assert cmd.decode_credentials(token) == {"username": "12345", "password": password,
+                                             # Defaulted, so an existing caller that sends
+                                             # only a login still fills the campaign slot.
+                                             "source": "campaign"}
 
 
 def test_a_malformed_payload_says_nothing_about_its_contents():

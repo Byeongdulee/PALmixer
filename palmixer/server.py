@@ -645,11 +645,39 @@ class PALmixerServer:
         except ValueError as e:
             return "ERROR: %s" % e
         username = str(payload.get("username") or "").strip()
-        if not username:
-            return "ERROR: username must not be empty"
-        self.pvapp.username = username
-        self.pvapp.password = str(payload.get("password") or "")
-        print("PALmixerServer: PVapp credentials received for %s" % username)
+        badge = str(payload.get("badge") or "").strip()
+        gup = str(payload.get("gup") or "").strip()
+        # Either route is a credential on its own, so "empty" now means neither was sent.
+        # The badge pair needs no password; a badge without its proposal is not a
+        # credential and is refused here rather than a round trip later.
+        if badge and not gup:
+            return "ERROR: badge needs the proposal (gup) it belongs to"
+        if gup and not badge:
+            return "ERROR: gup needs the badge it belongs to"
+        if not username and not badge:
+            return "ERROR: send username, or badge and gup"
+        if str(payload.get("source") or "campaign").strip().lower() == "user":
+            # The GUI's User tab: a fallback, never an override, so a person setting it
+            # cannot take a running campaign's mixes out from under its proposal.
+            self.pvapp.user_badge, self.pvapp.user_gup = badge, gup
+            print("PALmixerServer: User tab set badge %s on proposal %s%s"
+                  % (badge, gup, " (held in reserve; a campaign's own are in use)"
+                     if self.pvapp.badge else ""))
+            return "OK"
+
+        # Whichever route was sent REPLACES the other: the updater prefers the pair, so
+        # a username accepted here while a configured pair remained would be ignored.
+        if username:
+            self.pvapp.username = username
+            self.pvapp.password = str(payload.get("password") or "")
+            self.pvapp.badge = self.pvapp.gup = ""
+            self.pvapp.password_only = True
+        else:
+            self.pvapp.badge, self.pvapp.gup = badge, gup
+            self.pvapp.username = self.pvapp.password = ""
+            self.pvapp.password_only = False
+        print("PALmixerServer: PVapp credentials received for %s"
+              % ("badge %s on proposal %s" % (badge, gup) if badge else username))
         return "OK"
 
     def _confirm_mix_in_pvapp(self, slot):
