@@ -34,7 +34,8 @@ existing "which flowcell" choice drives the pump automatically.
 **Queued, not done.** A ZMQ reply means the command was accepted and queued, not
 that motion finished. To keep the blocking ``(ok, detail)`` contract every
 motion op waits: it sends the command, then polls the server's ``status`` until
-``operation_active`` goes false before returning.
+``operation_active`` goes false before returning. Mixing additionally requires
+the terminal MAKE SAMPLE status to say COMPLETE; STOP/error/unknown is not success.
 
 **One lock per server, not one lock overall.** The whole send+poll runs under
 the lock belonging to the endpoint it is talking to. Within a server that
@@ -51,9 +52,9 @@ flowcell op, because that really is the same pump.
 **Mixing speed is advisory.** The mixing server's ``sample_make`` uses the
 volumes and speeds currently shown in the pump dashboard and rejects overrides,
 so PALmixer cannot set the mix speed over ZMQ. ``speed``/``set_speed`` are kept
-as a local record only: the value is still reported and folded into each mix's
-detail (so the sample record carries a speed), but the dashboard sets the actual
-hardware speed.
+as an advisory record only. Each mix captures the accepted ``sample_make``
+parameter snapshot separately, including speeds, volumes and delays. These are
+planned controller settings, not measured flow or electrical timing.
 
 Connection settings come from the ``pump`` section of json/palmixer_config.json
 (host, mixer_port, flowcell_port, timeouts). Note the pump dashboards read the
@@ -65,6 +66,8 @@ the same names PALmixer uses for its control plane -- so this client uses its ow
 import threading
 import time
 import uuid
+from copy import deepcopy
+from datetime import datetime, timezone
 
 from . import config
 from . import state
@@ -92,6 +95,26 @@ class PumpError(Exception):
 
 def _new_id():
     return "palmixer-%s" % uuid.uuid4().hex[:8]
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _mix_completion(operation):
+    """Idle can mean complete, stopped or failed. Require terminal evidence."""
+    lines = str(operation or "").splitlines()
+    status = next((line.strip()[7:].strip().upper() for line in lines
+                   if line.strip().lower().startswith("status:")), "")
+    if status.startswith(("STOP", "CANCEL", "ABORT")):
+        return "stopped"
+    if status.startswith(("ERROR", "FAIL")):
+        return "failed"
+    purpose = next((line.strip()[8:].strip().upper() for line in lines
+                    if line.strip().lower().startswith("purpose:")), "")
+    if status.startswith("COMPLETE") and purpose == "MAKE SAMPLE":
+        return "completed"
+    return "unknown"
 
 
 #: Longest status text kept for the GUI panel. The mixing server's `operation`
@@ -238,6 +261,8 @@ class Pump:
         # held across a pump operation, or it would serialize the two servers
         # again through the back door.
         self._speed_lock = threading.Lock()
+        self.last_mix_record = None
+        self.on_mix_record = None
 
         section = {}
         try:
@@ -334,10 +359,34 @@ class Pump:
     # -- pump operations ------------------------------------------------------
     def mix(self):
         """Mix the sample in the mixer (mixing server ``sample_make``)."""
-        # Advisory speed is folded into the detail so the sample record carries
-        # a mixing speed even though the dashboard sets the actual value.
-        return self._run_remote(self._mixer, "sample_make", None,
-                                "mix at %g rpm" % self._speed_rpm)
+        record = {"started_at": _utc_now(), "status": "not_started",
+                  "advisory_speed_rpm": self._speed_rpm,
+                  "settings": None, "settings_source": "unavailable",
+                  "timing_source": "PALmixer UTC observations of the pump operation",
+                  "endpoint": "%s:%d" % (self._host, self._mixer_port)}
+        started = time.monotonic()
+        self.last_mix_record = record
+        try:
+            ok, detail = self._run_remote(self._mixer, "sample_make", None,
+                                         "sample_make", record=record)
+            if record["status"] in ("not_started", "accepted"):
+                record["status"] = "completed" if ok else "failed"
+            record["detail"] = detail
+            return ok, detail
+        except Exception as exc:
+            record.update(status="unknown", detail=str(exc))
+            raise
+        finally:
+            record.update(finished_at=_utc_now(), elapsed_s=time.monotonic() - started)
+            self.last_mix_record = deepcopy(record)
+            self._notify_mix_record(record)
+
+    def _notify_mix_record(self, record):
+        if self.on_mix_record is not None:
+            try:
+                self.on_mix_record(deepcopy(record))
+            except Exception as exc:
+                print("WARNING: mixing-record callback failed: %s" % exc)
 
     def clean_mixer(self):
         """Flush/clean the mixer (mixing server ``clean_all``)."""
@@ -538,7 +587,7 @@ class Pump:
         fc = flowcell_id if flowcell_id is not None else state.get_flowcell_in_use()
         return 0 if fc == 1 else 1
 
-    def _run_remote(self, endpoint, command, extra, label):
+    def _run_remote(self, endpoint, command, extra, label, record=None):
         """Send one motion command and block until that server goes idle.
 
         Returns ``(ok, detail)``. Held under the endpoint's own lock for the
@@ -546,11 +595,15 @@ class Pump:
         -- and two ops on different pumps freely do.
         """
         if self.simulate:
+            if record is not None:
+                record.update(status="simulated", settings_source="simulation")
             return True, "%s (simulate, no hardware)" % label
         if endpoint is None:
             return False, "%s: pump transport unavailable (pyzmq missing)" % label
 
         payload = {"command": command, "confirmed": True, "id": _new_id()}
+        if record is not None:
+            record["pump_request_id"] = payload["id"]
         if extra:
             payload.update(extra)
 
@@ -558,14 +611,26 @@ class Pump:
             try:
                 reply = endpoint.request(payload)
             except PumpError as e:
+                if record is not None:
+                    record["status"] = "unknown"  # It may have been accepted before contact was lost.
                 return False, "%s failed: %s" % (label, e)
             if not isinstance(reply, dict) or not reply.get("ok", False):
                 err = (reply.get("error") if isinstance(reply, dict)
                        else None) or ("bad reply %r" % (reply,))
                 return False, "%s rejected: %s" % (label, err)
-            return self._wait_idle(endpoint, label)
+            if record is not None:
+                record.update(status="accepted", accepted_at=_utc_now())
+                # This is the accepted job's immutable snapshot, never the
+                # editable current_settings from a later dashboard poll.
+                parameters = reply.get("parameters")
+                if isinstance(parameters, dict):
+                    record.update(settings=deepcopy(parameters),
+                                  settings_source="sample_make response parameters (planned, not measured)")
+                self._notify_mix_record(record)
+            draw_device = payload.get("device") if command == "draw_to_flowcell" else None
+            return self._wait_idle(endpoint, label, record=record, draw_device=draw_device)
 
-    def _wait_idle(self, endpoint, label):
+    def _wait_idle(self, endpoint, label, record=None, draw_device=None):
         """Poll ``status`` until ``operation_active`` is false (or timeout)."""
         deadline = time.monotonic() + self._op_timeout_s
         while True:
@@ -573,11 +638,28 @@ class Pump:
             try:
                 st = endpoint.request({"command": "status", "id": _new_id()})
             except PumpError as e:
+                if record is not None:
+                    record["status"] = "unknown"
                 return False, "%s: lost contact while waiting (%s)" % (label, e)
             if not isinstance(st, dict) or not st.get("ok", False):
+                if record is not None:
+                    record["status"] = "unknown"
                 return False, "%s: status query failed: %r" % (label, st)
             if not st.get("operation_active", False):
+                if draw_device is not None:
+                    device = next((p for p in st.get("pumps", []) if p.get("device") == draw_device), {})
+                    terminal = str(device.get("status") or "").strip()
+                    if terminal.lower() != "complete: draw to flowcell":
+                        return False, "%s: draw completion unverified (%s)" % (label, terminal or "no status")
+                if record is not None:
+                    record["terminal_operation"] = str(st.get("operation") or "")
+                    record["status"] = _mix_completion(st.get("operation"))
+                    if record["status"] != "completed":
+                        return False, "%s: %s (%s)" % (label, record["status"],
+                            _operation_summary(st.get("operation")) or "no completion evidence")
                 return True, "%s complete" % label
             if time.monotonic() > deadline:
+                if record is not None:
+                    record["status"] = "unknown"
                 return False, ("%s: still active after %g s"
                                % (label, self._op_timeout_s))

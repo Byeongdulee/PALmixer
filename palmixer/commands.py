@@ -7,6 +7,10 @@ means the GUI buttons and the server dispatcher can never drift apart.
 Wire protocol (mirrors APS12_SAXSDaq's ZMQCommandServer): plain space-delimited
 strings, one request -> one reply.
 
+Worker acceptances shown as ACCEPTED below include ``action_id=<id>``. Match
+that ID and command against ``get_state.last_result`` to verify completion;
+IDLE alone says nothing about success.
+
     "status"                              -> "IDLE" | "BUSY"
     "search_apriltag <station> [skip_roll]" -> "ACCEPTED" | "ERROR: <reason>"
     "stop_search"                         -> "OK" | "ERROR: <reason>"

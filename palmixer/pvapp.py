@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Confirming a mix in PVapp.
+"""Appending mixing provenance to the existing PVapp sample.
 
 PALsystem posts the "prepared" record the moment solutions go in a vial's two input
-wells -- before anything is mixed. ``make_sample`` is the step that actually turns
-those solutions into a sample (see :mod:`palmixer.workflows`), and until now PVapp
-never heard about it. This module updates that existing record once the mix genuinely
-finishes: which slot it came out of, which flow cell it went to the beam in, and when.
+wells -- before anything is mixed. ``make_sample`` produces a durable local event
+(see :mod:`palmixer.mixing_records`). A background worker merges it into that same
+sample's ``data.mixing_records``, preserving preparation and other metadata. Runs
+include failed/interrupted attempts; only confirmed pump completion updates the
+legacy ``mixed_*`` summary. A run ID makes retries idempotent.
 
     GET  /api/samples/<id>      -> the record PALsystem already created
     PUT  /api/samples/<id>      -> replace it (``PVapp/app/api/routes.py``)
@@ -18,10 +19,9 @@ merges the mix fields into its ``data`` before writing it back. A ``GET`` that 4
 means PALsystem never recorded this sample at all; that is reported and nothing is
 written, because a bare record created here would overwrite nothing useful with less.
 
-The read-modify-write is not atomic (PVapp has no compare-and-set), which is accepted
-here rather than engineered around: PALsystem's own write for a given sample happens
-minutes earlier, before ``make_sample`` is even issued, and nothing else writes that
-record during a run.
+The read-modify-write is not atomic. Concurrent writers require a PVapp event-append
+API or revision check to prevent lost updates. Reading fresh data preserves fields
+already present, but cannot protect a change made between GET and PUT.
 
 Both need HTTP Basic (same as PALsystem): a **badge number** with that user's
 password, or a **staff name** with the shared staff password plus ``owner_badge`` so
@@ -33,6 +33,7 @@ may also hand it over live over ZMQ (``set_credentials``); see :mod:`palmixer.co
 """
 
 import time
+from copy import deepcopy
 
 from . import config
 
@@ -42,7 +43,7 @@ class PVappError(RuntimeError):
 
 
 class PVappUpdater:
-    """Confirms one sample's mix, updating the record PALsystem already created."""
+    """Merges mixing events into the record PALsystem already created."""
 
     def __init__(self, base_url="", username="", password="", owner_badge="",
                  timeout_s=10.0, badge="", gup=""):
@@ -132,15 +133,19 @@ class PVappUpdater:
                            "PALMIXER_PVAPP_BADGE" % self.username)
         return True, ""
 
-    def confirm_mix(self, sample_id, slot, flowcell):
-        """Merge the mix confirmation into ``sample_id``'s existing PVapp record.
+    def confirm_mix(self, sample_id, slot, flowcell, mixing_record=None):
+        """Merge a run into ``sample_id``'s existing PVapp record.
 
         Returns the updated record. Raises :class:`PVappError` on any failure,
-        including "PALsystem never recorded this sample" -- the caller (a worker
-        thread already past the physical mix) should warn and carry on, exactly as
-        a failed PVapp record already does not fail the sample it describes.
+        including "PALsystem never recorded this sample". The journal retains
+        failed deliveries for retry without holding up hardware operations.
+        Omitting ``mixing_record`` retains the legacy confirmation-only API.
         """
         import requests
+
+        if mixing_record is not None and (not mixing_record.get("run_id")
+                or mixing_record.get("sample_id") != sample_id):
+            raise PVappError("Mixing record needs a run ID and the matching sample ID")
 
         ok, why = self.available()
         if not ok:
@@ -165,10 +170,32 @@ class PVappUpdater:
             raise PVappError("PVapp returned non-JSON for GET %s" % url)
 
         data = dict(record.get("data") or {})
-        data["mixed_by"] = "PALmixer"
-        data["mixed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        data["mixed_slot"] = slot
-        data["flowcell"] = flowcell
+        if mixing_record is not None:
+            runs = data.get("mixing_records", [])
+            if not isinstance(runs, list) or any(not isinstance(run, dict) for run in runs):
+                raise PVappError("PVapp mixing_records is not a list of events; refusing to replace it")
+            # Idempotent delivery, preserving all other runs and all preparation data.
+            updated = deepcopy(runs)
+            existing = next((i for i, run in enumerate(updated)
+                             if run.get("run_id") == mixing_record["run_id"]), None)
+            if existing is None:
+                updated.append(deepcopy(mixing_record))
+            else:
+                updated[existing] = deepcopy(mixing_record)
+            data["mixing_records"] = updated
+        if mixing_record is None or (mixing_record.get("mixing_status") == "completed"
+                                     and not mixing_record.get("simulated")):
+            summary = None
+            if mixing_record is not None:
+                # Retries can arrive out of order. Keep the summary on the
+                # latest successful run, not whichever old file synced last.
+                completed = [run for run in data["mixing_records"]
+                             if run.get("mixing_status") == "completed" and not run.get("simulated")]
+                summary = max(completed, key=_finished_at)
+            data["mixed_by"] = "PALmixer"
+            data["mixed_at"] = (_finished_at(summary) if summary else None) or time.strftime("%Y-%m-%dT%H:%M:%S")
+            data["mixed_slot"] = summary.get("slot", slot) if summary else slot
+            data["flowcell"] = summary.get("flowcell", flowcell) if summary else flowcell
         payload = {"data": data}
 
         try:
@@ -190,3 +217,10 @@ class PVappUpdater:
             return put.json()
         except ValueError:
             raise PVappError("PVapp returned non-JSON for PUT %s" % url)
+
+
+def _finished_at(record):
+    """Journal timestamps are ISO 8601 UTC, so chronological sorting is stable."""
+    pump = record.get("pump")
+    return str((pump.get("finished_at") if isinstance(pump, dict) else None)
+               or record.get("finished_at") or record.get("started_at") or "")

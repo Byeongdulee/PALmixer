@@ -6,6 +6,7 @@ dist/
 
 # runtime artifacts, not source
 *.log
+json/mixing_records/
 palmixer/waypoints.ini
 palmixer/palmixer_state.ini
 palmixer/daq_positions.ini

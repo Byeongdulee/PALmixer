@@ -18,11 +18,13 @@ import json
 import sys
 import threading
 import time
+from copy import deepcopy
 
 from . import commands as cmd
 from . import config
 from . import pvapp
 from . import state
+from .mixing_records import MixingJournal, new_record, utc_now
 from .mqtt_status import (
     MQTTPublisher, PHASE_FAILURE, PHASE_STARTED, PHASE_SUCCESS,
     motion_payload, motion_topic, new_trace, state_payload, state_topic,
@@ -76,6 +78,11 @@ class PALmixerServer:
         # the broker is unreachable or paho is not installed -- which left the
         # GUI showing nothing at all for a search that had already given up.
         self._last_result = None
+        self._mixing_journal = MixingJournal()
+        self._active_mix_record = None
+        self._mix_record_thread = None
+        self._last_mixing_record = None
+        self._mix_sync_wake = threading.Event()
         self._search_stop_event = None  # set while a search_apriltag action is running
 
         self._mqtt = MQTTPublisher(
@@ -86,8 +93,9 @@ class PALmixerServer:
         self.rob = None
         self.PAL12idb = None
         self.pump = Pump(simulate=self.simulate)
+        self.pump.on_mix_record = self._pump_mix_recorded
         self.motor = Motor(cfg["motor"].get("pv", "12idb:m6"))
-        #: Confirms a mix in PVapp once make_sample actually finishes. Credentials come
+        #: Appends locally journaled mixing outcomes to PVapp. Credentials come
         #: from the environment at startup and may be replaced for the process's
         #: lifetime by a campaign's set_credentials -- see PVappUpdater.
         self.pvapp = pvapp.PVappUpdater()
@@ -159,12 +167,17 @@ class PALmixerServer:
             # on the same snapshot, because a client polling for "what is the machine
             # set to" should not need a second round trip for it.
             return json.dumps(dict(state.snapshot(),
+                                   action_result_version=1,
+                                   simulated=self.simulate,
+                                   busy=bool(self._busy),
+                                   current_action_id=self._current_trace,
                                    mixing_speed=self.pump.speed,
                                    mixing_speed_limits=[self.pump.min_rpm,
                                                         self.pump.max_rpm],
                                    current_action=self._current_action,
                                    current_step=self._current_step,
                                    pump_status=self._pump_status,
+                                   last_mixing_record=self._last_mixing_record,
                                    last_result=self._last_result))
 
         if name == cmd.SET_CREDENTIALS:
@@ -358,6 +371,7 @@ class PALmixerServer:
         their late "success" must not clear a step that is genuinely running --
         hence only clearing when the name still matches.
         """
+        self._record_mixing_step(step, phase, detail)
         if phase == PHASE_STARTED:
             self._current_step = step
         elif self._current_step == step:
@@ -399,9 +413,10 @@ class PALmixerServer:
         self._mqtt.publish(motion_topic(self._beamline),
                             motion_payload(action_label, PHASE_STARTED, True, trace=trace))
 
-        threading.Thread(target=self._run_action, args=(action_fn, action_label, trace),
+        threading.Thread(target=self._run_action,
+                          args=(action_fn, action_label, trace, " ".join(parts)),
                           daemon=True).start()
-        return "ACCEPTED"
+        return "ACCEPTED action_id=%s" % trace
 
     def _resolve(self, name, args):
         """Map a command name + args to a zero-arg callable and a human label.
@@ -506,14 +521,8 @@ class PALmixerServer:
                 slot = int(args[0])
             except ValueError:
                 raise ValueError("slot must be an integer, got %r" % args[0])
-            # None means "assign one", and the workflow does that when the mix
-            # finishes rather than here. An auto ID is a timestamp, so minting
-            # it at accept time dated the sample to when the run was requested
-            # -- several minutes of transport and mixing before the sample
-            # existed. The cost is that the ID cannot appear in this label or
-            # in the MQTT payloads of the steps that precede the mix; it
-            # reaches clients on the tracking snapshot the moment it is
-            # assigned, and in the completion detail at the end.
+            # With no explicit ID, retain a prepared vial's slot tag. Only an
+            # untagged vial needs a new ID, minted by the workflow after mixing.
             sample_id = " ".join(args[1:]) if len(args) > 1 else None
             self._require_positions(self.workflows.stations_for_make_sample())
             try:
@@ -524,13 +533,7 @@ class PALmixerServer:
                                  " (%s)" % sample_id if sample_id else "")
 
             def run_make_sample():
-                detail = self.workflows.make_sample(slot, sample_id)
-                # After, not before: the final id (minted inside make_sample when
-                # none was given) is only in `state` once the mix has actually
-                # happened, and PALmixer confirming a mix that has not is worse
-                # than not confirming one at all.
-                self._confirm_mix_in_pvapp(slot)
-                return detail
+                return self._make_sample_recorded(slot, sample_id)
             return run_make_sample, label
 
         if name == cmd.DRAW_LOAD_SAMPLE:
@@ -605,7 +608,7 @@ class PALmixerServer:
             labels = [cmd.STATION_LABELS.get(s, s) for s in missing]
             raise ValueError(cmd.position_not_configured_error(labels))
 
-    def _run_action(self, action_fn, action_label, trace):
+    def _run_action(self, action_fn, action_label, trace, command=None):
         """Runs on a background thread: execute the action, publish the
         outcome, and clear the busy flag."""
         try:
@@ -623,11 +626,14 @@ class PALmixerServer:
                                 motion_payload(action_label, PHASE_FAILURE, False,
                                                detail=str(e), trace=trace))
         finally:
+            self._last_result.update(action_id=trace, command=command or action_label,
+                                     finished_at=utc_now(), simulated=self.simulate,
+                                     state=state.snapshot())
             with self._busy_lock:
                 self._busy = False
                 self._current_action = None
-            self._current_trace = None
-            self._current_step = None
+                self._current_trace = None
+                self._current_step = None
             self._publish_state(STATE_IDLE)
 
     # -- individual actions --------------------------------------------------
@@ -680,23 +686,69 @@ class PALmixerServer:
               % ("badge %s on proposal %s" % (badge, gup) if badge else username))
         return "OK"
 
-    def _confirm_mix_in_pvapp(self, slot):
-        """After make_sample finishes: tell PVapp what PALsystem's own record could
-        not know yet -- which slot it actually came out of, which flow cell it went
-        to the beam in, and that the mix genuinely happened.
-
-        Never raises: a lost confirmation costs provenance, not the sample -- it is
-        real and in the beam either way. Printed once, like every other PVapp
-        failure in this system, rather than surfaced through the action's result.
-        """
-        sample_id = state.get_sample_id(slot)
-        if not sample_id:
-            return
+    def _save_mixing_record(self, record):
         try:
-            self.pvapp.confirm_mix(sample_id, slot, state.get_flowcell_in_use())
-        except pvapp.PVappError as e:
-            print("WARNING: PVapp mix confirmation for %s not recorded (%s)"
-                  % (sample_id, e))
+            self._mixing_journal.save(record)
+        except (OSError, ValueError, TypeError) as exc:
+            print("WARNING: could not save mixing run %s locally: %s" % (record["run_id"], exc))
+
+    def _record_mixing_step(self, step, phase, detail):
+        record = self._active_mix_record
+        # Background washes can finish during a later sample. Only this
+        # workflow's own thread can add its ordered step observations.
+        if record is None or self._mix_record_thread != threading.get_ident():
+            return
+        record["steps"].append({"step": step, "phase": phase, "at": utc_now(), "detail": str(detail)})
+        if step == "mix":
+            if phase == PHASE_STARTED:
+                record["mixing_status"] = "running"
+                self.pump.last_mix_record = None
+            else:
+                pump_record = None if self.simulate else self.pump.last_mix_record
+                record["pump"] = deepcopy(pump_record)
+                record["mixing_status"] = ((pump_record or {}).get("status") or
+                    ("simulated" if self.simulate else "unknown"))
+            self._save_mixing_record(record)
+
+    def _pump_mix_recorded(self, pump_record):
+        record = self._active_mix_record
+        if record is not None and self._mix_record_thread == threading.get_ident():
+            record["pump"] = deepcopy(pump_record)
+            record["mixing_status"] = ("running" if pump_record["status"] == "accepted"
+                                       else pump_record["status"])
+            self._save_mixing_record(record)
+
+    def _make_sample_recorded(self, slot, sample_id):
+        # A PALsystem-prepared vial already has an identity. Keep it when the
+        # GUI leaves its optional sample-ID box blank.
+        sample_id = sample_id or state.get_sample_id(slot)
+        record = new_record(sample_id, slot, state.get_carousel_id(),
+                            state.get_flowcell_in_use(), simulated=self.simulate)
+        record["action_id"] = self._current_trace
+        self._active_mix_record = record
+        self._mix_record_thread = threading.get_ident()
+        self._save_mixing_record(record)
+        try:
+            detail = self.workflows.make_sample(slot, sample_id)
+            record.update(workflow_status="completed", detail=detail)
+            return detail
+        except Exception as exc:
+            record.update(workflow_status="failed", error=str(exc))
+            raise
+        finally:
+            record["sample_id"] = sample_id or state.get_sample_id(slot)
+            record["finished_at"] = utc_now()
+            self._save_mixing_record(record)
+            self._last_mixing_record = deepcopy(record)
+            self._active_mix_record = self._mix_record_thread = None
+            self._mix_sync_wake.set()
+
+    def _sync_mixing_records(self):
+        """HTTP retries never hold up robot/pump operations or the GUI."""
+        while not self._stopping.is_set():
+            self._mix_sync_wake.clear()
+            self._mixing_journal.sync_pending(self.pvapp)
+            self._mix_sync_wake.wait(30)
 
     def _stop_search(self):
         """Abort an in-progress search_apriltag: sets the cooperative stop
@@ -920,13 +972,16 @@ class PALmixerServer:
 
     # -- lifecycle ------------------------------------------------------------
     def start(self):
+        self._mixing_journal.recover_interrupted()
         self._publish_state(STATE_IDLE)
         self._publish_tracking(state.snapshot())
         threading.Thread(target=self._poll_pump_status, daemon=True).start()
+        threading.Thread(target=self._sync_mixing_records, daemon=True).start()
         self.zmq_server.start()
 
     def stop(self):
         self._stopping.set()
+        self._mix_sync_wake.set()
         self.zmq_server.stop()
         self._mqtt.close()
 

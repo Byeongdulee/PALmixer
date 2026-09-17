@@ -674,15 +674,18 @@ class Workflows:
     # draw_and_load's counterpart for a named slot: it turns the carousel to
     # `slot`'s *drawing* position (draw_offset_steps forward of its mixing
     # position -- see _advance_carousel) first, instead of drawing from
-    # whatever vial the mixer was last left over. Still no mixing, so no slot
-    # is consumed and no ID is minted -- the slot is expected to have been
-    # prepared already.
+    # whatever vial the mixer was last left over. No mixing or new ID is
+    # invented; a supplied ID binds the operator's preloaded vial to its slot.
     def _check_draw_load_sample(self, slot, sample_id=None):
         """Validate a preloaded slot without running the mixer."""
         try:
             state.validate_slot(slot)
             if sample_id is not None:
-                state.clean_sample_id(sample_id)
+                sample_id = state.clean_sample_id(sample_id)
+                tagged = state.get_sample_id(slot)
+                if tagged and tagged != sample_id:
+                    raise ValueError("slot %s holds %r, not requested sample %r"
+                                     % (slot, tagged, sample_id))
         except ValueError as e:
             raise WorkflowError(str(e))
         fc = state.get_flowcell_in_use()
@@ -700,6 +703,10 @@ class Workflows:
     def draw_load_sample(self, slot, sample_id=None):
         """Draw an already-prepared slot into the selected flow cell without mixing."""
         target_position = self._check_draw_load_sample(slot, sample_id)
+        # The campaign JSON is the operator's declaration for an untagged vial.
+        # Bind it before drawing; never relabel a conflicting existing sample.
+        if sample_id is not None:
+            state.set_sample_id(slot, sample_id)
         if self.simulate:
             fc = state.get_flowcell_in_use()
             for step, on_success in (
