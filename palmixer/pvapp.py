@@ -34,6 +34,7 @@ may also hand it over live over ZMQ (``set_credentials``); see :mod:`palmixer.co
 
 import time
 from copy import deepcopy
+from uuid import UUID
 
 from . import config
 
@@ -170,6 +171,21 @@ class PVappUpdater:
             raise PVappError("PVapp returned non-JSON for GET %s" % url)
 
         data = dict(record.get("data") or {})
+        try:
+            identities = {str(UUID(str(uid))) for uid in (
+                record.get("sample_uid"), data.get("sample_uid"),
+                (mixing_record or {}).get("sample_uid")) if uid}
+        except ValueError:
+            raise PVappError("Invalid sample_uid; refusing to update the sample") from None
+        if len(identities) > 1:
+            raise PVappError("sample_uid conflict; refusing to attach mixing to a different sample")
+        uid = next(iter(identities), "")
+        if uid and UUID(uid).int == 0:
+            raise PVappError("sample_uid cannot be the nil UUID")
+        if uid:
+            data["sample_uid"] = uid
+            if mixing_record is not None:
+                mixing_record = dict(mixing_record, sample_uid=uid)
         if mixing_record is not None:
             runs = data.get("mixing_records", [])
             if not isinstance(runs, list) or any(not isinstance(run, dict) for run in runs):

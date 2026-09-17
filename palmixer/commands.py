@@ -274,6 +274,7 @@ SET_LOCATION = "set_location"
 TEACH_CAROUSEL_SLOT = "teach_carousel_slot"
 RESET_CAROUSEL = "reset_carousel"
 SET_SAMPLE_ID = "set_sample_id"
+SET_SAMPLE_UID = "set_sample_uid"
 GET_SAMPLE_ID = "get_sample_id"
 CLEAR_SAMPLE_ID = "clear_sample_id"
 

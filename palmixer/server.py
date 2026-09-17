@@ -272,6 +272,17 @@ class PALmixerServer:
                 return "ERROR: %s" % e
             return "OK"
 
+        if name == cmd.SET_SAMPLE_UID:
+            if len(args) < 3:
+                return "ERROR: usage: set_sample_uid <slot> <sample_uid> <sample id>"
+            if self._busy:
+                return "ERROR: busy; sample identity cannot change during an action"
+            try:
+                state.set_sample_uid(args[0], " ".join(args[2:]), args[1])
+            except ValueError as e:
+                return "ERROR: %s" % e
+            return "OK"
+
         if name == cmd.GET_SAMPLE_ID:
             if len(args) != 1:
                 return "ERROR: usage: %s <slot>" % cmd.GET_SAMPLE_ID
@@ -723,7 +734,9 @@ class PALmixerServer:
         # GUI leaves its optional sample-ID box blank.
         sample_id = sample_id or state.get_sample_id(slot)
         record = new_record(sample_id, slot, state.get_carousel_id(),
-                            state.get_flowcell_in_use(), simulated=self.simulate)
+                            state.get_flowcell_in_use(), simulated=self.simulate,
+                            sample_uid=(state.carousel_sample_uids().get(int(slot), "")
+                                        if state.get_sample_id(slot) == sample_id else ""))
         record["action_id"] = self._current_trace
         self._active_mix_record = record
         self._mix_record_thread = threading.get_ident()

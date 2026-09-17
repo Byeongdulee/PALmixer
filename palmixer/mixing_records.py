@@ -14,8 +14,9 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def new_record(sample_id, slot, carousel_id, flowcell, simulated=False):
+def new_record(sample_id, slot, carousel_id, flowcell, simulated=False, sample_uid=""):
     return {"schema_version": 1, "run_id": uuid4().hex, "sample_id": sample_id,
+            "sample_uid": sample_uid,
             "slot": slot, "carousel_id": carousel_id, "flowcell": flowcell,
             "simulated": bool(simulated), "started_at": utc_now(),
             "finished_at": None, "workflow_status": "running",
@@ -88,8 +89,12 @@ class MixingJournal:
                             or record["workflow_status"] == "running"):
                         continue
                     try:
-                        updater.confirm_mix(record["sample_id"], record["slot"], record["flowcell"],
-                                            mixing_record=record)
+                        response = updater.confirm_mix(record["sample_id"], record["slot"], record["flowcell"],
+                                                       mixing_record=record)
+                        if isinstance(response, dict) and not record.get("sample_uid"):
+                            uid = response.get("sample_uid") or (response.get("data") or {}).get("sample_uid")
+                            if uid:
+                                record["sample_uid"] = uid
                     except Exception as exc:
                         if envelope["pvapp_sync"].get("error") != str(exc):
                             print("WARNING: mixing run %s saved locally; PVapp sync pending: %s"

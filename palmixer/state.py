@@ -44,6 +44,7 @@ import configparser
 import os
 import threading
 import time
+from uuid import UUID
 
 from . import config  # stdlib-only itself, so this keeps state.py importable anywhere
 
@@ -72,6 +73,7 @@ _INI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _TRACKING = "tracking"
 _CAROUSEL = "carousel"            # the taught reference: ref_slot + ref_position
 _CAROUSEL_SAMPLES = "carousel_samples"  # slot -> sample ID; a key here == used
+_CAROUSEL_UIDS = "carousel_sample_uids"
 
 # Only the MOUNTED carousel is tracked -- there is no per-carousel history. A
 # carousel taken off and put back later arrives as a fresh mount and must be
@@ -488,6 +490,8 @@ def mount_carousel(carousel_id, samples=None):
         # must not inherit what the old one had in it.
         if parser.has_section(_CAROUSEL_SAMPLES):
             parser.remove_section(_CAROUSEL_SAMPLES)
+        if parser.has_section(_CAROUSEL_UIDS):
+            parser.remove_section(_CAROUSEL_UIDS)
         if cleaned:
             parser.add_section(_CAROUSEL_SAMPLES)
             for slot, sample_id in sorted(cleaned.items()):
@@ -553,8 +557,45 @@ def set_sample_id(slot, sample_id):
     Overwrites an existing ID: re-mixing into a slot that already holds a
     sample is allowed, and the new sample is what is in there afterwards."""
     text = clean_sample_id(sample_id)
-    _set(_CAROUSEL_SAMPLES, "slot_%d" % validate_slot(slot), text)
+    key = "slot_%d" % validate_slot(slot)
+    def apply(parser):
+        if not parser.has_section(_CAROUSEL_SAMPLES):
+            parser.add_section(_CAROUSEL_SAMPLES)
+        if parser.get(_CAROUSEL_SAMPLES, key, fallback="") != text and parser.has_section(_CAROUSEL_UIDS):
+            parser.remove_option(_CAROUSEL_UIDS, key)
+        parser.set(_CAROUSEL_SAMPLES, key, text)
+    _mutate(apply)
     return text
+
+
+def set_sample_uid(slot, sample_id, sample_uid):
+    """Bind a UUID to an existing tag. A mismatch never changes the slot or UID."""
+    text = clean_sample_id(sample_id)
+    try:
+        parsed = UUID(str(sample_uid))
+        if not parsed.int:
+            raise ValueError()
+        uid = str(parsed)
+    except ValueError:
+        raise ValueError("sample_uid must be a non-nil UUID") from None
+    key = "slot_%d" % validate_slot(slot)
+    def apply(parser):
+        if parser.get(_CAROUSEL_SAMPLES, key, fallback="") != text:
+            raise ValueError("Sample ID no longer occupies this slot; UUID was not assigned")
+        old = parser.get(_CAROUSEL_UIDS, key, fallback="")
+        if old and old != uid:
+            raise ValueError("Slot sample_uid conflicts with the requested identity")
+        if not parser.has_section(_CAROUSEL_UIDS):
+            parser.add_section(_CAROUSEL_UIDS)
+        parser.set(_CAROUSEL_UIDS, key, uid)
+    _mutate(apply)
+    return uid
+
+
+def carousel_sample_uids():
+    samples = carousel_samples()
+    return {slot: value for slot, value in _slot_keys(_read(), _CAROUSEL_UIDS).items()
+            if slot in samples and value}
 
 
 def clear_sample_id(slot):
@@ -565,6 +606,8 @@ def clear_sample_id(slot):
     def apply(parser):
         if parser.has_section(_CAROUSEL_SAMPLES):
             parser.remove_option(_CAROUSEL_SAMPLES, key)
+        if parser.has_section(_CAROUSEL_UIDS):
+            parser.remove_option(_CAROUSEL_UIDS, key)
     _mutate(apply)
 
 
@@ -592,7 +635,7 @@ def reset_carousel():
     derived from it. The slot last moved to goes back to UNKNOWN for the same
     reason. The geometry (size, step) is configuration and is untouched."""
     def apply(parser):
-        for section in (_CAROUSEL, _CAROUSEL_SAMPLES):
+        for section in (_CAROUSEL, _CAROUSEL_SAMPLES, _CAROUSEL_UIDS):
             if parser.has_section(section):
                 parser.remove_section(section)
         for option in ("carousel_slot", "carousel_id"):
@@ -643,6 +686,7 @@ def _snapshot():
         "carousel_step": get_carousel_step(),
         "carousel_reference": carousel_reference(),
         "carousel_samples": carousel_samples(),
+        "carousel_sample_uids": carousel_sample_uids(),
         # Which physical carousel is in the machine, and whether the taught
         # reference belongs to it. `stale` is what workflows refuse on: every
         # slot position is derived from that reference, so using one taught on

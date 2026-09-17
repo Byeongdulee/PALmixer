@@ -719,6 +719,19 @@ is given its own to avoid the collision.
 
 ### Mixing records in PVapp
 
+Updated clients also carry a hidden `sample_uid` UUID. PALsystem supplies it after
+tagging a slot using `set_sample_uid <slot> <uuid> <sample id>`. PALmixer requires
+the readable tag to match and refuses changes to an existing UUID or while an
+action is running. `get_state.carousel_sample_uids` advertises support and exposes
+the UUIDs beside the existing `carousel_samples` map. Retagging a different sample,
+clearing a slot or mounting a new carousel removes the previous slot UUID.
+
+Mixing records include that UUID locally and in PVapp's existing `data` object.
+Delivery rejects a UUID conflict instead of overwriting another sample's record.
+Older journals without a UUID inherit one from PVapp when available. No UUID-only
+HTTP endpoint or database uniqueness constraint is implied: these clients still
+use PVapp's existing readable-ID GET/PUT routes, with the concurrency limits below.
+
 The PALmixer server journals each `make_sample` attempt and appends it under
 `data.mixing_records` in the existing PVapp sample. The same `sample_id` links
 PALsystem's preparation composition with mixing. If the command omits an ID,
