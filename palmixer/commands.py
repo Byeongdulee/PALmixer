@@ -38,6 +38,7 @@ IDLE alone says nothing about success.
     "set_sample_id <slot> <sample id>"    -> "OK" | "ERROR: <reason>"
     "get_sample_id <slot>"                -> "<sample id>" | "unknown" | "ERROR: <reason>"
     "clear_sample_id <slot>"              -> "OK" | "ERROR: <reason>"
+    "clear_slots"                         -> "OK" | "ERROR: <reason>" (keeps taught reference)
     "set_credentials <base64 json>"       -> "OK" | "ERROR: <reason>"
 
 A sample ID is the rest of the line, so it may contain spaces; runs of
@@ -273,6 +274,7 @@ SET_LOCATION = "set_location"
 # geometry (size, step) is configuration, not a command -- see config.py.
 TEACH_CAROUSEL_SLOT = "teach_carousel_slot"
 RESET_CAROUSEL = "reset_carousel"
+CLEAR_SLOTS = "clear_slots"
 SET_SAMPLE_ID = "set_sample_id"
 SET_SAMPLE_UID = "set_sample_uid"
 GET_SAMPLE_ID = "get_sample_id"
@@ -477,6 +479,11 @@ def reset_carousel_command():
     """Build the wire command to replace the carousel: drop the taught
     reference position and every sample ID."""
     return RESET_CAROUSEL
+
+
+def clear_slots_command():
+    """Clear all sample labels/UUIDs, preserving the taught carousel reference."""
+    return CLEAR_SLOTS
 
 
 def set_sample_id_command(slot, sample_id):

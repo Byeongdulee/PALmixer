@@ -626,6 +626,15 @@ def carousel_is_full():
     return used_slot_count() >= size
 
 
+def clear_slots():
+    """Clear sample identities only; keep the carousel's taught robot positions."""
+    def apply(parser):
+        for section in (_CAROUSEL_SAMPLES, _CAROUSEL_UIDS):
+            if parser.has_section(section):
+                parser.remove_section(section)
+    _mutate(apply)
+
+
 def reset_carousel():
     """Replace the carousel: clear the entire slot inventory in one transition.
 

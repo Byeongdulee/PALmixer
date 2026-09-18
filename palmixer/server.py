@@ -294,6 +294,15 @@ class PALmixerServer:
             # vocabulary's first-class "unknown", as the locations do.
             return sample_id if sample_id else state.UNKNOWN
 
+        if name == cmd.CLEAR_SLOTS:
+            if args:
+                return "ERROR: clear_slots takes no arguments"
+            with self._busy_lock:
+                if self._busy:
+                    return "ERROR: busy; slot labels cannot be cleared during an action"
+                state.clear_slots()
+            return "OK"
+
         if name == cmd.CLEAR_SAMPLE_ID:
             if len(args) != 1:
                 return "ERROR: usage: %s <slot>" % cmd.CLEAR_SAMPLE_ID
