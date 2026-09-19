@@ -137,16 +137,51 @@ class Workflows:
         self.motor = motor
         self.on_step = on_step or (lambda step, phase, detail="": None)
         self.simulate = simulate
+        from uuid import uuid4
+        self._cleanup_session = uuid4().hex
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_operations = {}
+        self._cleanup_parked = False
+
+    def cleanup_snapshot(self):
+        """Explicit completion evidence, including asynchronous cleaning failures."""
+        with self._cleanup_lock:
+            operations = {k: dict(v) for k, v in self._cleanup_operations.items()}
+            return {"version": 1, "session": self._cleanup_session,
+                    "parked": self._cleanup_parked, "operations": operations,
+                    "active": any(v["status"] == "running" for v in operations.values()),
+                    "wash_complete": operations.get("wash_flowcell", {}).get("status") == "completed",
+                    "problem": "; ".join(k + ": " + v["error"] for k, v in operations.items()
+                                           if v["status"] == "failed")}
+
+    def _cleanup_begin(self, name):
+        with self._cleanup_lock:
+            if name not in ("clean_mixer", "wash_flowcell"):
+                self._cleanup_parked = False
+                return None
+            record = {"status": "running", "error": ""}
+            self._cleanup_operations[name] = record
+            return record
+
+    def _cleanup_end(self, name, record, error=""):
+        with self._cleanup_lock:
+            if record is not None:
+                record.update(status="failed" if error else "completed", error=error)
+            if name == "park_at_transfer_point" and not error:
+                self._cleanup_parked = True
 
     # -- step bookkeeping -----------------------------------------------------
     def _step(self, name, fn):
+        cleanup = self._cleanup_begin(name)
         self.on_step(name, "started", "")
         try:
             result = fn()
         except Exception as e:
+            self._cleanup_end(name, cleanup, str(e))
             self.on_step(name, "failure", str(e))
             raise
         detail = result or ""
+        self._cleanup_end(name, cleanup)
         self.on_step(name, "success", detail)
         return detail
 
@@ -171,11 +206,14 @@ class Workflows:
         later steps because Pump serializes per server -- a later call to the
         *same* pump waits for this one, and a call to the other pump does not
         (the mixer and the flowcell are independent hardware)."""
+        cleanup = self._cleanup_begin(op)
         def run():
             try:
                 detail = self._pump_op(op)
+                self._cleanup_end(op, cleanup)
                 self.on_step(op, "success", detail)
             except Exception as e:
+                self._cleanup_end(op, cleanup, str(e))
                 self.on_step(op, "failure", str(e))
         self.on_step(op, "started", "(not awaited)")
         thread = threading.Thread(target=run, daemon=True)

@@ -265,7 +265,10 @@ def test_flowcell_draw_requires_its_own_success_status(status, ok, monkeypatch):
 
 @pytest.mark.parametrize("failed", [False, True])
 def test_worker_result_is_correlated_even_when_idle_after_failure(monkeypatch, failed):
+    from palmixer.workflows import Workflows
     instance = object.__new__(PALmixerServer)
+    instance.workflows = Workflows(None, None, None, None)
+    instance.workflows._step("park_at_transfer_point", lambda: "parked")
     instance.simulate = False
     instance._busy = True
     instance._busy_lock = Lock()
@@ -285,6 +288,7 @@ def test_worker_result_is_correlated_even_when_idle_after_failure(monkeypatch, f
     assert instance._last_result["ok"] is (not failed)
     assert instance._last_result["state"] == {"flowcell_1": "beam"}
     assert instance._busy is False
+    assert not instance.workflows.cleanup_snapshot()["parked"]
 
 
 def test_draw_load_refuses_relabeling_an_existing_sample(monkeypatch):
@@ -298,7 +302,9 @@ def test_draw_load_refuses_relabeling_an_existing_sample(monkeypatch):
 
 def test_acceptance_and_finished_result_share_the_same_action_id(monkeypatch):
     import palmixer.server as server_module
+    from palmixer.workflows import Workflows
     instance = object.__new__(PALmixerServer)
+    instance.workflows = Workflows(None, None, None, None)
     instance.simulate = False
     instance._busy = False
     instance._busy_lock = Lock()

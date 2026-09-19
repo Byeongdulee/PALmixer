@@ -176,6 +176,7 @@ class PALmixerServer:
                                                         self.pump.max_rpm],
                                    current_action=self._current_action,
                                    current_step=self._current_step,
+                                   cleanup=self.workflows.cleanup_snapshot(),
                                    pump_status=self._pump_status,
                                    last_mixing_record=self._last_mixing_record,
                                    last_result=self._last_result))
@@ -632,6 +633,9 @@ class PALmixerServer:
         """Runs on a background thread: execute the action, publish the
         outcome, and clear the busy flag."""
         try:
+            # Direct transports and manual moves also invalidate an earlier park.
+            # Only a completed workflow parking step can establish it again.
+            self.workflows._cleanup_begin("worker_action")
             detail = action_fn()
             self._last_result = {"action": action_label, "ok": True,
                                  "detail": detail or "", "time": time.time()}
