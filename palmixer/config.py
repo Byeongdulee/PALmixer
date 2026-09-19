@@ -16,6 +16,9 @@ Sections:
     carousel {size, step}                       -- carousel geometry
     pump  {host, mixer_port, flowcell_port, ...}-- apssector12_pump_control ZMQ
     daq   {host, port, request_timeout_s}       -- beamline DAQ GUI ZMQ (sample stage motors)
+    search_refs {station: [x,y,z,rx,ry,rz]}     -- where each AprilTag search starts
+                                                   looking (Z + orientation only; the
+                                                   X/Y come from waypoints.ini)
     pvapp {base_url, username, owner_badge, required, timeout_s} -- sample register
 
 Env overrides (take precedence over the JSON):
@@ -112,6 +115,30 @@ _DEFAULTS = {
         "owner_badge": "",       # required when logging in as staff rather than a badge
         "required": False,       # a lost mix-confirmation costs provenance, not the sample
         "timeout_s": 10.0,
+    },
+    # Where each AprilTag search stands to start looking: a *camera* standoff
+    # above the station, as a full 6-element pose. Only the Z and orientation
+    # are used as written -- the X/Y come from the station's taught position
+    # when it has one, so a station that physically moves takes its search
+    # along with it (see PAL12idb.search_reference). The Z is how far back to
+    # stand for the tag to be in frame at a workable size, and the orientation
+    # is which way the camera faces; neither is station geometry, which is why
+    # neither can be read off the taught pose.
+    #
+    # Configuration rather than code: these describe where the hardware sits,
+    # and moving a station should not need a source edit. They live here and
+    # not in waypoints.ini because nothing writes them -- that file is state
+    # the software maintains, and it is git-ignored, so a fresh clone would
+    # have no reference for its very first search.
+    #
+    # mixer_station and mixer_cleaning_station start out identical (they sit
+    # beside each other and shared one constant before this was config), but
+    # they are separate entries and can be given separate poses.
+    "search_refs": {
+        "sample_table": [-0.22, -0.37, 0.12, -2.18860535, 2.25379435, 0],
+        "cleaning_station": [0.38, -0.16, -0.1, 2.231, -2.212, 0],
+        "mixer_cleaning_station": [0.4, 0.1, 0.1, 2.231, -2.212, 0],
+        "mixer_station": [0.4, 0.1, 0.1, 2.231, -2.212, 0],
     },
 }
 

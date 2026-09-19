@@ -15,9 +15,33 @@ try:
 except ImportError:
     import daq_client
 
-ref_mixer_cleantable = [0.4, 0.1, 0.1, 2.231, -2.212, 0]
-ref_cleanstation = [0.38, -0.16, -0.1, 2.231, -2.212, 0]
-ref_sampletable = [-0.22, -0.37, 0.12, -2.18860535, 2.25379435, 0]
+try:
+    from . import config as _config
+except ImportError:
+    import config as _config
+
+# Where an AprilTag search stands to start looking -- a camera standoff above
+# each station, not a grab pose. locate_apriltag() drives here first and
+# search_apriltag_by_tilt() then tilts around from here hunting the tag.
+#
+# These are the `search_refs` section of json/palmixer_config.json; the names
+# below are kept because goto_default() and the rest of this module refer to
+# them, but they are now just the config read once at import. Read live with
+# search_reference(), which is what every search actually calls -- config.py
+# re-reads the file on every access, so an edit there takes effect without a
+# restart, the same as waypoints.ini.
+def _ref(station, fallback):
+    try:
+        pose = _config.get_section('search_refs').get(station)
+        return [float(v) for v in pose] if pose else list(fallback)
+    except Exception:
+        return list(fallback)
+
+ref_mixer_cleantable = _ref('mixer_cleaning_station',
+                            [0.4, 0.1, 0.1, 2.231, -2.212, 0])
+ref_cleanstation = _ref('cleaning_station', [0.38, -0.16, -0.1, 2.231, -2.212, 0])
+ref_sampletable = _ref('sample_table',
+                       [-0.22, -0.37, 0.12, -2.18860535, 2.25379435, 0])
 # Intermediate pose for the sample table <-> mixer side traverse. A direct
 # point-to-point move between those two regions sweeps the arm through what
 # sits between them, so every such leg is routed through this pose instead
@@ -1157,6 +1181,38 @@ def get_station_position(pos):
         return get_sample_on_mixerstation_position()
     raise ValueError('unknown station %r' % (pos,))
 
+def search_reference(pos):
+    """Where locate_apriltag() drives to before hunting for `pos`'s AprilTag.
+
+    The station's taught X/Y, at the configured ref pose's Z and orientation.
+    Each part comes from whichever source actually knows it:
+
+      * X/Y from waypoints.ini, so moving a station -- by re-teaching it or by
+        editing the ini -- moves where the search looks for it. Taking this
+        from a constant is what left the search starting 0.33 m away from the
+        mixer station after it was physically repositioned.
+      * Z and orientation from `search_refs` in json/palmixer_config.json,
+        because those are a *camera* standoff and attitude, not station
+        geometry: how far back to stand for the tag to be in frame at a
+        workable size, and which way to face. The taught pose's own Z is down
+        at the grab point and its orientation is the gripper's angle on a
+        possibly tilted seat, so neither substitutes.
+
+    Both are read live -- config.py re-reads its file on every access, as
+    waypoints.ini is -- so neither needs a restart to take effect.
+
+    Falls back to the ref pose unchanged for a station with no taught position:
+    the first search for a station has nothing else to go on, which is the case
+    these poses were originally written for.
+    """
+    ref = _ref(pos, ref_sampletable)
+    try:
+        taught = get_station_position(pos)
+    except (RuntimeError, ValueError):
+        return ref          # never taught, or not a station -- ref as written
+    return [taught[0], taught[1]] + list(ref[2:])
+
+
 ORIENTATION_AXES = ('x', 'y', 'z')
 
 def tweak_orientation(robot, axis, degrees):
@@ -1378,18 +1434,12 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False):
     # it face-down / squaring it to a tilted tag: position is still recorded,
     # only the orientation differs (teach a tilted seat's angle by hand).
     global sample_table, cleaning_station1, cleaning_station2, mixer_cleaning_station, mixer_station
-    ref_pos = []
-    if pos == 'sample_table':
-        ref_pos = ref_sampletable
-    if pos == 'cleaning_station':
-        ref_pos = ref_cleanstation
-    if pos == 'mixer_cleaning_station':
-        ref_pos = ref_mixer_cleantable
-    if pos == 'mixer_station':
-        ref_pos = ref_mixer_cleantable
-    print(f"Looking for {pos} ....")
-    if len(ref_pos)==0:
-        ref_pos = ref_sampletable
+    # The station's own taught X/Y at its configured camera standoff -- see
+    # search_reference(). This used to be a per-station constant, which meant
+    # a station that physically moved was still searched for where it used to
+    # be, and no edit to waypoints.ini could say otherwise.
+    ref_pos = search_reference(pos)
+    print(f"Looking for {pos} .... (from {[round(v, 4) for v in ref_pos[:3]]})")
     # Tell the camera how big the tag it is about to look at actually is,
     # before anything measures a distance from it. This is read by every
     # distance-based step downstream, not just the descent below: the tilt

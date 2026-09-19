@@ -46,6 +46,11 @@ the reference unreachable -- see [Soft limits](#the-carousel).
 `carousel.draw_offset_steps` (4) is how many slots `make_sample` advances
 between mixing a vial and drawing from it.
 
+`search_refs` is where each AprilTag search starts looking -- only its Z and
+orientation are used as written, the X/Y coming from the station's taught
+position. See
+[Where an AprilTag search starts looking](#where-an-apriltag-search-starts-looking).
+
 `robot.ur12idb_path` holds one path per operating system, so the same config
 serves the beamline Linux host and the Windows control machine:
 
@@ -63,9 +68,28 @@ edit to the shared JSON.
 
 ## Running
 
-On the Linux beamline host, running against real hardware (no `--simulate`)
-needs `robot12idb`/`camera_tools` and their dependencies, which live in the
-`aps12robot` environment -- activate it before starting the server:
+On Windows, `run_palmixer.cmd` starts both halves in one window each -- the
+quickest way in, and it pre-flights the things that otherwise fail in a window
+that closes before anyone reads it:
+
+```
+run_palmixer.cmd              drives the real robot, motor, and pumps
+run_palmixer.cmd --simulate   no robot/motor/pump I/O; for GUI/dev work
+```
+
+Everything passed goes to the server; the GUI takes no arguments. It runs the
+`aps12robot` environment by interpreter path (no activation needed -- see
+[On Windows](#on-windows)); override with
+`set PALMIXER_PYTHON=C:\path\to\python.exe`. It refuses to start, with an
+explanation, if the interpreter or a dependency is missing, if `robot12idb`
+cannot be imported (skipped for `--simulate`), or if a server already holds
+the ZMQ port. It does **not** start the two pump dashboards -- those are a
+separate program; start them first or every pump step fails.
+
+To run the two halves by hand instead, or on the Linux beamline host: running
+against real hardware (no `--simulate`) needs `robot12idb`/`camera_tools` and
+their dependencies, which live in the `aps12robot` environment -- activate it
+before starting the server:
 
 ```sh
 conda activate aps12robot
@@ -225,6 +249,37 @@ given and the current tracked state: `unload_sample` needs no mixer position
 at all unless `aspirate` was asked for, and even then it only needs the mixer
 cleaning station when the mixer head is sitting at the mixer station and
 therefore has to be parked out of the way first.
+
+### Where an AprilTag search starts looking
+
+`waypoints.ini` holds the search *result*. Where the search *starts* is the
+`search_refs` section of `json/palmixer_config.json` -- a camera standoff
+above each station, as a full 6-element pose. `locate_apriltag` drives there
+first, and `search_apriltag_by_tilt` then tilts around from there hunting the
+tag.
+
+The two halves of that pose come from different places, because they answer
+different questions (`PAL12idb.search_reference`):
+
+| part | source | why |
+|---|---|---|
+| X/Y | the station's taught position in `waypoints.ini` | so a station that physically moves takes its search along with it |
+| Z + orientation | `search_refs` in the config | a *camera* standoff and attitude -- how far back to stand for the tag to fill a workable part of the frame, and which way to face |
+
+Neither Z nor orientation can be read off the taught pose: that pose's Z is
+down at the grab point, and its orientation is the gripper's angle on a
+possibly tilted seat. Both files are re-read on every access, so an edit to
+either takes effect without restarting the server.
+
+A station with no taught position yet falls back to the configured pose
+verbatim -- the first search for a station has nothing else to go on, which is
+what these poses were originally written for.
+
+`mixer_station` and `mixer_cleaning_station` start out with identical entries
+(they sit beside each other, and shared a single hardcoded constant before
+this was configuration) but are separate keys and can be given separate poses.
+They already differ in practice, since each takes its X/Y from its own taught
+position.
 
 ## Taught positions and the EPICS waypoint PVs
 

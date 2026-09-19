@@ -1,2 +1,8 @@
 # SCM syntax highlighting & preventing 3-way merges
 pixi.lock merge=binary linguist-language=YAML linguist-generated=true -diff
+
+# cmd.exe is only mostly tolerant of LF line endings -- it misreads labels and
+# multi-line parenthesised blocks in some combinations, which this file is full
+# of. Checked out CRLF everywhere, including on a Linux clone, so a round trip
+# through one cannot quietly break the launcher.
+*.cmd text eol=crlf

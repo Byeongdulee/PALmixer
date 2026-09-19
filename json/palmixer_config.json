@@ -49,5 +49,11 @@
         "owner_badge": "",
         "required": false,
         "timeout_s": 10.0
+    },
+    "search_refs": {
+        "sample_table": [-0.22, -0.37, 0.12, -2.18860535, 2.25379435, 0],
+        "cleaning_station": [0.38, -0.10, -0.1, 2.231, -2.212, 0],
+        "mixer_cleaning_station": [0.4, 0.1, 0.1, 2.231, -2.212, 0],
+        "mixer_station": [0.4, 0.1, 0.1, 2.231, -2.212, 0]
     }
 }
