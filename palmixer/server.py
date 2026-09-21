@@ -467,11 +467,11 @@ class PALmixerServer:
         if name in cmd.TRANSPORT_FUNCTIONS:
             if args:
                 raise ValueError("%s takes no arguments" % name)
-            # Refused outright, before ACCEPTED: the Experiment tab's own
-            # buttons for these two, reachable regardless of what the server
-            # is otherwise doing (busy or not) -- see Workflows.mixer_head_busy.
-            if name in cmd.MIXER_HEAD_TRANSPORTS and self.workflows.mixer_head_busy():
-                raise ValueError("mixer head cannot be moved while it is being washed")
+            # A mixer-head transport is deliberately *not* refused here while
+            # the head is being washed. It is accepted and the worker waits
+            # out the wash (_run_transport -> Workflows.await_mixer_wash), so
+            # the head goes where it was told to go as soon as it can rather
+            # than the operator having to notice the refusal and press again.
             self._require_positions(self.PAL12idb.TRANSPORT_STATIONS[name] if self.PAL12idb else ())
             return (lambda: self._run_transport(name)), name
 
@@ -871,6 +871,16 @@ class PALmixerServer:
             # the Experiment tab's transport button is pressed directly
             # rather than through unload_sample.
             self.workflows.stop_auto_shake()
+        if name in cmd.MIXER_HEAD_TRANSPORTS:
+            # The head is docked at its cleaning station with liquid running
+            # through it; moving it now would spill. Wait the wash out rather
+            # than refuse -- the order is a fine one, it has just arrived
+            # early. Reported as its own "wait_for_clean_mixer" step so a wait
+            # of minutes does not look like a stalled robot. This is the only
+            # path that bypasses Workflows._move_mixer_head (the Experiment
+            # tab's two buttons calling PAL12idb directly), so the wait has to
+            # be repeated here.
+            self.workflows.await_mixer_wash()
         getattr(self.PAL12idb, name)(self.rob)
         return "%s complete" % name
 

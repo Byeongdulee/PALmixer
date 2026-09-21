@@ -20,6 +20,11 @@
     "motor": {
         "pv": "12idb:m6"
     },
+    "gripper": {
+        "stroke_m": 0.05,
+        "release_count": 120,
+        "cleaning_station_open_extra_m": 0.02
+    },
     "carousel": {
         "size": 16,
         "step": 1.0,
@@ -36,7 +41,8 @@
         "flowcell_port": 5556,
         "request_timeout_s": 5.0,
         "poll_interval_s": 0.5,
-        "operation_timeout_s": 600.0
+        "operation_timeout_s": 600.0,
+        "startup_grace_s": 10.0
     },
     "daq": {
         "host": "purple.xray.aps.anl.gov",

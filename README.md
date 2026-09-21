@@ -51,6 +51,11 @@ orientation are used as written, the X/Y coming from the station's taught
 position. See
 [Where an AprilTag search starts looking](#where-an-apriltag-search-starts-looking).
 
+`gripper` converts a finger opening in metres into the Hand-E's 0-255 position
+count, and sets how much wider than normal the fingers open before dropping
+onto the flowcell cleaning station. See
+[Gripper opening on a cleaning-station pickup](#gripper-opening-on-a-cleaning-station-pickup).
+
 `robot.ur12idb_path` holds one path per operating system, so the same config
 serves the beamline Linux host and the Windows control machine:
 
@@ -249,6 +254,37 @@ given and the current tracked state: `unload_sample` needs no mixer position
 at all unless `aspirate` was asked for, and even then it only needs the mixer
 cleaning station when the mixer head is sitting at the mixer station and
 therefore has to be parked out of the way first.
+
+### Gripper opening on a cleaning-station pickup
+
+Three transports collect the flowcell off its cleaning station --
+`load_flowcell_from_cleaningstation_to_beam`, `ready_flowcell_to_draw` and
+`flowcell_to_sample_on_mixer`. All three come straight down onto the station
+(see `cleaningstation_approach_lift`), which means the fingers pass down either
+side of a flowcell standing in a deep seat. They open **2 cm wider than
+elsewhere** before descending, so a flowcell sitting slightly proud or cocked
+is cleared rather than nudged.
+
+The Robotiq Hand-E takes a 0-255 position count (0 fully open, 255 fully
+closed) and **reports nothing back**, so "2 cm wider than the current opening"
+cannot be measured -- it is computed:
+
+| `gripper.*` | default | meaning |
+|---|---|---|
+| `stroke_m` | `0.05` | the Hand-E's 50 mm finger span, i.e. 255 counts |
+| `release_count` | `120` | what `robUR.release()` commands -- the baseline |
+| `cleaning_station_open_extra_m` | `0.02` | how much wider than that |
+
+which works out as count **18** (46.5 mm) against release()'s count 120
+(26.5 mm). Everything else -- `return_sample` collecting from the sample table,
+every `dropdown`/release -- is untouched and still uses plain `release()`.
+
+Two things to know if you retune this. `release_count` **mirrors** a constant
+inside `robUR.release()` in the sibling UR_12idb repo; nothing links them, so
+if that is ever changed this has to follow or the widening starts from the
+wrong baseline. And 46.5 mm leaves only 3.5 mm of the Hand-E's travel in hand
+-- asking for much more than 2 cm silently clamps at fully open rather than
+failing, on the grounds that a wrong number should not strand the flowcell.
 
 ### Where an AprilTag search starts looking
 
@@ -631,20 +667,58 @@ pump op does. Moving the head off the station while that is happening risks
 spilling the liquid actively flowing through it, damaging the tubing, or
 fouling the needle alignment.
 
-`Workflows.mixer_head_busy()` answers whether a `clean_mixer` is still
-running, checked fresh every time rather than cached, and two things refuse
-while it is:
+So a move ordered mid-wash **waits** rather than being refused. Nothing is
+wrong with the order -- the operator wants the head at the mixer, and the only
+objection is that the wash has not finished yet, which resolves itself. The
+robot holds still until the wash reports completion, then moves.
 
-- **Moving the mixer head at all** -- `mixer2cleaningstation` and
-  `mixer2mixingstation`, whichever way they are reached: the Experiment tab's
-  own buttons for either (refused outright by the server, before ACCEPTED),
-  or a step inside `make_sample`, `draw_and_load`, or `unload_sample aspirate`
-  (refused with a `WorkflowError` at the point that step would have run --
-  `Workflows._move_mixer_head` is the one place every internal call to either
-  transport goes through).
-- **Starting `make_sample`** -- refused outright by `_check_make_sample`, the
-  same synchronous pre-flight path as its other guards. The realistic case is
-  a second `make_sample` fired before the first one's wash has finished.
+**What counts as "being washed" is the mixing dashboard's own answer**, not
+PALmixer's record of having started a wash. `Workflows.mixer_pumps_running()`
+asks port 5555 whether `operation_active` is set; whatever pump0 and pump1 are
+doing, they are doing it through the mixer head, so an active operation there
+means the head must not move *regardless of who started it*. A wash fired from
+the pump dashboard directly, or by a PALmixer session from before a server
+restart, is invisible to any local bookkeeping -- and that is precisely the
+case that let the head move mid-wash. A still-running background `clean_mixer`
+thread of ours also counts, covering the moment between firing a wash and the
+dashboard reporting it, but it is the backup source, not the primary one.
+
+`Workflows.mixer_head_busy()` combines the two, checked fresh every time rather
+than cached, and `Workflows.await_mixer_wash()` waits one out. Both paths to
+the head call it:
+
+- **The Experiment tab's own buttons** for `mixer2cleaningstation` and
+  `mixer2mixingstation` -- accepted as usual, then held in the worker by
+  `Server._run_transport` before the `PAL12idb` call. These are the one path
+  that bypasses `_move_mixer_head`, calling `PAL12idb` directly.
+- **A step inside a workflow** -- `make_sample`, `draw_and_load`, or
+  `unload_sample aspirate`. `Workflows._move_mixer_head` is the single place
+  every internal call to either transport goes through, so the wait lands at
+  the step that actually needs the head and not before. `make_sample` in
+  particular is *not* refused at pre-flight for a wash left running by the
+  previous one: it starts, gets on with `rotate_carousel`, and waits only when
+  it reaches `mixer2mixingstation`.
+
+The wait is reported as its own step -- `wait_for_clean_mixer` while joining
+our own background thread, then `wait_for_mixer_pumps` while polling the
+dashboard once a second -- so a hold of minutes reads as "waiting for the wash"
+in the log rather than as a transport that has stalled.
+
+It is bounded by the pump's own `operation_timeout_s` (600 s by default), and
+on expiry the move is **refused**, not performed:
+
+```
+ERROR: the mixing pumps have been running for over 600 s; refusing to move the
+mixer head while liquid may still be flowing through it. Stop the operation on
+the pump dashboard, then retry.
+```
+
+An operation still active after the pumps would themselves have given up is a
+fault, and driving the head out of a station that may still have liquid running
+through it is the worse of the two ways to be wrong. The one case treated as
+"not running" is a dashboard that cannot be reached at all -- indistinguishable
+from one that is switched off, and refusing to ever move the head because a
+status socket is down would strand the robot.
 
 ### Pump status panel
 
@@ -742,6 +816,27 @@ the op is **queued**, not done: each op then polls `status` until
 `MAKE SAMPLE` / `COMPLETE` terminal status. A STOP, error or unknown outcome
 fails the mixing step instead of letting the workflow proceed as if it succeeded.
 
+**"Not active" is ambiguous at both ends of an operation**, and `startup_grace_s`
+(10 s) covers both. The dashboard replies `ok` as soon as a job is queued, then
+takes up to a second or so to raise `operation_active` and write its `Status:`
+line -- and symmetrically it can drop `operation_active` a beat before writing
+the terminal `Status: COMPLETE`. Polling into either gap reads "idle with no
+completion evidence" and fails a perfectly good operation:
+
+```
+sample_make: unknown (Purpose: Make Sample)
+```
+
+That message is the signature of the start-up gap specifically: `Purpose:` with
+no `Status:` line is a report the dashboard has set up but not begun. So an idle
+reading is only accepted as the end of an operation once something backs it up
+-- the operation was seen active at least once, or there is a status to judge.
+Until then, within the grace, idle means "has not begun yet". Once idle *with*
+an inconclusive verdict, `Pump._settle` re-polls for the same window to let a
+late status line land. Neither weakens the guard: an explicit STOP or ERROR is
+taken at once and never re-polled, and a dashboard that is accepted and then
+simply never runs still fails the step, just 10 s later.
+
 **Flowcell selection is by device index.** The flowcell ops carry a 0-based
 `device` derived from `state.get_flowcell_in_use()`: PALmixer flowcell **ID 1**
 maps to flowcell2 / `device 0` (`flow2_sample`), and **ID 2** to flowcell3 /
@@ -762,7 +857,8 @@ Endpoints, timeouts, and the advisory speed limits live in
 "pump": {
     "mixing_speed_rpm": 800.0, "min_rpm": 0.0, "max_rpm": 3000.0,
     "host": "127.0.0.1", "mixer_port": 5555, "flowcell_port": 5556,
-    "request_timeout_s": 5.0, "poll_interval_s": 0.5, "operation_timeout_s": 600.0
+    "request_timeout_s": 5.0, "poll_interval_s": 0.5, "operation_timeout_s": 600.0,
+    "startup_grace_s": 10.0
 }
 ```
 

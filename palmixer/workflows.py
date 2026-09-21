@@ -87,14 +87,33 @@ tubing, or fouling the needle alignment. clean_mixer is fired without being
 awaited (see above), so it can still be running well after the make_sample
 that started it has returned and the server has gone idle again; nothing else
 here waits for it to finish on its own the way a same-server pump op does.
-Workflows.mixer_head_busy() answers whether it still is, checked fresh every
-time (not cached), and Workflows._move_mixer_head() is the one place every
-internal call to either transport goes through, refusing with a WorkflowError
-if so. server.py additionally refuses outright, before ACCEPTED, for the two
-cases an operator can trigger directly: the Experiment tab's own buttons for
-either transport, and make_sample (_check_make_sample) -- so those get
-"ERROR: ..." immediately rather than an ACCEPTED that then fails once the
-sequence reaches the step that would have moved the head.
+Workflows.mixer_head_busy() answers whether it still is and
+Workflows.await_mixer_wash() waits it out, both checked fresh every time. The
+decisive source is the *mixing dashboard itself* (mixer_pumps_running(): does
+port 5555 report operation_active?), not our own record of having started a
+wash. Local bookkeeping alone was not enough, and this is the bug that let the
+head move mid-wash on the beamline: a wash started from the pump dashboard
+directly, or by a PALmixer session before a server restart, leaves
+_background_pumps empty while pump0 and pump1 are very much running. The
+background thread is still tracked, and still consulted, but only to cover the
+gap between firing a wash and the dashboard reporting it.
+
+Every move of the head waits rather than refuses: Workflows._move_mixer_head()
+is the one place every internal call to either transport goes through, and
+server.py calls await_mixer_wash() in _run_transport for the two the Experiment
+tab can trigger directly. A move ordered mid-wash is a legitimate order
+arriving early, not a mistake -- the operator wants the head at the mixer, and
+the only thing wrong with doing it now is that the wash has not finished, which
+resolves itself.
+
+The wait is bounded by the pump's own per-operation timeout, and on expiry it
+raises rather than moving anyway: an operation still active after the pumps
+would themselves have given up is a fault, and driving the head out of a
+station that may still have liquid running through it is the worse of the two
+ways to be wrong. An unreachable dashboard is the one case treated as "not
+running" -- it is indistinguishable from a dashboard that is switched off, and
+refusing to ever move the head because a status socket is down would strand
+the robot.
 """
 
 import threading
@@ -124,6 +143,13 @@ def _draw_offset_steps():
 # this gap, so it does not control how quickly a stop takes effect.
 AUTO_SHAKE_PAUSE_S = 0.5
 
+# How often await_mixer_wash re-asks the mixing dashboard whether pump0/pump1
+# are still running. Slower than the pump's own poll interval because this is
+# a second client on the same status socket (the server's pump-status thread
+# is the other), and a wash runs for minutes -- a second of latency on noticing
+# it finished costs nothing next to that.
+MIXER_PUMP_POLL_S = 1.0
+
 
 class WorkflowError(Exception):
     """Raised when a guard fails and the workflow refuses to start."""
@@ -142,6 +168,8 @@ class Workflows:
         self._cleanup_lock = threading.Lock()
         self._cleanup_operations = {}
         self._cleanup_parked = False
+        self._background_lock = threading.Lock()
+        self._background_pumps = {}
 
     def cleanup_snapshot(self):
         """Explicit completion evidence, including asynchronous cleaning failures."""
@@ -217,26 +245,33 @@ class Workflows:
                 self.on_step(op, "failure", str(e))
         self.on_step(op, "started", "(not awaited)")
         thread = threading.Thread(target=run, daemon=True)
-        self._background_pump = (op, thread)
+        # Keyed by op, not a single slot. A clean_mixer and a wash_flowcell
+        # genuinely do run at the same time (different servers, that is the
+        # point of firing them unawaited), and one slot meant the second to
+        # start erased the first -- after which nothing waited for the erased
+        # one because as far as this object was concerned it had finished.
+        with self._background_lock:
+            self._background_pumps[op] = thread
         thread.start()
 
-    def _background_pump_status(self):
-        """(op, thread) of a still-running background pump op, or None.
+    def _background_pump_threads(self):
+        """{op: thread} for background pump ops still running.
 
         Freshly checks `thread.is_alive()` rather than trusting the bookkeeping
         left by _start_background_pump_op: nothing proactively clears that once
-        the thread actually finishes, only the next caller that asks. Clears it
-        here when it finds a dead thread, so a stale entry cannot linger and
-        make something look busy that has long since finished.
+        the thread actually finishes, only the next caller that asks. Drops the
+        dead ones here, so a stale entry cannot linger and make something look
+        busy that has long since finished.
         """
-        entry = getattr(self, "_background_pump", None)
-        if entry is None:
-            return None
-        op, thread = entry
-        if not thread.is_alive():
-            self._background_pump = None
-            return None
-        return entry
+        with self._background_lock:
+            for op in [o for o, t in self._background_pumps.items() if not t.is_alive()]:
+                del self._background_pumps[op]
+            return dict(self._background_pumps)
+
+    def _forget_background_pump(self, op, thread):
+        with self._background_lock:
+            if self._background_pumps.get(op) is thread:
+                del self._background_pumps[op]
 
     def _await_background_pump(self, before_op):
         """Wait out a background pump op, but only if it would block `before_op`.
@@ -248,46 +283,127 @@ class Workflows:
         than inside the pump call, so a wait of minutes is a named step instead
         of a step that appears to have stalled.
         """
-        entry = self._background_pump_status()
-        if entry is None:
-            return
-        op, thread = entry
-        if _pump_server_for(op) != _pump_server_for(before_op):
-            return                      # different pump: they run side by side
-        self._background_pump = None
-        self._step("wait_for_%s" % op, lambda: self._join_pump(thread, op))
+        server = _pump_server_for(before_op)
+        for op, thread in self._background_pump_threads().items():
+            if _pump_server_for(op) != server:
+                continue                # different pump: they run side by side
+            self._step("wait_for_%s" % op, lambda t=thread, o=op: self._join_pump(t, o))
 
-    @staticmethod
-    def _join_pump(thread, op):
+    def _join_pump(self, thread, op):
         thread.join()
+        self._forget_background_pump(op, thread)
         # The op reports its own success or failure through its own on_step
         # trio; this step only ever says the waiting is over.
         return "%s finished; the pump is free" % op
 
-    def mixer_head_busy(self):
-        """Is the mixer head currently being washed (a background clean_mixer
-        still running)?
+    def mixer_pumps_running(self):
+        """Is the mixing server (pump0/pump1) running an operation right now?
 
-        True while the head is docked at the cleaning station with liquid
-        actively flowing through it -- moving it away mid-wash risks spilling
-        it, damaging the tubing, or fouling the needle alignment. Unlike a
-        pump-to-pump wait, nothing else here waits for this on its own, so
-        anything that is about to move the head has to check fresh.
+        Asked of the hardware, not of our own bookkeeping. Whatever pump0 and
+        pump1 are doing, they are doing it *through the mixer head* -- washing
+        it at the cleaning station, or pushing liquid through the needle at the
+        mixing station -- so an active operation there means the head must not
+        move, regardless of who started it.
+
+        This is the check that matters, because the wash is frequently not ours
+        to know about: it can be started from the pump dashboard directly, or
+        by a PALmixer run from before this server was restarted. In both cases
+        _background_pumps is empty while the pumps are very much running.
+
+        Returns False when the dashboard cannot be reached or pyzmq is missing
+        -- see await_mixer_wash for why unreachable does not mean blocked.
         """
-        entry = self._background_pump_status()
-        return entry is not None and entry[0] == "clean_mixer"
+        if self.pump is None or self.simulate:
+            return False
+        snapshot = getattr(self.pump, "status_snapshot", None)
+        if snapshot is None:
+            return False
+        try:
+            mixer = snapshot()["servers"]["mixer"]
+        except Exception:
+            return False            # unreachable; fall back to the local view
+        return bool(mixer.get("operation_active"))
+
+    def mixer_head_busy(self):
+        """Is anything happening that means the mixer head must not move?
+
+        Either of two sources says so, and they cover different gaps:
+
+        - `mixer_pumps_running()` -- the mixing dashboard reports an active
+          operation. Ground truth, and the only one that sees a wash PALmixer
+          did not start.
+        - a background `clean_mixer` thread of ours still running. Covers the
+          moment between firing the wash and the dashboard reporting it as
+          active, and keeps working when the dashboard is unreachable.
+
+        Checked fresh every time, never cached: the whole point is that the
+        answer changes underneath us while the robot is deciding.
+        """
+        if "clean_mixer" in self._background_pump_threads():
+            return True
+        return self.mixer_pumps_running()
+
+    def await_mixer_wash(self):
+        """Block until the mixer pumps are idle, so the head can move.
+
+        Two waits, in order: join our own clean_mixer thread if we started one,
+        then poll the mixing dashboard until it reports no active operation.
+        The second is what catches a wash started from the pump dashboard, or
+        one left running by a PALmixer session that has since restarted -- the
+        case where we have no thread to join and previously sailed straight
+        through into the move.
+
+        Reported as its own "wait_for_mixer_pumps" step rather than folded into
+        the move: a wash can run for minutes, and a move that simply sat there
+        for that long would look like a stalled robot.
+
+        Bounded by `pump.operation_timeout_s` (600 s by default). On expiry it
+        raises rather than moving anyway: an operation still active after the
+        pumps' own timeout is a fault, and driving the head out of a station
+        that may still have liquid running through it is the worse of the two
+        ways to be wrong. An unreachable dashboard is treated as "not running"
+        instead of blocking -- it is indistinguishable from a dashboard that
+        is off, and refusing to ever move the head because a status socket is
+        down would strand the robot.
+        """
+        entry = self._background_pump_threads().get("clean_mixer")
+        if entry is not None:
+            self._step("wait_for_clean_mixer",
+                       lambda: self._join_pump(entry, "clean_mixer"))
+        if not self.mixer_pumps_running():
+            return
+        self._step("wait_for_mixer_pumps", self._poll_mixer_pumps_idle)
+
+    def _mixer_wash_timeout_s(self):
+        """How long to keep waiting before calling an active operation a fault.
+
+        The pump's own per-operation timeout, so the two agree: an op the pump
+        would itself have given up on is exactly the one this should stop
+        waiting for. Read off the Pump instance rather than the config so a
+        pump constructed with a different timeout is honoured.
+        """
+        return float(getattr(self.pump, "_op_timeout_s", 600.0))
+
+    def _poll_mixer_pumps_idle(self):
+        deadline = time.time() + self._mixer_wash_timeout_s()
+        while self.mixer_pumps_running():
+            if time.time() >= deadline:
+                raise WorkflowError(
+                    "the mixing pumps have been running for over %.0f s; refusing "
+                    "to move the mixer head while liquid may still be flowing "
+                    "through it. Stop the operation on the pump dashboard, then "
+                    "retry." % self._mixer_wash_timeout_s())
+            time.sleep(MIXER_PUMP_POLL_S)
+        return "the mixing pumps are idle; the mixer head is free to move"
 
     def _move_mixer_head(self, name, fn):
         """Run a mixer-head transport (mixer2cleaningstation /
-        mixer2mixingstation), refused while mixer_head_busy(). The one place
-        every internal call to either goes through, so the refusal applies
-        everywhere the head could be moved, not just the two cases with their
-        own pre-flight check (the Experiment tab's buttons, in server.py, and
-        make_sample, in _check_make_sample).
+        mixer2mixingstation), waiting out a wash in progress first. The one
+        place every internal call to either goes through, so the wait applies
+        everywhere the head could be moved, not just the Experiment tab's two
+        buttons (handled in server.py's _run_transport).
         """
-        if self.mixer_head_busy():
-            raise WorkflowError(
-                "mixer head cannot be moved while it is being washed")
+        self.await_mixer_wash()
         return self._step(name, fn)
 
     def _start_auto_shake(self):
@@ -447,15 +563,13 @@ class Workflows:
         self._require_known(mixer_loc, state.WHAT_MIXER_HEAD,
                              (state.MIXER_AT_MIXER, state.MIXER_AT_CLEANING))
 
-        # Refused outright rather than accepted-then-failed: a wash left
-        # running by a previous make_sample can still be going once this one
-        # would otherwise reach mixer2mixingstation (make_sample's own
-        # opening mixer2cleaningstation runs before this, so this alone would
-        # not catch it there -- _move_mixer_head is the backstop for that gap
-        # and for every other internal call to either mixer transport).
-        if self.mixer_head_busy():
-            raise WorkflowError(
-                "cannot start make_sample while the mixer head is being washed")
+        # A wash left running by a previous make_sample is not checked here.
+        # It does not stop this run from starting -- the head only has to be
+        # free by the time mixer2mixingstation comes round, and the steps
+        # before it (rotate_carousel, and the opening mixer2cleaningstation
+        # when the head is at the mixer) are legitimate work to get on with
+        # meanwhile. _move_mixer_head waits the wash out at the step that
+        # actually needs the head.
 
         # Every slot position is derived from one taught reference, so a reference
         # taught on a different carousel sends the robot to where that one's slot

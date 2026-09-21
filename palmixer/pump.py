@@ -82,6 +82,12 @@ DEFAULT_FLOWCELL_PORT = 5556
 DEFAULT_REQUEST_TIMEOUT_S = 5.0
 DEFAULT_POLL_INTERVAL_S = 0.5
 DEFAULT_OPERATION_TIMEOUT_S = 600.0
+#: How long the dashboard is allowed to take to pick up an accepted command
+#: before "not active" is believed, and how long a just-finished operation is
+#: given to write its terminal Status line. Covers both ends of the same lag;
+#: see Pump._wait_idle. Generous because the cost of waiting a few seconds is
+#: nothing next to abandoning a run that is physically going fine.
+DEFAULT_STARTUP_GRACE_S = 10.0
 #: Ceiling on how long a status poll waits for a reply. Deliberately shorter
 #: than an operation's timeout: a status read that hangs leaves a stale panel,
 #: which is worth far less than the seconds it would spend waiting, and a
@@ -101,16 +107,28 @@ def _utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _status_text(operation):
+    """The ``Status:`` line's text, upper-cased, or "" when there is none.
+
+    "None" is a meaningful answer, not just an empty one: the mixing server
+    writes the Purpose line when it sets an operation up and the Status line
+    only once it is actually under way, so a report with a Purpose and no
+    Status is one that has not started yet. See _wait_idle.
+    """
+    return next((line.strip()[7:].strip().upper()
+                 for line in str(operation or "").splitlines()
+                 if line.strip().lower().startswith("status:")), "")
+
+
 def _mix_completion(operation):
     """Idle can mean complete, stopped or failed. Require terminal evidence."""
-    lines = str(operation or "").splitlines()
-    status = next((line.strip()[7:].strip().upper() for line in lines
-                   if line.strip().lower().startswith("status:")), "")
+    status = _status_text(operation)
     if status.startswith(("STOP", "CANCEL", "ABORT")):
         return "stopped"
     if status.startswith(("ERROR", "FAIL")):
         return "failed"
-    purpose = next((line.strip()[8:].strip().upper() for line in lines
+    purpose = next((line.strip()[8:].strip().upper()
+                    for line in str(operation or "").splitlines()
                     if line.strip().lower().startswith("purpose:")), "")
     if status.startswith("COMPLETE") and purpose == "MAKE SAMPLE":
         return "completed"
@@ -282,6 +300,8 @@ class Pump:
             section.get("poll_interval_s", DEFAULT_POLL_INTERVAL_S))
         self._op_timeout_s = float(
             section.get("operation_timeout_s", DEFAULT_OPERATION_TIMEOUT_S))
+        self._startup_grace_s = float(
+            section.get("startup_grace_s", DEFAULT_STARTUP_GRACE_S))
 
         # _ctx is kept on the instance purely to hold the context alive: its
         # sockets die with it, so letting it fall out of scope here would break
@@ -631,8 +651,30 @@ class Pump:
             return self._wait_idle(endpoint, label, record=record, draw_device=draw_device)
 
     def _wait_idle(self, endpoint, label, record=None, draw_device=None):
-        """Poll ``status`` until ``operation_active`` is false (or timeout)."""
+        """Poll ``status`` until ``operation_active`` is false (or timeout).
+
+        "Not active" is ambiguous immediately after a command is accepted: the
+        dashboard replies ok as soon as the job is queued, and there is a gap
+        of up to a second or so before it raises ``operation_active`` and
+        writes a Status line. Polling into that gap and reading it as "already
+        finished" is what produced::
+
+            sample_make: unknown (Purpose: Make Sample)
+
+        on a mix that then ran perfectly -- the run was abandoned at step 4
+        while the pumps were still working. So an idle report is only taken as
+        the end of the operation once there is something to back it up: either
+        the operation was seen active at least once, or a Status line exists
+        to be judged. Until then, within `startup_grace_s`, idle means "has
+        not begun yet" and the poll keeps going.
+
+        The grace only covers the *start*. Once the operation has been seen
+        running, the original behaviour applies unchanged -- idle ends the
+        wait, and the terminal status still has to say COMPLETE.
+        """
         deadline = time.monotonic() + self._op_timeout_s
+        start_deadline = time.monotonic() + self._startup_grace_s
+        seen_active = False
         while True:
             time.sleep(self._poll_interval_s)
             try:
@@ -645,7 +687,17 @@ class Pump:
                 if record is not None:
                     record["status"] = "unknown"
                 return False, "%s: status query failed: %r" % (label, st)
+            if st.get("operation_active", False):
+                seen_active = True
+            elif (not seen_active
+                    and not self._operation_begun(st, draw_device)
+                    and time.monotonic() < start_deadline):
+                # Accepted, but the dashboard has not picked it up yet. Not a
+                # completed operation with no evidence -- an operation with
+                # nothing to report because it has not started.
+                continue
             if not st.get("operation_active", False):
+                st = self._settle(endpoint, st, record, draw_device)
                 if draw_device is not None:
                     device = next((p for p in st.get("pumps", []) if p.get("device") == draw_device), {})
                     terminal = str(device.get("status") or "").strip()
@@ -663,3 +715,68 @@ class Pump:
                     record["status"] = "unknown"
                 return False, ("%s: still active after %g s"
                                % (label, self._op_timeout_s))
+
+    def _settle(self, endpoint, st, record, draw_device):
+        """Re-poll a just-gone-idle operation until its verdict stops being
+        "inconclusive", or `startup_grace_s` runs out. Returns the last status.
+
+        The mirror of the start-up race: the dashboard can drop
+        ``operation_active`` a beat before it writes the terminal
+        ``Status: COMPLETE`` line, so the first idle reading can be missing
+        the very evidence this is about to demand. Only an inconclusive
+        verdict is retried -- an explicit STOP/ERROR is the dashboard telling
+        us something definite, and waiting for it to change its mind would be
+        wrong.
+
+        Best effort throughout: a failed re-poll keeps the reading already in
+        hand rather than turning a completed operation into a contact error.
+        """
+        if record is None and draw_device is None:
+            return st                   # nothing here demands terminal evidence
+        deadline = time.monotonic() + self._startup_grace_s
+        while self._inconclusive(st, record, draw_device):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self._poll_interval_s)
+            try:
+                fresh = endpoint.request({"command": "status", "id": _new_id()})
+            except PumpError:
+                break
+            if not isinstance(fresh, dict) or not fresh.get("ok", False):
+                break
+            st = fresh
+            if st.get("operation_active", False):
+                # A *new* operation has started underneath us. Nothing further
+                # this call reads would be about the one it was waiting for.
+                break
+        return st
+
+    @staticmethod
+    def _operation_begun(st, draw_device):
+        """Has the dashboard said anything at all about this operation yet?
+
+        Any of: a Status line in the operation report, or -- for a per-device
+        op like a draw -- a status on the device itself. Only when there is
+        none of that is an idle reading taken as "not started"; an operation
+        that finished so fast the poll missed it running still has its result
+        sitting there to be read, and must not be waited on.
+        """
+        if _status_text(st.get("operation")):
+            return True
+        if draw_device is None:
+            return False
+        device = next((p for p in st.get("pumps", [])
+                       if p.get("device") == draw_device), {})
+        return bool(str(device.get("status") or "").strip())
+
+    @staticmethod
+    def _inconclusive(st, record, draw_device):
+        if draw_device is not None:
+            device = next((p for p in st.get("pumps", [])
+                           if p.get("device") == draw_device), {})
+            status = str(device.get("status") or "").strip().upper()
+            if status.startswith(("COMPLETE", "ERROR", "FAIL", "STOP",
+                                  "CANCEL", "ABORT")):
+                return False        # the device has said something definite
+            return True
+        return record is not None and _mix_completion(st.get("operation")) == "unknown"

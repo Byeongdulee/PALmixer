@@ -13,9 +13,12 @@ def test_cleanup_waits_for_both_background_operations_and_parking():
         clean_mixer=lambda: run(mixer)), None)
     assert not workflow.cleanup_snapshot()["wash_complete"]
     workflow._start_background_pump_op("clean_mixer")
-    mixer_thread = workflow._background_pump[1]
+    mixer_thread = workflow._background_pumps["clean_mixer"]
     workflow._start_background_pump_op("wash_flowcell")
-    wash_thread = workflow._background_pump[1]
+    wash_thread = workflow._background_pumps["wash_flowcell"]
+    # Both are tracked at once. They run on different pump servers and are
+    # meant to overlap, so the second must not displace the first.
+    assert set(workflow._background_pump_threads()) == {"clean_mixer", "wash_flowcell"}
     workflow._step("park_at_transfer_point", lambda: "parked")
     assert workflow.cleanup_snapshot()["parked"] and workflow.cleanup_snapshot()["active"]
     wash.set()
@@ -31,7 +34,7 @@ def test_cleanup_waits_for_both_background_operations_and_parking():
 def test_failed_background_wash_is_retained_after_thread_exits_and_restart_is_unknown():
     workflow = Workflows(None, None, SimpleNamespace(wash_flowcell=lambda: (False, "pump lost")), None)
     workflow._start_background_pump_op("wash_flowcell")
-    workflow._background_pump[1].join(3)
+    workflow._background_pumps["wash_flowcell"].join(3)
     workflow._step("park_at_transfer_point", lambda: "parked")
     snapshot = workflow.cleanup_snapshot()
     assert "pump lost" in snapshot["problem"] and not snapshot["wash_complete"]

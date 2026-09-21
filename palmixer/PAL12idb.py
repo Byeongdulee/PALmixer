@@ -590,8 +590,71 @@ def reset_gripper_activation():
     _gripper_activated_on = None
 
 
-def pickup(robot, height = needle_clear_height):
-    robot.release()
+#: Robotiq position counts, 0 fully open and 255 fully closed. Fixed by the
+#: gripper's protocol, not a preference.
+GRIPPER_OPEN_COUNT = 0
+GRIPPER_CLOSED_COUNT = 255
+
+
+def cleaning_station_open_extra():
+    """How much wider than release() to open before a flowcell cleaning
+    station pickup. Read live, so it can be retuned without a restart."""
+    return float(_config.get_section('gripper').get(
+        'cleaning_station_open_extra_m', 0.0) or 0.0)
+
+
+def pickup_open_count(extra_m=None):
+    """The gripper count to descend at, `extra_m` wider than robot.release().
+
+    The Hand-E takes a position count and reports nothing back, so "wider than
+    the current opening" cannot be measured -- it is computed from the opening
+    robUR.release() commands (`gripper.release_count`) and the finger travel
+    per count (`gripper.stroke_m` / 255).
+
+    Returns None when no widening is asked for, meaning "just call release()".
+    Clamped to fully open: asking for more travel than the gripper has is a
+    number being wrong, not a reason to refuse to pick the flowcell up.
+    """
+    section = _config.get_section('gripper')
+    if extra_m is None:
+        extra_m = float(section.get('cleaning_station_open_extra_m', 0.0) or 0.0)
+    if extra_m <= 0:
+        return None
+    stroke_m = float(section.get('stroke_m', 0.05) or 0.05)
+    release_count = float(section.get('release_count', 120))
+    counts_per_m = GRIPPER_CLOSED_COUNT / stroke_m
+    return int(max(GRIPPER_OPEN_COUNT,
+                   min(GRIPPER_CLOSED_COUNT,
+                       round(release_count - extra_m * counts_per_m))))
+
+
+def open_gripper(robot, extra_m=None):
+    """Open the gripper, optionally `extra_m` wider than robot.release().
+
+    Falls back to a plain release() when there is no widening to do, or when
+    the robot object exposes no way to command a raw count -- a simulated or
+    older robot should still open its gripper, just not by a tuned amount.
+    """
+    count = pickup_open_count(extra_m)
+    gripper = getattr(robot, 'gripper', None)
+    action = getattr(gripper, 'gripper_action', None)
+    if count is None or action is None:
+        robot.release()
+        return None
+    action(count)
+    return count
+
+
+def pickup(robot, height = needle_clear_height, open_extra_m = 0.0):
+    """Descend, close on the piece, and lift clear.
+
+    `open_extra_m` opens the fingers that much wider than release() does
+    before descending. Used when dropping onto the flowcell cleaning station,
+    where the fingers pass down either side of a flowcell standing in a deep
+    seat and a wider gap is the difference between clearing it and nudging it.
+    Zero everywhere else, which is the original release()-and-descend.
+    """
+    open_gripper(robot, open_extra_m)
     # cm go deeper from the standard height
     robot.mvr2z(-grab_depth-distance_gripper_tag)
     robot.grab()
@@ -722,7 +785,11 @@ def transport2sampletable(robot, p1, height = needle_clear_height,
         move_to_cleaningstation(robot, p1, via_transferpoint)
     else:
         _move_leg(robot, p1, via_transferpoint)
-    pickup(robot, height=height)
+    # pickup_from_above is only ever set for a flowcell cleaning station (see
+    # the note above), so it doubles as "this is the pickup that wants the
+    # wider opening" -- no second flag saying the same thing twice.
+    pickup(robot, height=height,
+           open_extra_m=cleaning_station_open_extra() if pickup_from_above else 0.0)
     p2 = list(get_sampletable_position())
     p2[2] = p2[2]-distance_gripper_tag+sampletable_clear_height
     _move_leg(robot, p2, via_transferpoint)
@@ -1001,7 +1068,7 @@ def ready_flowcell_to_draw(robot):
     # approached. Not routed through the corridor: this step runs with the arm
     # already on the mixer side, which is the same side the station is on.
     move_to_cleaningstation(robot, cleaning_station, via_transferpoint=False)
-    pickup(robot)
+    pickup(robot, open_extra_m=cleaning_station_open_extra())
     p2 = list(get_sample_on_mixerstation_position())
     p2[2] = p2[2]-distance_gripper_tag+needle_clear_height
     robot.moveto(p2)
@@ -1104,7 +1171,7 @@ def flowcell_to_sample_on_mixer(robot):
     # anywhere, including at the sample table. Down onto the station vertically
     # at the end of the first one.
     move_to_cleaningstation(robot, cleaning_station)
-    pickup(robot)
+    pickup(robot, open_extra_m=cleaning_station_open_extra())
     approach = list(target)
     approach[2] = target[2]-distance_gripper_tag+needle_clear_height
     _move_leg(robot, approach, True)

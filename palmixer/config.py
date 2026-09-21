@@ -82,6 +82,17 @@ _DEFAULTS = {
         },
     },
     "motor": {"pv": "12idb:m6"},
+    # Robotiq Hand-E on the UR3. Its command is a 0-255 position count, 0 fully
+    # open and 255 fully closed, with no read-back -- so an opening in metres
+    # has to be converted, and "the current opening" has to be known rather
+    # than measured. `stroke_m` is the Hand-E's 50 mm span, and `release_count`
+    # mirrors what robUR.release() commands (UR_12idb common/robUR.py); if that
+    # is ever retuned, this has to follow or the widening below starts from the
+    # wrong baseline. `cleaning_station_open_extra_m` is how much wider than
+    # that the fingers are opened before dropping onto the flowcell cleaning
+    # station to pick the flowcell up -- see PAL12idb.pickup_open_count.
+    "gripper": {"stroke_m": 0.05, "release_count": 120,
+                "cleaning_station_open_extra_m": 0.02},
     # `step` is degrees of rotation between adjacent slots -- 12.m6 is a rotary
     # stage, so its engineering units and the carousel's angular pitch are the
     # same number. PVapp's "CRS" holder type describes the same hardware
@@ -95,7 +106,8 @@ _DEFAULTS = {
     "pump": {"mixing_speed_rpm": 800.0, "min_rpm": 0.0, "max_rpm": 3000.0,
              "host": "sec12b02.xray.aps.anl.gov", "mixer_port": 5555, "flowcell_port": 5556,
              "request_timeout_s": 5.0, "poll_interval_s": 0.5,
-             "operation_timeout_s": 600.0},
+             "operation_timeout_s": 600.0,
+             "startup_grace_s": 10.0},
     # ZMQ endpoint of the beamline DAQ GUI -- a different server from this
     # package's own "zmq" section above. Its getpos/move/status commands read
     # and drive the sample-stage motors, which is a separate control system

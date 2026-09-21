@@ -145,10 +145,11 @@ TRANSPORT_FUNCTIONS = (
     "flowcell_to_sample_on_mixer",
 )
 
-# The two transports that physically move the mixer head. Refused by the
-# server while the head is being washed (Workflows.mixer_head_busy) -- moving
-# it off the cleaning station mid-wash risks spilling the liquid actively
-# flowing through it, damaging the tubing, or fouling the needle alignment.
+# The two transports that physically move the mixer head. Held by the server
+# until a wash in progress finishes (Workflows.await_mixer_wash) rather than
+# refused -- moving the head off the cleaning station mid-wash risks spilling
+# the liquid actively flowing through it, damaging the tubing, or fouling the
+# needle alignment, but the move itself is wanted, just not yet.
 MIXER_HEAD_TRANSPORTS = ("mixer2cleaningstation", "mixer2mixingstation")
 
 TRANSPORT_LABELS = {

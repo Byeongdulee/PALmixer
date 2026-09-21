@@ -27,7 +27,11 @@ class Endpoint:
 
     def request(self, request):
         self.requests.append(deepcopy(request))
-        response = self.replies.pop(0)
+        # The last reply repeats instead of running out. `status` is a
+        # question, not a queue: a real dashboard asked twice in a row answers
+        # the same thing twice, and the wait re-polls an inconclusive reading
+        # rather than trusting a single sample of it.
+        response = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
         if isinstance(response, Exception):
             raise response
         return response
@@ -37,6 +41,9 @@ def driver(terminal="COMPLETE"):
     p = pump.Pump(simulate=True)
     p.simulate = False
     p._poll_interval_s = 0
+    # Short, so the cases that deliberately never produce completion evidence
+    # spend milliseconds in the re-poll window rather than the real 10 s.
+    p._startup_grace_s = 0.05
     p._mixer = Endpoint([
         {"ok": True, "queued": True, "parameters": deepcopy(PARAMETERS)},
         {"ok": True, "operation_active": False,
@@ -256,6 +263,7 @@ def test_flowcell_draw_requires_its_own_success_status(status, ok, monkeypatch):
     p = pump.Pump(simulate=True)
     p.simulate = False
     p._poll_interval_s = 0
+    p._startup_grace_s = 0.05   # "Ready" is not a verdict; it gets re-polled
     monkeypatch.setattr(state, "get_flowcell_in_use", lambda: 1)
     p._flowcell = Endpoint([{"ok": True}, {"ok": True, "operation_active": False,
         "pumps": [{"device": 0, "status": status},
