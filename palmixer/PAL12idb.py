@@ -20,6 +20,11 @@ try:
 except ImportError:
     import config as _config
 
+try:
+    from . import commands as _commands
+except ImportError:
+    import commands as _commands
+
 # Where an AprilTag search stands to start looking -- a camera standoff above
 # each station, not a grab pose. locate_apriltag() drives here first and
 # search_apriltag_by_tilt() then tilts around from here hunting the tag.
@@ -171,6 +176,94 @@ except ImportError:
     DEFAULT_ACCEL = DEFAULT_SPEED = 0.1
 placement_speed = DEFAULT_SPEED / 2
 placement_accel = DEFAULT_ACCEL / 2
+
+# -- protective-stop recovery ------------------------------------------------
+# A protective stop does not arrive as one exception type. The robot raises it
+# two different ways, from two different modules, and a stop that kills a
+# running program surfaces as a third class that merely shares a name with the
+# first:
+#   * common.robUR.RobotException(SafetyStatus(mode)) -- the `if mode > 2` guard
+#     that opens every motion wrapper in robUR, raised *before* anything moves.
+#   * urxe.ursecmon.ProtectiveStopException -- raised mid-move, from the
+#     secondary monitor's wait().
+#   * urx.urrobot.RobotException -- "Robot stopped" / "Goal not reached ...".
+#     A *different class* from robUR's despite the identical name, so catching
+#     one does not catch the other.
+#   * ursecmon.TimeoutException -- a program send that did not land.
+# Collected here so the catch sites read as one thing. Empty tuple when
+# UR_12idb is absent, which makes the isinstance() below simply never match.
+_MOTION_FAULTS = ()
+for _mod, _name in (('common.robUR', 'RobotException'),
+                    ('urxe.ursecmon', 'ProtectiveStopException'),
+                    ('urxe.ursecmon', 'TimeoutException'),
+                    ('urx.urrobot', 'RobotException')):
+    try:
+        _exc = getattr(__import__(_mod, fromlist=[_name]), _name)
+    except Exception:                      # noqa: BLE001 - absent is fine
+        continue
+    if isinstance(_exc, type) and issubclass(_exc, BaseException):
+        _MOTION_FAULTS = _MOTION_FAULTS + (_exc,)
+
+# How far above a seat the recovery search stands to look for its AprilTag.
+# The taught pose with this added to Z, at the taught orientation -- not
+# search_reference(), which is a tuned camera standoff for a teach. Recovery is
+# already at the seat when it starts, so this is a straight lift off it.
+#
+# 100 mm, not the 200 mm first tried. The tag sits distance_gripper_tag (50 mm)
+# below the taught pose, so this leaves the camera ~0.15 m off it -- close to
+# the standoffs the search_refs poses use, and within reach of the 12 mm
+# flowcell tags. At 200 mm the camera stood ~0.25 m off, further out than any
+# tuned reference, and a 12 mm tag may not resolve from there. Being nearer
+# than the 0.2 m working standoff costs nothing: descend_to_apriltag steps
+# either way (step = measured - distance), so it simply backs off to it.
+RECOVERY_SEARCH_LIFT = 0.10
+# The lift between re-grabbing a mis-seated piece and setting it back down, so
+# the second attempt comes down onto the seat instead of dragging across it.
+RECOVERY_RESEAT_LIFT = 0.05
+# Where the arm retreats to when recovery has given up, before the operator is
+# asked to come and look. Enough to be clear of the seat, small enough not to
+# be a move of its own.
+RECOVERY_ABORT_LIFT = 0.10
+
+
+class ProtectiveStopUnrecovered(RuntimeError):
+    """A protective stop that recovery could not get past.
+
+    Raised only after the arm has been put somewhere safe (gripper released
+    where that is wanted, lifted clear). Carries
+    commands.PROTECTIVE_STOP_UNRECOVERED at the front of its message, which is
+    what makes the GUI raise a dialog rather than only colouring a banner.
+    """
+
+
+def _is_protective_stop(robot, exc):
+    """True only if `exc` is a motion fault *and* the robot really is stopped.
+
+    The exception type alone is not enough: robUR raises its RobotException for
+    an unreachable pose and a TCP-set timeout as well, and "recovering" from
+    one of those would unlock nothing and then drive the arm around for no
+    reason. The safety mode is the authority, so it decides; the type only
+    keeps unrelated failures (a lost camera, a bad station name) out.
+    """
+    if _MOTION_FAULTS and not isinstance(exc, _MOTION_FAULTS):
+        return False
+    try:
+        return robot.get_safety_mode() > 2
+    except Exception:                      # noqa: BLE001 - fall back to secmon
+        try:
+            return bool(robot.is_protective_stopped())
+        except Exception:                  # noqa: BLE001 - cannot tell: not one
+            return False
+
+
+def _recoverable_station(station):
+    """Whether `station` has an AprilTag a recovery search could find.
+
+    False for sample_on_mixer_station: its pose is derived from the mixer
+    cleaning station by a fixed offset (see _sample_on_mixer_from), and there
+    is no tag on the seat itself to search for.
+    """
+    return station in APRILTAG_SIZES
 flowcell_ID = state.get_flowcell_in_use()
 from . import capath
 capath.ensure()                 # must precede the epics import: see capath.py
@@ -768,8 +861,246 @@ def dropdown_sampletable(robot):
     return dropdown_at(robot, get_sampletable_position(),
                        acc=placement_accel, vel=placement_speed)
 
+
+# -- protective-stop recovery -------------------------------------------------
+# A protective stop used to end a transport outright: the exception propagated,
+# @_tracks marked the piece's location unknown, and the operator had to unlock
+# the robot by hand and re-teach. These sequences try to get past one on their
+# own, and when they cannot, put the arm somewhere safe and fetch someone.
+#
+# Recovery is scoped to the single pickup or dropdown that failed, never to the
+# transport as a whole. Re-running a transport would be wrong twice over: the
+# recovered pose is deliberately not stored, so the retry would go straight back
+# to the taught pose the stop just disproved; and at a target-end stop the piece
+# is already at the target, so the retry would drive back to p1 and pick up air.
+#
+# One attempt, then stop. A protective stop raised *during* recovery is not
+# recovered again -- whatever tripped it is evidently still there.
+#
+# What locate_apriltag leaves behind matters here, and is not obvious: it ends
+# with put_tcp2camera(), which puts the *gripper tip* where the *camera* was --
+# one camera standoff above the tag -- so its trailing grab() closes on empty
+# air and its bump() only touches the piece and backs off. It returns parked on
+# the reference pose with the fingers closed and empty. That is exactly the
+# state _move_leg() leaves for pickup(), which opens the fingers before
+# descending, so a search composes straight into a pickup.
+
+def _stop_is_cleared(robot):
+    """True if the robot is out of protective stop (safety mode 1 or 2)."""
+    try:
+        return robot.get_safety_mode() <= 2
+    except Exception:                      # noqa: BLE001 - fall back to secmon
+        try:
+            return not robot.is_protective_stopped()
+        except Exception:                  # noqa: BLE001 - cannot tell
+            return False
+
+
+def _release_and_require_clear(robot, station):
+    """robot.release_after_unlock(), then check it actually worked.
+
+    release_after_unlock (robUR.py:711) prints and carries on when the unlock
+    fails, and the release() it then sends is URScript the controller discards
+    while stopped -- so it can return normally having neither cleared the stop
+    nor opened the gripper. Recovery would go on believing the fingers were
+    open when they are still clamped on the piece, so the mode is re-read here
+    and a stop that did not clear ends the attempt.
+    """
+    robot.release_after_unlock()
+    if not _stop_is_cleared(robot):
+        raise RuntimeError("the protective stop did not clear, so the gripper "
+                           "release was discarded by the controller")
+
+
+def _abort_protective_stop(robot, station, reason, release=True):
+    """Put the arm somewhere safe, then raise ProtectiveStopUnrecovered.
+
+    Always raises. `release` opens the gripper first, which is what is wanted
+    at a seat (the piece is on or nearly on it) and, by the operator's choice,
+    mid-travel too. Every step is best-effort and individually reported: this
+    runs *because* something already went wrong, so a failure to lift must not
+    replace the diagnosis with a new one -- but the operator does need to know
+    whether the arm really lifted and whether the fingers really opened.
+    """
+    done = []
+    try:
+        robot.unlock_protective_stop()
+        done.append("cleared the stop" if _stop_is_cleared(robot)
+                    else "could NOT clear the stop")
+    except Exception as e:                 # noqa: BLE001
+        done.append("could NOT clear the stop (%s)" % e)
+    if release:
+        try:
+            robot.release_after_unlock()
+            done.append("opened the gripper" if _stop_is_cleared(robot)
+                        else "gripper release was DISCARDED (still stopped)")
+        except Exception as e:             # noqa: BLE001
+            done.append("could NOT open the gripper (%s)" % e)
+    else:
+        done.append("left the gripper CLOSED -- it may still hold the piece")
+    try:
+        robot.mvr2z(RECOVERY_ABORT_LIFT)
+        done.append("lifted %.2f m" % RECOVERY_ABORT_LIFT)
+    except Exception as e:                 # noqa: BLE001
+        done.append("could NOT lift (%s) -- THE ARM HAS NOT MOVED" % e)
+    raise ProtectiveStopUnrecovered(
+        "%s at %s: %s. The robot then: %s. Check the station and whatever the "
+        "arm was carrying before running anything else."
+        % (_commands.PROTECTIVE_STOP_UNRECOVERED,
+           _commands.STATION_LABELS.get(station, station or "an unnamed position"),
+           reason, "; ".join(done)))
+
+
+def _recovery_search_pose(station):
+    """The taught seat pose lifted RECOVERY_SEARCH_LIFT, orientation kept.
+
+    Not search_reference(): that substitutes a camera standoff and attitude
+    tuned for teaching a station from across the cell. Recovery is already
+    standing on the seat, so this is a straight lift off it and nothing else
+    moves.
+    """
+    above = list(get_station_position(station))
+    above[2] = above[2] + RECOVERY_SEARCH_LIFT
+    return above
+
+
+def _search_seat_again(robot, station):
+    """Stand over `station` and re-find its AprilTag, without storing anything.
+
+    Returns the found pose. store=False is the whole point: a recovery search
+    is a guess made under duress, and letting it overwrite a taught position in
+    waypoints.ini would quietly replace a good teach with it.
+    """
+    above = _recovery_search_pose(station)
+    robot.set_tcp(robot.tcp)               # an aborted search can leave camtcp live
+    robot.moveto(above)                    # at the seat already, so effectively a lift
+    return locate_apriltag(robot, pos=station, ref_pos=above, store=False,
+                           via_transferpoint=False)
+
+
+def _recover_at_start(robot, station, height, open_extra_m = 0.0):
+    """Protective stop while picking up: re-find the seat, then pick up.
+
+    Unlock, stand RECOVERY_SEARCH_LIFT over the taught seat, search for its
+    AprilTag from there, and pick up from the pose that finds. locate_apriltag
+    leaves the arm on that pose with the fingers closed and empty, which is
+    exactly where pickup() expects to begin, so the pickup is the ordinary one.
+    """
+    if not robot.unlock_protective_stop():
+        _abort_protective_stop(robot, station,
+                               "the protective stop would not clear")
+    if not _recoverable_station(station):
+        _abort_protective_stop(
+            robot, station,
+            "it carries no AprilTag, so there is nothing to search for")
+    print("PAL12idb: recovering at %s -- standing %.2f m over the seat to look "
+          "for its AprilTag." % (station, RECOVERY_SEARCH_LIFT))
+    found = _search_seat_again(robot, station)
+    pickup(robot, height=height, open_extra_m=open_extra_m)
+    return found
+
+
+def _recover_at_target(robot, station, station_pos, place):
+    """Protective stop while setting down: let go, re-find the piece, re-seat it.
+
+    Unlock and open the gripper (the piece is at or nearly at its seat), back
+    off RECOVERY_SEARCH_LIFT, and search for the tag from over the taught seat.
+    Then pick the piece back up, lift RECOVERY_RESEAT_LIFT, and set it down at
+    the *taught* pose -- so the second attempt lands where the first was aiming
+    rather than wherever the stop left things.
+
+    `place` is the station's own set-down, passed in so the retry uses it too:
+    the sample table is placed at half speed and the deep seats are placed by
+    feel, and a recovery that fell back to a plain dropdown() would set the
+    piece down differently from the way that station is meant to be.
+    """
+    _release_and_require_clear(robot, station)
+    robot.mvr2z(RECOVERY_SEARCH_LIFT)
+    if not _recoverable_station(station):
+        _abort_protective_stop(
+            robot, station,
+            "it carries no AprilTag, so there is nothing to search for")
+    print("PAL12idb: recovering at %s -- released, backed off %.2f m, looking "
+          "for the AprilTag again." % (station, RECOVERY_SEARCH_LIFT))
+    _search_seat_again(robot, station)
+    pickup(robot, height=RECOVERY_RESEAT_LIFT)
+    place()
+
+
+def _pickup_recovering(robot, station, height, open_extra_m = 0.0):
+    """pickup(), recovering once from a protective stop at the seat.
+
+    With `station` None -- a call site that has not been told which seat it is
+    working on -- this is exactly pickup(), so an unconverted caller keeps
+    today's fail-fast behaviour rather than recovering against a seat nobody
+    named.
+    """
+    try:
+        pickup(robot, height=height, open_extra_m=open_extra_m)
+    except Exception as e:
+        if station is None or not _is_protective_stop(robot, e):
+            raise
+        print("PAL12idb: protective stop picking up at %s (%s); recovering."
+              % (station, e))
+        try:
+            _recover_at_start(robot, station, height, open_extra_m)
+        except ProtectiveStopUnrecovered:
+            raise
+        except Exception as e2:            # noqa: BLE001 - one attempt only
+            _abort_protective_stop(robot, station, "recovery failed: %s" % e2)
+
+
+def _dropdown_recovering(robot, station, station_pos,
+                         height = needle_clear_height, by_bump = False,
+                         place = None):
+    """Set down at `station`, recovering once from a protective stop there.
+
+    `place` overrides how: transport2sampletable places at half speed via
+    dropdown_sampletable(), and the recovery has to re-place the same way.
+    Defaults to the ordinary dropdown().
+    """
+    if place is None:
+        def place():
+            dropdown(robot, height=height, station_pos=station_pos,
+                     by_bump=by_bump)
+    try:
+        place()
+    except Exception as e:
+        if station is None or not _is_protective_stop(robot, e):
+            raise
+        print("PAL12idb: protective stop setting down at %s (%s); recovering."
+              % (station, e))
+        try:
+            _recover_at_target(robot, station, station_pos, place)
+        except ProtectiveStopUnrecovered:
+            raise
+        except Exception as e2:            # noqa: BLE001 - one attempt only
+            _abort_protective_stop(robot, station, "recovery failed: %s" % e2)
+
+
+def _move_leg_recovering(robot, target, via_transferpoint, station = None):
+    """_move_leg(), abandoning safely on a protective stop in mid-travel.
+
+    No search here: a stop between seats leaves the arm somewhere with no tag
+    to re-find and no seat to re-measure against, so there is nothing to
+    recover to. The arm is released and lifted clear and the operator called.
+    Releasing drops whatever is being carried -- chosen deliberately over
+    leaving a stalled arm holding a piece out over the cell.
+    """
+    try:
+        _move_leg(robot, target, via_transferpoint)
+    except Exception as e:
+        if not _is_protective_stop(robot, e):
+            raise
+        _abort_protective_stop(
+            robot, station,
+            "protective stop in mid-travel, with no seat to re-measure "
+            "against (%s)" % e)
+
+
 def transport2sampletable(robot, p1, height = needle_clear_height,
-                          via_transferpoint = False, pickup_from_above = False):
+                          via_transferpoint = False, pickup_from_above = False,
+                          p1_station = None):
     # transport() specialized to the sample table as the destination: the drop
     # is dropdown_sampletable() rather than the bump-for-contact dropdown(),
     # and the destination comes from the taught sample table position rather
@@ -780,20 +1111,34 @@ def transport2sampletable(robot, p1, height = needle_clear_height,
     # pickup_from_above drops onto p1 vertically at the end of the first leg
     # instead of arriving on it directly; see move_to_cleaningstation, which is
     # the only p1 that wants it.
+    #
+    # `p1_station` names the seat picked up from, so a protective stop there can
+    # be recovered. The destination is always the sample table, so that end
+    # names itself.
     activate_gripper(robot)
-    if pickup_from_above:
-        move_to_cleaningstation(robot, p1, via_transferpoint)
-    else:
-        _move_leg(robot, p1, via_transferpoint)
+    try:
+        if pickup_from_above:
+            move_to_cleaningstation(robot, p1, via_transferpoint)
+        else:
+            _move_leg(robot, p1, via_transferpoint)
+    except Exception as e:
+        if not _is_protective_stop(robot, e):
+            raise
+        _abort_protective_stop(
+            robot, p1_station,
+            "protective stop on the approach, before anything was picked "
+            "up (%s)" % e)
     # pickup_from_above is only ever set for a flowcell cleaning station (see
     # the note above), so it doubles as "this is the pickup that wants the
     # wider opening" -- no second flag saying the same thing twice.
-    pickup(robot, height=height,
-           open_extra_m=cleaning_station_open_extra() if pickup_from_above else 0.0)
+    _pickup_recovering(
+        robot, p1_station, height=height,
+        open_extra_m=cleaning_station_open_extra() if pickup_from_above else 0.0)
     p2 = list(get_sampletable_position())
     p2[2] = p2[2]-distance_gripper_tag+sampletable_clear_height
-    _move_leg(robot, p2, via_transferpoint)
-    dropdown_sampletable(robot)
+    _move_leg_recovering(robot, p2, via_transferpoint, 'sample_table')
+    _dropdown_recovering(robot, 'sample_table', get_sampletable_position(),
+                         place=lambda: dropdown_sampletable(robot))
 
 def test_pickup(robot, height=needle_clear_height):
     pickup(robot, height=height)
@@ -884,7 +1229,8 @@ def move_to_cleaningstation(robot, cleaning_station, via_transferpoint = True):
     robot.moveto(target)
 
 def transport(robot, p1, p2, height = needle_clear_height, drop_height = None,
-              via_transferpoint = False, drop_by_bump = False):
+              via_transferpoint = False, drop_by_bump = False,
+              p1_station = None, p2_station = None):
     # picking up the flowcell at p1 and dropping it at p2. The robot is assumed to be empty.
     # assuming robot is empty
     # `drop_height` is the clearance held over p2, and defaults to `height`.
@@ -897,22 +1243,29 @@ def transport(robot, p1, p2, height = needle_clear_height, drop_height = None,
     # is only the last few millimetres that differ.
     if drop_height is None:
         drop_height = height
+    #
+    # `p1_station` / `p2_station` name the two seats, which is what lets a
+    # protective stop at either end be recovered from (the recovery has to know
+    # which AprilTag to look for and which taught pose to stand over). Left
+    # None, the wrappers below are exactly pickup()/dropdown()/_move_leg() and
+    # nothing recovers -- so an un-named caller keeps today's fail-fast
+    # behaviour instead of recovering against a seat nobody identified.
     activate_gripper(robot)
-    _move_leg(robot, p1, via_transferpoint)
+    _move_leg_recovering(robot, p1, via_transferpoint, p1_station)
     # `height` has to reach pickup()/dropdown() too, not just the travel Z
     # below: the mixer head only needs to clear its post by mixer_height, and
     # lifting it the full needle_clear_height instead swings it far higher
     # than the move requires.
-    pickup(robot, height=height)
+    _pickup_recovering(robot, p1_station, height=height)
     # Z position should be the needle cleared position. Work on a copy: writing
     # p2[2] in place edits the caller's list, so a taught position passed in
     # (sample_table / cleaning_station) would creep upward on every transport.
     p2 = list(p2)
     destination = list(p2)          # the taught pose, before the clearance
     p2[2] = p2[2]-distance_gripper_tag+drop_height
-    _move_leg(robot, p2, via_transferpoint)
-    dropdown(robot, height=drop_height, station_pos=destination,
-             by_bump=drop_by_bump)
+    _move_leg_recovering(robot, p2, via_transferpoint, p2_station)
+    _dropdown_recovering(robot, p2_station, destination, height=drop_height,
+                         by_bump=drop_by_bump)
 # State tracking. Every transport function below is wrapped with @_tracks so
 # that wherever it is called from -- a workflow or a single button on the
 # Experiment tab -- the tracked location is updated the same way. The state
@@ -983,12 +1336,15 @@ def mixer2cleaningstation(robot):
     # Set down by feel: the mixer cleaning station is one of the two seats a
     # computed release Z does not suit (BUMP_RELEASE_STATIONS).
     transport(robot, get_mixerstation_position(), get_mixer_cleaningstation_position(),
-              height=mixer_height, drop_by_bump=True)
+              height=mixer_height, drop_by_bump=True,
+              p1_station='mixer_station', p2_station='mixer_cleaning_station')
 
 # mixer head to the mixer station. The robot is assumed to be empty.
 @_tracks(lambda: state.set_mixer_head, state.MIXER_AT_MIXER)
 def mixer2mixingstation(robot):
-    transport(robot, get_mixer_cleaningstation_position(), get_mixerstation_position(), height=mixer_height)
+    transport(robot, get_mixer_cleaningstation_position(), get_mixerstation_position(),
+              height=mixer_height,
+              p1_station='mixer_cleaning_station', p2_station='mixer_station')
 
 # Bring the flowcell parked at the cleaning station to the beam, ready for data collection. The robot is assumed to be empty.
 # This is for measuring water background. The flowcell is not loaded with sample.
@@ -1012,7 +1368,8 @@ def load_flowcell_from_cleaningstation_to_beam(robot):
         cleaning_station = get_cleaningstation_position(2)
     # cleaning station -> sample table: crosses between the two regions.
     transport2sampletable(robot, cleaning_station, height=needle_clear_height,
-                          via_transferpoint=True, pickup_from_above=True)
+                          via_transferpoint=True, pickup_from_above=True,
+                          p1_station='cleaning_station')
     # The flowcell is seated and the gripper is clear, so the stage is free to
     # go back to where the beam is set up to look -- and it has to happen here,
     # before the background acquisition that follows this call.
@@ -1040,7 +1397,8 @@ def load_flowcell_from_beam_to_cleaningstation(robot):
     # the seat is found rather than computed.
     transport(robot, get_sampletable_position(), cleaning_station,
               height=needle_clear_height, via_transferpoint=True,
-              drop_by_bump=True)
+              drop_by_bump=True,
+              p1_station='sample_table', p2_station='cleaning_station')
     # The flowcell is off the sample table now, so nothing is left for the
     # stage to be aligned to it for; put it back where it was before this
     # function touched it, rather than leaving it parked at the sample table
@@ -1068,7 +1426,8 @@ def ready_flowcell_to_draw(robot):
     # approached. Not routed through the corridor: this step runs with the arm
     # already on the mixer side, which is the same side the station is on.
     move_to_cleaningstation(robot, cleaning_station, via_transferpoint=False)
-    pickup(robot, open_extra_m=cleaning_station_open_extra())
+    _pickup_recovering(robot, 'cleaning_station', height=needle_clear_height,
+                       open_extra_m=cleaning_station_open_extra())
     p2 = list(get_sample_on_mixerstation_position())
     p2[2] = p2[2]-distance_gripper_tag+needle_clear_height
     robot.moveto(p2)
@@ -1088,7 +1447,8 @@ def load_sample_to_beam(robot):
     p2[2] = p2[2]-distance_gripper_tag+sampletable_clear_height
     # mixer station -> sample table: crosses between the two regions.
     move_via_transferpoint(robot, p2)
-    dropdown_sampletable(robot)
+    _dropdown_recovering(robot, 'sample_table', get_sampletable_position(),
+                         place=lambda: dropdown_sampletable(robot))
     # Last step of the load, and the last thing before the campaign acquires:
     # the sample is in the beam only once the stage is back where the beam is.
     _restore_stage(restore_to, 'loading the sample to the beam')
@@ -1115,7 +1475,7 @@ def return_sample(robot):
     # unload_sample this runs straight after mixer2cleaningstation, so the
     # approach can begin at the mixer cleaning station.
     move_via_transferpoint(robot, sample_table_pos)
-    pickup(robot)
+    _pickup_recovering(robot, 'sample_table', height=needle_clear_height)
     # The sample seat, matching ready_flowcell_to_draw: the sample goes back
     # into the vial it was drawn from, and that vial is standing at the seat,
     # not under the mixer head. Aspirating over the mixer station would push it
@@ -1142,7 +1502,8 @@ def wash_flowcell_after_return(robot):
     # By feel, as at the other end of this station's use: where the flowcell is
     # let go is where the seat turns out to be, not a computed height. The
     # taught pose is still passed, for the fast part of the descent.
-    dropdown(robot, station_pos=cleaning_station, by_bump=True)
+    _dropdown_recovering(robot, 'cleaning_station', cleaning_station,
+                         by_bump=True)
 
 # Pick the flowcell up from its cleaning station and hold it over the sample
 # seat on the mixer station, without letting go. The teaching approach for that
@@ -1171,7 +1532,8 @@ def flowcell_to_sample_on_mixer(robot):
     # anywhere, including at the sample table. Down onto the station vertically
     # at the end of the first one.
     move_to_cleaningstation(robot, cleaning_station)
-    pickup(robot, open_extra_m=cleaning_station_open_extra())
+    _pickup_recovering(robot, 'cleaning_station', height=needle_clear_height,
+                       open_extra_m=cleaning_station_open_extra())
     approach = list(target)
     approach[2] = target[2]-distance_gripper_tag+needle_clear_height
     _move_leg(robot, approach, True)
@@ -1492,7 +1854,8 @@ def descend_to_apriltag(robot, distance = apriltag_view_distance, tolerance = 0.
         descended = descended + step
     return measured
 
-def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False):
+def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
+                    ref_pos=None, store=True, via_transferpoint=True):
     # Record the taught position of a station. Returns the pose it found, and
     # also stores it in sample_table / cleaning_station. stop_event, if given,
     # is a threading.Event the caller can set (alongside stopping the robot)
@@ -1505,7 +1868,11 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False):
     # search_reference(). This used to be a per-station constant, which meant
     # a station that physically moved was still searched for where it used to
     # be, and no edit to waypoints.ini could say otherwise.
-    ref_pos = search_reference(pos)
+    # ref_pos lets a caller say where to search from instead. Protective-stop
+    # recovery does: it stands over the seat it just failed at, not at the
+    # tuned teaching standoff (see _recovery_search_pose).
+    if ref_pos is None:
+        ref_pos = search_reference(pos)
     print(f"Looking for {pos} .... (from {[round(v, 4) for v in ref_pos[:3]]})")
     # Tell the camera how big the tag it is about to look at actually is,
     # before anything measures a distance from it. This is read by every
@@ -1527,7 +1894,13 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False):
     # earlier step would otherwise put the camera on the reference pose and the
     # gripper an offset away from it.
     robot.set_tcp(robot.tcp)
-    move_via_transferpoint(robot, list(ref_pos))
+    # via_transferpoint=False for a recovery search: the arm is standing on the
+    # seat it stopped at, so the corridor detour would drag it sideways out of
+    # whatever it is touching before lifting off it.
+    if via_transferpoint:
+        move_via_transferpoint(robot, list(ref_pos))
+    else:
+        robot.moveto(list(ref_pos))
     # One pass. This used to run the search twice, closing in between them, so
     # that the position was recorded from a close-range detection rather than
     # from wherever the first pass happened to stop. The search now arrives
@@ -1581,5 +1954,9 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False):
     robot.set_tcp(robot.tcp)
     p = robot.get_pose()
     v = p.get_pose_vector().tolist()
-    store_station_position(pos, v)
+    # store=False for a recovery search: a position found under duress must not
+    # overwrite a good teach in waypoints.ini. The pose is still returned, so
+    # the caller can use it for the run in hand.
+    if store:
+        store_station_position(pos, v)
     return v

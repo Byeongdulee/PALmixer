@@ -148,6 +148,10 @@ class MainWindow(QMainWindow):
         self.result_label.setWordWrap(False)
         self.result_label.setStyleSheet("padding: 3px;")
         self._last_result_stamp = None
+        # Which failure has already been shown in a dialog, and whether one is
+        # up right now -- see _maybe_alert.
+        self._alerted_key = None
+        self._alert_open = False
         layout.addWidget(self.result_label)
 
         self.log_list = QListWidget()
@@ -237,6 +241,11 @@ class MainWindow(QMainWindow):
                 self._show_result(bool(last_result.get("ok")),
                                   "%s%s" % (last_result.get("action", "?"),
                                             (" -- %s" % detail) if detail else ""))
+                # The no-broker route to the same dialog (see _maybe_alert).
+                if (not last_result.get("ok")
+                        and cmd.is_protective_stop_failure(detail)):
+                    self._maybe_alert(last_result.get("action_id") or stamp,
+                                      "Protective Stop -- Recovery Failed", detail)
         fc_in_use = snapshot.get("flowcell_in_use")
         if fc_in_use is not None:
             self.config_tab.flowcell.set_flowcell_in_use(fc_in_use)
@@ -283,6 +292,13 @@ class MainWindow(QMainWindow):
         # only place the outcome arrives.
         if phase == PHASE_FAILURE:
             self._show_error("%s failed%s" % (action, (" -- %s" % detail) if detail else ""))
+            # A protective stop the robot could not recover from is the one
+            # async failure worth interrupting for: the arm has been put
+            # somewhere safe, but a piece may be loose and the operator has to
+            # go and look before anything else runs.
+            if cmd.is_protective_stop_failure(detail):
+                self._maybe_alert(payload.get("trace") or detail,
+                                  "Protective Stop -- Recovery Failed", detail)
 
     # -- shared helpers ----------------------------------------------------------
     def _set_busy(self, busy):
@@ -328,6 +344,35 @@ class MainWindow(QMainWindow):
 
     def _show_error(self, text):
         self._show_result(False, text)
+
+    def _maybe_alert(self, key, title, text):
+        """Put a failure in front of the operator once, from whichever route
+        reaches it first.
+
+        A transport that fails arrives twice over: on the MQTT motion topic and
+        in the get_state last_result poll. Neither can be dropped -- MQTT is
+        fail-open, so with no broker the poll is the only one that arrives, and
+        the poll only carries the parent action -- so both are wired up and
+        de-duplicated against each other here. `key` is the action's trace id,
+        which the server puts on the motion payload as `trace` and on
+        last_result as `action_id`, so the two routes agree on it.
+
+        _alerted_key is set *before* the dialog goes up, not after: QMessageBox
+        spins its own event loop, so the 3 s status poll keeps firing and lands
+        straight back in here while the box is still open.
+        """
+        if key is not None and key == self._alerted_key:
+            return
+        if self._alert_open:
+            self._log("(another failure while a dialog is open) %s" % text,
+                      QColor("darkred"))
+            return
+        self._alerted_key = key
+        self._alert_open = True
+        try:
+            QMessageBox.critical(self, title, text)
+        finally:
+            self._alert_open = False
 
     def _clear_result(self):
         # Left visible with empty text, not hidden -- see the comment where

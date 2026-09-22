@@ -320,6 +320,25 @@ WHAT_FLOWCELL_2 = _state.WHAT_FLOWCELL_2
 # decide whether to pop up a dialog instead of just logging it).
 POSITION_NOT_CONFIGURED = "position not configured"
 
+# Marker prefix on the failure detail of a transport that hit a protective stop
+# and could not be recovered (PAL12idb.ProtectiveStopUnrecovered). Matched by
+# the GUI the same way POSITION_NOT_CONFIGURED is, but on the *async* failure
+# routes -- the MQTT motion topic and the get_state last_result poll -- since a
+# transport fails long after its command was answered with ACCEPTED. The robot
+# has already been put somewhere safe by the time this appears; the dialog is
+# to fetch the operator, not to ask them to catch anything.
+PROTECTIVE_STOP_UNRECOVERED = "protective stop not recovered"
+
+
+def is_protective_stop_failure(detail):
+    """Whether a failure detail carries the unrecovered-protective-stop marker.
+
+    Matched against the raw detail rather than the composed banner text, so it
+    works the same on both async routes (the MQTT motion payload and the
+    get_state last_result), which wrap it differently.
+    """
+    return PROTECTIVE_STOP_UNRECOVERED in str(detail or "")
+
 
 def position_not_configured_error(missing_labels):
     """Build the ERROR detail for a transport/workflow command that needs a
