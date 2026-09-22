@@ -928,8 +928,34 @@ class PALmixerServer:
             time.sleep(0.2)
             what = "simulated gripper release"
         else:
+            # Both activate_gripper() and release() are URScript programs, and
+            # the controller runs none while it is stopped -- so this used to
+            # send two commands into the void and report "gripper released"
+            # anyway. Clear a protective stop first, then release, then look
+            # again: a worker action can afford the ~6 s the hold-off costs,
+            # and a release that did not happen must not be reported as one.
+            mode = self._safety_mode()
+            if mode == 3:
+                print("PALmixerServer: protective stopped; clearing it before "
+                      "opening the gripper.")
+                if not self.rob.unlock_protective_stop():
+                    raise RuntimeError(
+                        "the protective stop would not clear, so the gripper "
+                        "cannot be opened -- clear the cause and try again")
+            elif mode is not None and mode > 2:
+                # A safeguard stop or an e-stop is not ours to release: that is
+                # a door open or a button pressed, and unlocking it from here
+                # would be undoing someone's deliberate safing.
+                raise RuntimeError(
+                    "the robot is in safety mode %d, not a protective stop -- "
+                    "the gripper cannot be opened until that is cleared at the "
+                    "robot" % mode)
             self.PAL12idb.activate_gripper(self.rob)
             self.rob.release()
+            if self._safety_mode() not in (1, 2, None):
+                raise RuntimeError(
+                    "the robot stopped while releasing, so the gripper command "
+                    "was discarded -- clear the cause and try again")
             what = "gripper released"
         # Same bookkeeping and the same wording either way: a simulated run is
         # there to rehearse what the real one reports.
@@ -938,6 +964,23 @@ class PALmixerServer:
             return ("%s; flowcell %d was being held, so its location is now "
                     "unknown -- reconcile it with set_location" % (what, dropped))
         return what
+
+    def _safety_mode(self):
+        """The robot's safety mode, or None if it cannot be read.
+
+        1 NORMAL / 2 REDUCED are the only two in which the controller will run
+        a URScript program; 3 is a protective stop, and 5-11 are safeguard
+        stops, emergency stops, violations and faults. Reads never raise on a
+        stopped robot (they go to the cached secmon dict), but the connection
+        itself can be down, hence the None.
+        """
+        try:
+            return int(self.rob.get_safety_mode())
+        except Exception:                               # noqa: BLE001
+            try:
+                return 3 if self.rob.is_protective_stopped() else 1
+            except Exception:                           # noqa: BLE001
+                return None
 
     @staticmethod
     def _forget_held_flowcell():
@@ -962,7 +1005,12 @@ class PALmixerServer:
         if self.rob is None:
             return "ERROR: no robot connection"
         try:
-            self.rob.unlock_stop()
+            # The dashboard says whether the controller accepted the release;
+            # robUR.unlock_stop() throws that answer away, so it is asked
+            # directly -- the same one-level reach _stop_search makes for
+            # stopj(). Without it a refusal and a release that did not take
+            # hold are indistinguishable, and they need different advice.
+            accepted = bool(self.rob.dashboard.unlock())
         except Exception as e:                          # noqa: BLE001
             return "ERROR: could not unlock the protective stop: %s" % e
         # secmon lags the unlock slightly, so give it a moment before asking.
@@ -971,10 +1019,20 @@ class PALmixerServer:
             still_stopped = self.rob.is_protective_stopped()
         except Exception:                               # noqa: BLE001
             return "OK protective-stop unlock sent (could not read the state back)"
-        if still_stopped:
-            return ("OK protective-stop unlock sent, but the robot still reports "
-                    "one -- clear the cause and press it again")
-        return "OK protective stop cleared"
+        if not still_stopped:
+            return "OK protective stop cleared"
+        if not accepted:
+            # The common case, and the one that used to look like a dead
+            # button: UR refuses to release a protective stop until about 5 s
+            # after it tripped, and this command is answered inline on the
+            # socket thread, so it cannot sit and wait out the hold-off
+            # without also stalling status and stop_search.
+            return ("OK unlock refused by the controller -- it will not release "
+                    "a protective stop until about 5 s after it trips. Wait a "
+                    "moment and press again.")
+        return ("OK protective-stop unlock sent and accepted, but the robot "
+                "still reports a stop -- the cause is probably still there; "
+                "clear it and press again")
 
     def _motor_tweak(self, direction, step):
         if self.simulate:
