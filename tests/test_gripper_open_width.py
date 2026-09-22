@@ -120,13 +120,30 @@ def test_a_robot_with_no_raw_count_api_still_opens_its_gripper():
 
 CLEANING_STATION_PICKUPS = ["ready_flowcell_to_draw", "flowcell_to_sample_on_mixer"]
 
+#: Every way a transport can reach pickup(). _pickup_recovering is the wrapper
+#: that retries once after a protective stop at the seat; it forwards
+#: open_extra_m, so a call through it counts the same as a direct one. Listed
+#: rather than matched on a name pattern, so a new wrapper that quietly drops
+#: the argument shows up as a test failure instead of passing unnoticed.
+PICKUP_CALLS = ("pickup", "_pickup_recovering")
+
 
 def _pickup_kwargs(func):
     tree = ast.parse(inspect.getsource(func).lstrip())
     return [{kw.arg for kw in node.keywords}
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
-            and getattr(node.func, "id", None) == "pickup"]
+            and getattr(node.func, "id", None) in PICKUP_CALLS]
+
+
+def test_the_recovery_wrapper_forwards_the_wider_opening():
+    """_pickup_recovering sits between the transports and pickup(), so if it
+    dropped open_extra_m the widening would vanish with every call site still
+    looking correct."""
+    source = inspect.getsource(PAL12idb._pickup_recovering)
+    assert "open_extra_m" in inspect.signature(PAL12idb._pickup_recovering).parameters
+    assert source.count("open_extra_m=open_extra_m") >= 1, (
+        "_pickup_recovering takes open_extra_m but does not pass it on")
 
 
 @pytest.mark.parametrize("name", CLEANING_STATION_PICKUPS)
