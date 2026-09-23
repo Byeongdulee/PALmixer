@@ -168,6 +168,10 @@ that call. See the docstring in `_winenv.py`.
 | `release_gripper` | worker | Open the gripper where the arm stands. Refused while busy, so it cannot be pressed mid-carry; a flowcell the tracking says was in the gripper is set to `unknown`, since after this it is wherever it fell. The Experiment tab's **Release Gripper** button, behind a confirmation |
 | `unlock_stop` | fast | Clear the robot's protective stop (`robUR.unlock_stop`). Fast and ungated by the busy flag: a protective stop happens *during* a move, and the action it interrupted may still be holding the server busy. It reaches the robot over the dashboard socket, not the motion one, so a wedged move does not block it. Reads the state back and says whether the stop actually cleared. The Experiment tab's **Unlock Protective Stop** button, which stays enabled while BUSY |
 | `goto_transfer_point` | worker | Move to the fixed corridor pose every cross-cell leg routes through. Not a taught position, so it needs no configuration and is never refused as unconfigured -- the Configuration tab's **Transfer Point** button, next to the per-station Go To buttons |
+| `tweak_position x\|y\|z <millimetres>` | worker | Jog the arm along a **base** axis, keeping the tool's orientation, so a taught X/Y/Z can be corrected by eye before `set_position_here` records it. Base frame because that is the frame the stored numbers are in: the step is exactly how much the saved value changes. Capped at 50 mm per press (`PAL12idb.MAX_POSITION_TWEAK`), refused before ACCEPTED -- a jog is close-quarters work, and anything bigger is a typo or a wrong unit. The Configuration tab's **Move Robot by Hand** panel |
+| `tweak_orientation x\|y\|z <degrees>` | worker | Rotate the tool about its own axis, in the **tool** frame, so the gripper tip stays put and the wrist swings around it. The opposite frame choice to `tweak_position`, and for the opposite reason. The same **Move Robot by Hand** panel |
+| `set_position_here <station>` | worker | Record the arm's current pose -- X/Y/Z **and** RX/RY/RZ -- as the station's taught position. Both the per-station **Set Current Robot Position As** buttons and the jog panel's **Save Position & Orientation** button |
+| `set_orientation_here <station>` | worker | Replace a station's taught RX/RY/RZ, keeping its X/Y/Z. No GUI button sends this any more (see below); still available over ZMQ for re-teaching a seat angle without disturbing a position that is known good |
 | `push_positions` / `pull_positions` | worker | Sync taught positions with the EPICS waypoint PVs (see below) |
 | `mixer2cleaningstation` etc. (8 names) | worker | Run the matching `PAL12idb` transport function |
 | `motor_tweak forward\|reverse <step>` | worker | Tweak `12idb:m6` by `step` |
@@ -280,6 +284,44 @@ given and the current tracked state: `unload_sample` needs no mixer position
 at all unless `aspirate` was asked for, and even then it only needs the mixer
 cleaning station when the mixer head is sitting at the mixer station and
 therefore has to be parked out of the way first.
+
+### Teaching a seat by hand
+
+The AprilTag search places a station well but cannot always *orient* it: the
+flowcell does not sit level in its cleaning station, and its 12 mm tag is too
+small at any workable standoff for the pose solver to resolve which way it is
+tilted. Centring on the tag stays a reliable 1-2 px measurement, so position
+survives; the seat angle has to be taught by hand.
+
+The Configuration tab's **Move Robot by Hand** panel is one panel for one job
+-- getting the arm onto a seat by eye -- with three rows:
+
+```
+Move:    [1.00 mm ]  [X -][X +]  [Y -][Y +]  [Z -][Z +]
+Rotate:  [1.00 deg]  [RX-][RX+]  [RY-][RY+]  [RZ-][RZ+]
+Save as: [Flowcell Cleaning Station v]  [Save Position & Orientation]
+```
+
+The two jogs keep separate step sizes, because millimetres and degrees are
+different quantities, and **separate frames**, which is the one surprising
+thing here:
+
+- **Position is base frame.** `X +` moves the arm the way the stored `x`
+  increases, so what you watch on camera and what lands in `waypoints.ini`
+  agree, whatever angle the wrist is at.
+- **Orientation is tool frame.** The gripper tip stays put and the wrist swings
+  around it -- so a rotation does not undo the position you just set.
+
+**Save writes the whole pose**, X/Y/Z and RX/RY/RZ together (`set_position_here`
+-> `PAL12idb.record_current_position`). It previously sent
+`set_orientation_here`, which keeps the taught X/Y/Z and replaces only the
+angle -- correct back when the panel could not move the position at all, but
+now it would silently discard half of what was just jogged.
+
+As with the per-station **Set Current Robot Position As** buttons, leave the arm
+where a *search* would leave it: transports descend from the stored pose to
+reach the object, so saving with the gripper already down on the object teaches
+a position that much too low.
 
 ### Gripper opening on a cleaning-station pickup
 

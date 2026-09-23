@@ -63,7 +63,7 @@ class ConfigTab(QWidget):
         layout.addWidget(button_box)
         layout.addWidget(self._build_goto_group())
         layout.addWidget(self._build_teach_group())
-        layout.addWidget(self._build_orientation_group())
+        layout.addWidget(self._build_jog_group())
         layout.addWidget(self._build_sync_group())
         self.setLayout(layout)
 
@@ -152,28 +152,71 @@ class ConfigTab(QWidget):
             return
         self._send_command(cmd.set_position_here_command(station))
 
-    # -- teach an orientation by hand ------------------------------------------
-    def _build_orientation_group(self):
-        """Jog the wrist onto a seat angle and record just that angle.
+    # -- jog the pose by hand, then save it ------------------------------------
+    def _build_jog_group(self):
+        """Jog position and orientation together, and record the result.
 
-        For a station the AprilTag search places well but cannot orient: the
-        flowcell does not sit level in its cleaning station, and its 12 mm tag
-        is too small at any workable standoff for the pose solver to resolve
-        which way it is tilted. Centring on the tag is a 1-2 px measurement and
-        stays reliable, so the taught X/Y/Z is kept and only RX/RY/RZ is
-        replaced. The seat angle is fixed geometry -- this is a once-per-setup
-        job, not part of a teach.
+        One panel rather than two, because they are one job: getting the arm
+        onto a seat by eye. A tilted seat needs both -- rotating the wrist onto
+        the seat angle usually needs the position nudged after it, and the
+        operator was otherwise moving between two boxes to do one thing.
+
+        The two halves keep their own step sizes (mm and degrees) and their own
+        frames, which is the one thing to know about this panel:
+
+        * **Position is base frame.** "+X" moves the arm the way the stored
+          `x` increases, so what is watched on camera and what lands in
+          waypoints.ini agree.
+        * **Orientation is tool frame.** The gripper tip stays where it is and
+          the wrist swings around it, so a rotation does not undo the position
+          just set.
+
+        Saving writes the *whole* pose (see _on_save_pose).
         """
-        box = QGroupBox("Teach Orientation by Hand")
-        layout = QHBoxLayout()
+        box = QGroupBox("Move Robot by Hand")
+        rows = QVBoxLayout()
 
-        layout.addWidget(QLabel("Step:"))
+        # -- position row
+        pos_row = QHBoxLayout()
+        pos_row.addWidget(QLabel("Move:"))
+        self.pos_step_box = QDoubleSpinBox()
+        self.pos_step_box.setDecimals(2)
+        # Upper end matches PAL12idb.MAX_POSITION_TWEAK (50 mm), which the
+        # server enforces independently; the spin box is the convenient limit,
+        # not the safety one.
+        self.pos_step_box.setRange(0.1, 50.0)
+        self.pos_step_box.setValue(1.0)
+        self.pos_step_box.setSingleStep(0.5)
+        self.pos_step_box.setSuffix(" mm")
+        pos_row.addWidget(self.pos_step_box)
+
+        self.pos_buttons = []
+        for axis, sense in zip(cmd.POSITION_AXES,
+                               ("out board / in board", "along / against the X-ray",
+                                "up / down")):
+            for sign, glyph in ((-1.0, "-"), (+1.0, "+")):
+                btn = QPushButton("%s %s" % (axis.upper(), glyph))
+                btn.setToolTip(
+                    "Move the arm %s along the base %s axis (%s), keeping the "
+                    "tool's orientation.\n\nBase frame, so the step shown is "
+                    "exactly how much the saved X/Y/Z changes."
+                    % ("+" if sign > 0 else "-", axis.upper(), sense))
+                btn.clicked.connect(
+                    lambda _checked, a=axis, s=sign: self._on_tweak_position(a, s))
+                pos_row.addWidget(btn)
+                self.pos_buttons.append(btn)
+        pos_row.addStretch(1)
+        rows.addLayout(pos_row)
+
+        # -- orientation row
+        rot_row = QHBoxLayout()
+        rot_row.addWidget(QLabel("Rotate:"))
         self.rot_step_box = QDoubleSpinBox()
         self.rot_step_box.setDecimals(2)
         self.rot_step_box.setRange(0.05, 45.0)
         self.rot_step_box.setValue(1.0)
         self.rot_step_box.setSuffix(" deg")
-        layout.addWidget(self.rot_step_box)
+        rot_row.addWidget(self.rot_step_box)
 
         self.rot_buttons = []
         for axis in cmd.ORIENTATION_AXES:
@@ -181,51 +224,73 @@ class ConfigTab(QWidget):
                 btn = QPushButton("R%s %s" % (axis.upper(), glyph))
                 btn.setToolTip(
                     "Rotate the tool about its own %s axis. The gripper tip "
-                    "stays where it is and the wrist swings around it, so the "
-                    "position the AprilTag search found is not lost."
+                    "stays where it is and the wrist swings around it, so a "
+                    "rotation does not move the position you just set."
                     % axis.upper())
                 btn.clicked.connect(
                     lambda _checked, a=axis, s=sign: self._on_tweak_orientation(a, s))
-                layout.addWidget(btn)
+                rot_row.addWidget(btn)
                 self.rot_buttons.append(btn)
+        rot_row.addStretch(1)
+        rows.addLayout(rot_row)
 
-        layout.addSpacing(12)
-        self.orient_station = QComboBox()
+        # -- save row
+        save_row = QHBoxLayout()
+        save_row.addWidget(QLabel("Save as:"))
+        self.jog_station = QComboBox()
         for station in cmd.TAUGHT_STATIONS:
-            self.orient_station.addItem(cmd.STATION_LABELS[station], station)
-        # Opens on the station this exists for.
-        default = self.orient_station.findData(cmd.STATION_CLEANING_STATION)
+            self.jog_station.addItem(cmd.STATION_LABELS[station], station)
+        # Opens on the station this panel exists for: the one whose seat tilt
+        # the AprilTag search cannot resolve.
+        default = self.jog_station.findData(cmd.STATION_CLEANING_STATION)
         if default >= 0:
-            self.orient_station.setCurrentIndex(default)
-        layout.addWidget(self.orient_station)
+            self.jog_station.setCurrentIndex(default)
+        save_row.addWidget(self.jog_station)
 
-        self.save_orientation_btn = QPushButton("Save Orientation")
-        self.save_orientation_btn.setToolTip(
-            "Give the selected station the tool's current orientation, keeping "
-            "its taught X/Y/Z. The station must already have a taught position.")
-        self.save_orientation_btn.clicked.connect(self._on_save_orientation)
-        layout.addWidget(self.save_orientation_btn)
-        self.rot_buttons.append(self.save_orientation_btn)
+        self.save_pose_btn = QPushButton("Save Position && Orientation")
+        self.save_pose_btn.setToolTip(
+            "Record the arm's current pose -- X/Y/Z and RX/RY/RZ together -- "
+            "as the selected station's taught position, replacing whatever the "
+            "AprilTag search last found.\n\nThe arm must be left where a search "
+            "would leave it: transports descend from the stored pose to reach "
+            "the object, so saving with the gripper already down on the object "
+            "teaches a position that is too low.")
+        self.save_pose_btn.clicked.connect(self._on_save_pose)
+        save_row.addWidget(self.save_pose_btn)
+        save_row.addStretch(1)
+        rows.addLayout(save_row)
 
-        layout.addStretch(1)
-        box.setLayout(layout)
+        box.setLayout(rows)
         return box
+
+    def _on_tweak_position(self, axis, sign):
+        self._send_command(cmd.tweak_position_command(
+            axis, sign * self.pos_step_box.value()))
 
     def _on_tweak_orientation(self, axis, sign):
         self._send_command(cmd.tweak_orientation_command(
             axis, sign * self.rot_step_box.value()))
 
-    def _on_save_orientation(self):
-        station = self.orient_station.currentData()
+    def _on_save_pose(self):
+        """Save the whole pose, not the orientation alone.
+
+        This button used to send set_orientation_here, which keeps the taught
+        X/Y/Z and replaces only RX/RY/RZ -- it predates there being any way to
+        jog the position from the GUI, so position was never the operator's to
+        change here. Now that it is, saving half of what was just jogged would
+        silently throw the other half away. set_position_here records the full
+        pose (PAL12idb.record_current_position), so both survive.
+        """
+        station = self.jog_station.currentData()
         label = cmd.STATION_LABELS[station]
         if QMessageBox.question(
-                self, "Save Orientation",
-                "Give %s the tool's current orientation?\n\n"
-                "Its taught X/Y/Z is kept; only RX/RY/RZ is replaced."
-                % label,
+                self, "Save Position and Orientation",
+                "Record the robot's current pose as %s?\n\n"
+                "Both its position (X/Y/Z) and its orientation (RX/RY/RZ) are "
+                "replaced, and every move to %s uses them." % (label, label),
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
-        self._send_command(cmd.set_orientation_here_command(station))
+        self._send_command(cmd.set_position_here_command(station))
 
     # -- EPICS waypoint sync ---------------------------------------------------
     def _build_sync_group(self):
@@ -256,7 +321,8 @@ class ConfigTab(QWidget):
     def busy_widgets(self):
         """Widgets to disable while the server reports BUSY."""
         return (list(self.station_buttons) + list(self.goto_buttons)
-                + list(self.teach_buttons) + list(self.rot_buttons)
+                + list(self.teach_buttons) + list(self.pos_buttons)
+                + list(self.rot_buttons) + [self.save_pose_btn]
                 + list(self.sync_buttons) + self.flowcell.busy_widgets)
 
     def showEvent(self, event):

@@ -17,6 +17,7 @@ IDLE alone says nothing about success.
     "set_position_here <station>"         -> "OK <pose>" | "ERROR: <reason>"
     "set_orientation_here <station>"      -> "OK <pose>" | "ERROR: <reason>"
     "tweak_orientation x|y|z <degrees>"   -> "ACCEPTED" | "ERROR: <reason>"
+    "tweak_position x|y|z <millimetres>"  -> "ACCEPTED" | "ERROR: <reason>"
     "goto_position <station>"             -> "ACCEPTED" | "ERROR: <reason>"
     "goto_transfer_point"                 -> "ACCEPTED" | "ERROR: <reason>"
     "<transport_name>"                    -> "ACCEPTED" | "ERROR: <reason>"
@@ -109,11 +110,24 @@ SET_POSITION_HERE = "set_position_here"
 # Teach a station's orientation alone, keeping the X/Y/Z the AprilTag search
 # found. For the flowcell cleaning station, where the flowcell does not sit
 # level and its 12 mm tag is too small to resolve the tilt from -- position is
-# measured well there, orientation is not. TWEAK_ORIENTATION is the jog that
-# gets the tool onto the seat angle; SET_ORIENTATION_HERE records it.
+# measured well there, orientation is not.
+#
+# No GUI button sends this any more: the Configuration tab's jog panel can now
+# move the position too, so saving the orientation alone would discard half of
+# what was just jogged, and its save button sends SET_POSITION_HERE instead.
+# Kept in the vocabulary because the operation is still a real one over ZMQ --
+# re-teaching a seat angle without disturbing a position that is known good.
 SET_ORIENTATION_HERE = "set_orientation_here"
 TWEAK_ORIENTATION = "tweak_orientation"
 ORIENTATION_AXES = ("x", "y", "z")
+
+# The position counterpart of TWEAK_ORIENTATION: nudge the arm along a base
+# axis so a taught X/Y/Z can be corrected by eye before SET_POSITION_HERE
+# records it. Base frame, not tool frame, because the numbers being corrected
+# are base frame -- see PAL12idb.tweak_position. There is no
+# "set_position_here for one axis": position is taught whole.
+TWEAK_POSITION = "tweak_position"
+POSITION_AXES = ("x", "y", "z")
 
 # Drive to a station's taught position and stop there, without picking
 # anything up -- the way to check by eye what a search or a manual teach
@@ -377,6 +391,17 @@ def set_orientation_here_command(station):
 def tweak_orientation_command(axis, degrees):
     """Build the wire command to rotate the tool about its own ``axis``."""
     return "%s %s %s" % (TWEAK_ORIENTATION, axis, degrees)
+
+
+def tweak_position_command(axis, millimetres):
+    """Build the wire command to jog the arm along base-frame ``axis``.
+
+    Millimetres on the wire, metres everywhere the robot is driven: the jog is
+    an operator typing a step they can see, and 0.5 reads better than 0.0005
+    both in the GUI and in the status log. PAL12idb.tweak_position takes
+    metres, and server.py does the one conversion.
+    """
+    return "%s %s %s" % (TWEAK_POSITION, axis, millimetres)
 
 
 def goto_position_command(station):

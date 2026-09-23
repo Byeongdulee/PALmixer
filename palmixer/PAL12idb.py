@@ -1660,6 +1660,48 @@ def tweak_orientation(robot, axis, degrees):
         float(degrees), coordinate='tcp')
     return robot.get_pose().get_pose_vector().tolist()
 
+
+POSITION_AXES = ('x', 'y', 'z')
+
+#: Largest single position jog, in metres. A jog is an operator nudging the arm
+#: by eye next to a seat; anything this big is a typo or a wrong unit, and the
+#: arm is usually millimetres from something it must not hit. Enforced here
+#: rather than only in the GUI spin box, because the command is reachable over
+#: ZMQ without going through it.
+MAX_POSITION_TWEAK = 0.05
+
+def tweak_position(robot, axis, metres):
+    """Move the arm `metres` along base-frame `axis`, leaving orientation alone.
+
+    The position counterpart of tweak_orientation, and the jog behind the
+    Configuration tab's position teaching. Deliberately in the **base** frame,
+    not the tool frame the rotation jog uses: what this exists to fine-tune is
+    the X/Y/Z that "Set Current Robot Position As" then writes to
+    waypoints.ini, and those are base-frame numbers. Pressing "+X" moves the
+    arm the same direction as the stored x going up, whatever angle the wrist
+    happens to be at -- so a nudge watched on camera and the number that lands
+    in the file agree.
+
+    Implemented as read-pose / add / moveto rather than a relative move, for
+    the same reason dropdown_at sends a full pose: where the arm ends up does
+    not then depend on the controller's idea of the current frame. Runs at
+    placement speed, half the default -- this is close-quarters work.
+    """
+    axis = str(axis).lower()
+    if axis not in POSITION_AXES:
+        raise ValueError('axis must be one of %s, got %r' % (POSITION_AXES, axis))
+    metres = float(metres)
+    if not abs(metres) <= MAX_POSITION_TWEAK:      # also catches NaN
+        raise ValueError('jog of %.4f m exceeds the %.3f m limit for a single '
+                         'step (MAX_POSITION_TWEAK)' % (metres, MAX_POSITION_TWEAK))
+    # An aborted search can leave the camera TCP live; the jog has to move the
+    # gripper tip, which is the frame the taught positions are expressed in.
+    robot.set_tcp(robot.tcp)
+    target = list(robot.get_pos())
+    target[POSITION_AXES.index(axis)] += metres
+    robot.moveto(target, acc=placement_accel, vel=placement_speed)
+    return list(robot.get_pos())
+
 def goto_station(robot, pos):
     """Move the robot to station `pos`'s taught position, via transfer_point.
 

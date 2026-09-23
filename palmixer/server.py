@@ -548,6 +548,28 @@ class PALmixerServer:
             label = "%s %s %s" % (cmd.TWEAK_ORIENTATION, axis, degrees)
             return (lambda: self._tweak_orientation(axis, degrees)), label
 
+        if name == cmd.TWEAK_POSITION:
+            if len(args) != 2 or args[0].lower() not in cmd.POSITION_AXES:
+                raise ValueError("usage: %s <%s> <millimetres>" % (
+                    cmd.TWEAK_POSITION, "|".join(cmd.POSITION_AXES)))
+            axis = args[0].lower()
+            try:
+                millimetres = float(args[1])
+            except ValueError:
+                raise ValueError("millimetres must be numeric, got %r" % args[1])
+            # Bounded again here, on the synchronous accept path, so an
+            # over-large jog is refused before ACCEPTED rather than failing
+            # once the operator thinks the arm is already moving. PAL12idb
+            # enforces the same limit as the backstop for a direct call.
+            if self.PAL12idb is not None:
+                limit_mm = self.PAL12idb.MAX_POSITION_TWEAK * 1000.0
+                if not abs(millimetres) <= limit_mm:
+                    raise ValueError(
+                        "jog of %g mm exceeds the %g mm single-step limit"
+                        % (millimetres, limit_mm))
+            label = "%s %s %s mm" % (cmd.TWEAK_POSITION, axis, millimetres)
+            return (lambda: self._tweak_position(axis, millimetres)), label
+
         if name == cmd.ZALIGN:
             if args:
                 raise ValueError("%s takes no arguments" % cmd.ZALIGN)
@@ -945,6 +967,15 @@ class PALmixerServer:
             return "simulated %s rotation of %s deg" % (axis, degrees)
         pose = self.PAL12idb.tweak_orientation(self.rob, axis, degrees)
         return "rotated %s by %s deg, now at %s" % (axis, degrees, pose)
+
+    def _tweak_position(self, axis, millimetres):
+        """Jog the arm along a base axis. Same worker path as the orientation
+        tweak: a real move, so it must not run on the reply thread."""
+        if self.simulate:
+            time.sleep(0.3)
+            return "simulated %s jog of %s mm" % (axis, millimetres)
+        pose = self.PAL12idb.tweak_position(self.rob, axis, millimetres / 1000.0)
+        return "moved %s by %s mm, now at %s" % (axis, millimetres, pose)
 
     def _zalign(self):
         """Level the tool Z axis (robUR.Zalign). Runs through the same busy /
