@@ -23,7 +23,8 @@
     "gripper": {
         "stroke_m": 0.05,
         "release_count": 120,
-        "cleaning_station_open_extra_m": 0.02
+        "cleaning_station_open_extra_m": 0.02,
+        "mixer_head_open_extra_m": 0.01
     },
     "carousel": {
         "size": 16,

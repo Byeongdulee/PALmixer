@@ -689,11 +689,28 @@ GRIPPER_OPEN_COUNT = 0
 GRIPPER_CLOSED_COUNT = 255
 
 
+def _open_extra(key):
+    """A `gripper.<key>_open_extra_m` from config, read live so it can be
+    retuned without a restart. 0.0 when absent -- an unset widening means the
+    ordinary release(), not a failure."""
+    return float(_config.get_section('gripper').get(key, 0.0) or 0.0)
+
+
 def cleaning_station_open_extra():
     """How much wider than release() to open before a flowcell cleaning
-    station pickup. Read live, so it can be retuned without a restart."""
-    return float(_config.get_section('gripper').get(
-        'cleaning_station_open_extra_m', 0.0) or 0.0)
+    station pickup. The flowcell stands in a deep seat and the fingers pass
+    down either side of it."""
+    return _open_extra('cleaning_station_open_extra_m')
+
+
+def mixer_head_open_extra():
+    """How much wider than release() to open before taking the mixer head.
+
+    Separate from the flowcell's widening rather than sharing one number: the
+    two are avoiding different obstructions, so a change made for one seat
+    should not silently move the other.
+    """
+    return _open_extra('mixer_head_open_extra_m')
 
 
 def pickup_open_count(extra_m=None):
@@ -1230,7 +1247,7 @@ def move_to_cleaningstation(robot, cleaning_station, via_transferpoint = True):
 
 def transport(robot, p1, p2, height = needle_clear_height, drop_height = None,
               via_transferpoint = False, drop_by_bump = False,
-              p1_station = None, p2_station = None):
+              p1_station = None, p2_station = None, open_extra_m = 0.0):
     # picking up the flowcell at p1 and dropping it at p2. The robot is assumed to be empty.
     # assuming robot is empty
     # `drop_height` is the clearance held over p2, and defaults to `height`.
@@ -1256,7 +1273,14 @@ def transport(robot, p1, p2, height = needle_clear_height, drop_height = None,
     # below: the mixer head only needs to clear its post by mixer_height, and
     # lifting it the full needle_clear_height instead swings it far higher
     # than the move requires.
-    _pickup_recovering(robot, p1_station, height=height)
+    #
+    # `open_extra_m` widens the fingers for the pickup at p1 only. It is the
+    # caller's to set rather than derived from p1_station, because what has to
+    # be cleared is the thing being picked up, not the seat it stands in: the
+    # same station appears as p1 holding the mixer head and as p2 holding
+    # nothing.
+    _pickup_recovering(robot, p1_station, height=height,
+                       open_extra_m=open_extra_m)
     # Z position should be the needle cleared position. Work on a copy: writing
     # p2[2] in place edits the caller's list, so a taught position passed in
     # (sample_table / cleaning_station) would creep upward on every transport.
@@ -1337,14 +1361,16 @@ def mixer2cleaningstation(robot):
     # computed release Z does not suit (BUMP_RELEASE_STATIONS).
     transport(robot, get_mixerstation_position(), get_mixer_cleaningstation_position(),
               height=mixer_height, drop_by_bump=True,
-              p1_station='mixer_station', p2_station='mixer_cleaning_station')
+              p1_station='mixer_station', p2_station='mixer_cleaning_station',
+              open_extra_m=mixer_head_open_extra())
 
 # mixer head to the mixer station. The robot is assumed to be empty.
 @_tracks(lambda: state.set_mixer_head, state.MIXER_AT_MIXER)
 def mixer2mixingstation(robot):
     transport(robot, get_mixer_cleaningstation_position(), get_mixerstation_position(),
               height=mixer_height,
-              p1_station='mixer_cleaning_station', p2_station='mixer_station')
+              p1_station='mixer_cleaning_station', p2_station='mixer_station',
+              open_extra_m=mixer_head_open_extra())
 
 # Bring the flowcell parked at the cleaning station to the beam, ready for data collection. The robot is assumed to be empty.
 # This is for measuring water background. The flowcell is not loaded with sample.

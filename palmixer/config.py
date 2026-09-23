@@ -88,11 +88,14 @@ _DEFAULTS = {
     # than measured. `stroke_m` is the Hand-E's 50 mm span, and `release_count`
     # mirrors what robUR.release() commands (UR_12idb common/robUR.py); if that
     # is ever retuned, this has to follow or the widening below starts from the
-    # wrong baseline. `cleaning_station_open_extra_m` is how much wider than
-    # that the fingers are opened before dropping onto the flowcell cleaning
-    # station to pick the flowcell up -- see PAL12idb.pickup_open_count.
+    # wrong baseline. The two *_open_extra_m are how much wider than that the
+    # fingers open before closing on a particular thing -- see
+    # PAL12idb.pickup_open_count. They differ because the obstructions do: a
+    # flowcell stands in a deep seat the fingers pass either side of, while the
+    # mixer head is a larger body on a post.
     "gripper": {"stroke_m": 0.05, "release_count": 120,
-                "cleaning_station_open_extra_m": 0.02},
+                "cleaning_station_open_extra_m": 0.02,
+                "mixer_head_open_extra_m": 0.01},
     # `step` is degrees of rotation between adjacent slots -- 12.m6 is a rotary
     # stage, so its engineering units and the carousel's angular pitch are the
     # same number. PVapp's "CRS" holder type describes the same hardware

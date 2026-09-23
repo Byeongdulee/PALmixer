@@ -52,9 +52,9 @@ position. See
 [Where an AprilTag search starts looking](#where-an-apriltag-search-starts-looking).
 
 `gripper` converts a finger opening in metres into the Hand-E's 0-255 position
-count, and sets how much wider than normal the fingers open before dropping
-onto the flowcell cleaning station. See
-[Gripper opening on a cleaning-station pickup](#gripper-opening-on-a-cleaning-station-pickup).
+count, and sets how much wider than normal the fingers open for the two grabs
+that need it -- the flowcell off its cleaning station, and the mixer head. See
+[Gripper opening on a pickup](#gripper-opening-on-a-pickup).
 
 `robot.name` **picks the robot12idb class**, not just a label -- `UR3` builds
 `robot12idb.UR3`, `UR5` builds `robot12idb.UR5` (matched case-insensitively).
@@ -323,33 +323,48 @@ where a *search* would leave it: transports descend from the stored pose to
 reach the object, so saving with the gripper already down on the object teaches
 a position that much too low.
 
-### Gripper opening on a cleaning-station pickup
+### Gripper opening on a pickup
 
-Three transports collect the flowcell off its cleaning station --
-`load_flowcell_from_cleaningstation_to_beam`, `ready_flowcell_to_draw` and
-`flowcell_to_sample_on_mixer`. All three come straight down onto the station
-(see `cleaningstation_approach_lift`), which means the fingers pass down either
-side of a flowcell standing in a deep seat. They open **2 cm wider than
-elsewhere** before descending, so a flowcell sitting slightly proud or cocked
-is cleared rather than nudged.
+Two grabs open the fingers wider than usual before closing, because both have
+something to clear on the way in:
+
+- **The flowcell, off its cleaning station** -- `ready_flowcell_to_draw`,
+  `flowcell_to_sample_on_mixer` and `load_flowcell_from_cleaningstation_to_beam`.
+  All three come straight down onto the station (see
+  `cleaningstation_approach_lift`), so the fingers pass down either side of a
+  flowcell standing in a deep seat. **2 cm wider**, so one sitting slightly
+  proud or cocked is cleared rather than nudged.
+- **The mixer head** -- `mixer2cleaningstation` and `mixer2mixingstation`, which
+  pick it up at whichever end they start from. **1 cm wider**: a larger body on
+  a post, not a piece down in a seat, so it needs less.
+
+Everything else -- `return_sample` collecting the flowcell off the sample
+table, the flowcell leg of `load_flowcell_from_beam_to_cleaningstation`, every
+`dropdown`/release -- is untouched and uses plain `release()`.
 
 The Robotiq Hand-E takes a 0-255 position count (0 fully open, 255 fully
-closed) and **reports nothing back**, so "2 cm wider than the current opening"
+closed) and **reports nothing back**, so "wider than the current opening"
 cannot be measured -- it is computed:
 
 | `gripper.*` | default | meaning |
 |---|---|---|
 | `stroke_m` | `0.05` | the Hand-E's 50 mm finger span, i.e. 255 counts |
 | `release_count` | `120` | what `robUR.release()` commands -- the baseline |
-| `cleaning_station_open_extra_m` | `0.02` | how much wider than that |
+| `cleaning_station_open_extra_m` | `0.02` | flowcell off its cleaning station |
+| `mixer_head_open_extra_m` | `0.01` | the mixer head |
 
-which works out as count **18** (46.5 mm) against release()'s count 120
-(26.5 mm). Everything else -- `return_sample` collecting from the sample table,
-every `dropdown`/release -- is untouched and still uses plain `release()`.
+```
+release() baseline         count 120    26.5 mm
+mixer head                 count  69    36.5 mm   (+10 mm)
+flowcell cleaning station  count  18    46.5 mm   (+20 mm)
+```
 
-Two things to know if you retune this. `release_count` **mirrors** a constant
+The two widenings are separate settings rather than one shared number, so
+retuning a flowcell seat cannot silently move the mixer head's grab.
+
+Two things to know if you retune either. `release_count` **mirrors** a constant
 inside `robUR.release()` in the sibling UR_12idb repo; nothing links them, so
-if that is ever changed this has to follow or the widening starts from the
+if that is ever changed this has to follow or both widenings start from the
 wrong baseline. And 46.5 mm leaves only 3.5 mm of the Hand-E's travel in hand
 -- asking for much more than 2 cm silently clamps at fully open rather than
 failing, on the grounds that a wrong number should not strand the flowcell.

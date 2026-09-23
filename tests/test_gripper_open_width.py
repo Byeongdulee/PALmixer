@@ -79,6 +79,21 @@ def test_the_configured_default_is_the_two_centimetres_asked_for():
     assert PAL12idb.pickup_open_count() == PAL12idb.pickup_open_count(0.02)
 
 
+def test_the_mixer_head_opens_one_centimetre_wider():
+    """A smaller widening than the flowcell's: the mixer head is a larger body
+    on a post, not a piece standing in a deep seat."""
+    assert PAL12idb.mixer_head_open_extra() == pytest.approx(0.01)
+    count = PAL12idb.pickup_open_count(PAL12idb.mixer_head_open_extra())
+    widened = opening_mm(count) - opening_mm(RELEASE_COUNT)
+    assert widened == pytest.approx(10.0, abs=0.2)
+
+
+def test_the_two_widenings_are_independent_settings():
+    """Sharing one number would mean retuning a flowcell seat silently moved
+    the mixer head's grab, and vice versa."""
+    assert PAL12idb.mixer_head_open_extra() != PAL12idb.cleaning_station_open_extra()
+
+
 def test_no_widening_means_the_original_release():
     """Zero must not be "open to count 120 by hand" -- it must be the plain
     release() call, so every non-cleaning-station pickup is untouched."""
@@ -152,6 +167,45 @@ def test_cleaning_station_transports_ask_for_the_wider_opening(name):
     assert calls, "%s no longer calls pickup()" % name
     assert all("open_extra_m" in kwargs for kwargs in calls), (
         "%s picks the flowcell up off the cleaning station without widening" % name)
+
+
+MIXER_HEAD_TRANSPORTS = ["mixer2cleaningstation", "mixer2mixingstation"]
+
+
+@pytest.mark.parametrize("name", MIXER_HEAD_TRANSPORTS)
+def test_both_mixer_head_transports_widen_for_the_grab(name):
+    """The head is picked up at p1 in both directions, so both need it."""
+    tree = ast.parse(inspect.getsource(getattr(PAL12idb, name)).lstrip())
+    calls = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call)
+             and getattr(node.func, "id", None) == "transport"]
+    assert calls, "%s no longer calls transport()" % name
+    for call in calls:
+        kwargs = {kw.arg for kw in call.keywords}
+        assert "open_extra_m" in kwargs, (
+            "%s grabs the mixer head without widening" % name)
+
+
+def test_transport_forwards_the_widening_to_the_pickup():
+    """transport() is the wrapper for the mixer head the way
+    _pickup_recovering is for the flowcell: it has to pass the argument on."""
+    assert "open_extra_m" in inspect.signature(PAL12idb.transport).parameters
+    source = " ".join(inspect.getsource(PAL12idb.transport).split())
+    assert "open_extra_m=open_extra_m" in source
+
+
+def test_the_flowcell_leg_through_transport_is_not_widened():
+    """load_flowcell_from_beam_to_cleaningstation also goes through
+    transport(), picking the flowcell off the sample table -- no deep seat and
+    no mixer head, so it keeps the default."""
+    tree = ast.parse(inspect.getsource(
+        PAL12idb.load_flowcell_from_beam_to_cleaningstation).lstrip())
+    calls = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call)
+             and getattr(node.func, "id", None) == "transport"]
+    assert calls
+    for call in calls:
+        assert "open_extra_m" not in {kw.arg for kw in call.keywords}
 
 
 def test_the_sample_table_pickup_is_left_alone():
