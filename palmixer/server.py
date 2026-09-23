@@ -45,6 +45,35 @@ STATE_BUSY = "BUSY"
 PUMP_STATUS_INTERVAL_S = 2.0
 
 
+def _robot_model(robot12idb, name):
+    """The robot12idb class for `robot.name` in the config -- UR3, UR5, ...
+
+    The model is a real difference in tool geometry, not a label: the UR5
+    carries a tool changer, putting its TCP 45 mm further out than the UR3's,
+    and its camera TCP with it. Building the wrong class drives the arm with
+    the other one's offsets, so every taught descent lands 45 mm out. `name`
+    also selects UR_12idb's own ini/<name>.ini, so the two follow each other
+    instead of being configured separately.
+
+    Matched case-insensitively, and an unknown name is refused with the list of
+    models this UR_12idb actually has, rather than falling back to the UR3 --
+    silently driving a UR5 as a UR3 is exactly the failure this exists to stop.
+    """
+    base = getattr(robot12idb, "UR_cam_grip", None)
+    models = {n: cls for n, cls in vars(robot12idb).items()
+              if isinstance(cls, type) and base is not None
+              and issubclass(cls, base) and cls is not base}
+    for model_name, cls in models.items():
+        if model_name.upper() == name.upper():
+            return cls
+    raise ValueError(
+        "robot.name is %r, which is not a robot model in this UR_12idb "
+        "checkout. Available: %s. Set robot.name in "
+        "json/palmixer_config.json to the arm actually connected -- note that "
+        "the models differ in tool geometry, so taught positions do not carry "
+        "between them." % (name, ", ".join(sorted(models)) or "none found"))
+
+
 class PALmixerServer:
     """Wires the ZMQ command server to robot/pump/motor actions, with MQTT status."""
 
@@ -126,13 +155,25 @@ class PALmixerServer:
                                   % (ur12idb_path, e, hint)) from e
             from . import PAL12idb as pal
 
+            # `robot.name` picks the class, not just the ini file. The models
+            # differ in tool geometry -- the UR5 carries a tool changer, so its
+            # TCP sits 45 mm further out than the UR3's -- and driving one
+            # through the other's class puts every descent and every camera
+            # standoff wrong by that much.
+            robot_name = str(cfg["robot"].get("name") or "UR3").strip()
+            robot_class = _robot_model(robot12idb, robot_name)
             # Pass `ip` explicitly so the connection uses *our* config
             # (json/palmixer_config.json, overridable with PALMIXER_ROBOT_IP)
             # instead of UR_12idb's own list_of_robots.json -- that file is
             # a default for other UR_12idb consumers, not a second place
             # this package's robot address has to be kept in sync.
-            self.rob = robot12idb.UR3(name=cfg["robot"].get("name", "UR3"),
-                                       ip=cfg["robot"].get("ip"))
+            self.rob = robot_class(name=robot_name, ip=cfg["robot"].get("ip"))
+            # Printed because taught positions are only valid for the geometry
+            # they were taught on: seeing the wrong TCP here is the cheapest
+            # moment to catch a config pointed at the other arm.
+            print("PALmixerServer: %s at %s, tool TCP %s"
+                  % (robot_name, cfg["robot"].get("ip"),
+                     getattr(robot_class, "tcp", "unknown")))
             self.PAL12idb = pal
         else:
             print("PALmixerServer: --simulate mode, no hardware will be touched.")

@@ -10,8 +10,8 @@
         "beamline": "12idb"
     },
     "robot": {
-        "name": "UR3",
-        "ip": "UR3-12idb.xray.aps.anl.gov",
+        "name": "UR5",
+        "ip": "UR5-12idc.xray.aps.anl.gov",
         "ur12idb_path": {
             "linux": "/home/beams15/S12STAFF/python_codes/UR_12idb",
             "windows": "C:/Users/s12idb/Documents/GitHub/UR_12idb"

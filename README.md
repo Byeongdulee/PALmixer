@@ -56,6 +56,32 @@ count, and sets how much wider than normal the fingers open before dropping
 onto the flowcell cleaning station. See
 [Gripper opening on a cleaning-station pickup](#gripper-opening-on-a-cleaning-station-pickup).
 
+`robot.name` **picks the robot12idb class**, not just a label -- `UR3` builds
+`robot12idb.UR3`, `UR5` builds `robot12idb.UR5` (matched case-insensitively).
+This matters because the models differ in tool geometry: the UR5 carries a
+tool changer, putting its TCP 45 mm further out than the UR3's, and its camera
+TCP with it.
+
+```
+UR3  tool TCP z = 0.150    camera TCP z = 0.015
+UR5  tool TCP z = 0.195    camera TCP z = 0.060
+```
+
+So **taught positions do not carry between arms** -- everything in
+`waypoints.ini` has to be re-taught after a change of `robot.name`, or every
+descent lands 45 mm out. The server prints the model and its TCP on startup,
+which is the cheapest moment to notice a config pointed at the other arm:
+
+```
+PALmixerServer: UR5 at UR5-12idc.xray.aps.anl.gov, tool TCP [0.0, 0.0, 0.195, 0.0, 0.0, 0.0]
+```
+
+A name that is not a model in your UR_12idb checkout is refused at startup,
+listing the ones that are, rather than falling back to the UR3 -- silently
+driving a UR5 as a UR3 is the failure the check exists to prevent. `name` also
+selects UR_12idb's own `ini/<name>.ini`, so the class and that file stay in
+step.
+
 `robot.ur12idb_path` holds one path per operating system, so the same config
 serves the beamline Linux host and the Windows control machine:
 
