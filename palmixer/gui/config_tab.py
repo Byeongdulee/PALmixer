@@ -22,12 +22,12 @@ from .flowcell_selector import FlowcellSelector
 
 
 class ConfigTab(QWidget):
-    def __init__(self, robot_ip, send_command, parent=None):
+    def __init__(self, robot_ip, send_command, query=None, parent=None):
         super().__init__(parent)
         self._send_command = send_command
 
         self.flowcell = FlowcellSelector(send_command)
-        self.camera = CameraWidget(robot_ip)
+        self.camera = CameraWidget(robot_ip, query=query)
 
         button_box = QGroupBox("Search AprilTag")
         button_layout = QHBoxLayout()
@@ -55,11 +55,45 @@ class ConfigTab(QWidget):
             "squaring it to a tilted tag. Use for a seat whose tilt you teach "
             "by hand afterward.")
         button_layout.addWidget(self.skip_roll_check)
+        # Applies to whichever station is searched next, like skip-roll above.
+        # For a station that has moved far enough that its configured
+        # reference no longer looks anywhere near the tag: put the camera over
+        # it by eye -- the view is right here -- and search from there instead.
+        # Nothing is read from waypoints.ini or search_refs, so it also works
+        # when a stored position is wrong in a way that would send the arm
+        # somewhere unhelpful.
+        self.from_current_check = QCheckBox("Start from the current position")
+        self.from_current_check.setToolTip(
+            "Search from where the arm is standing now, instead of first "
+            "driving to the station's configured search reference.\n\n"
+            "The camera must be looking down. If it already is, nothing is "
+            "reoriented and the view does not shift; if it is not, the camera "
+            "is brought face-down first, which moves the arm. Use the Robot "
+            "panel's Camera to TCP button on the Experiment tab to get it "
+            "there yourself beforehand.")
+        button_layout.addWidget(self.from_current_check)
         button_box.setLayout(button_layout)
+
+        # Freeze the calibrated Venton coordinate frame onto the live image. A
+        # checkable toggle, not a one-shot: on press it asks the server to
+        # project the origin + X/Y/Z axes into the current view and holds that
+        # overlay fixed until pressed again (it does not track the arm).
+        self.venton_axes_btn = QPushButton("Show Venton Axes")
+        self.venton_axes_btn.setCheckable(True)
+        self.venton_axes_btn.setToolTip(
+            "Overlay the calibrated Venton table origin and X/Y/Z axes on the "
+            "live image, frozen at the pose you press it from. Press again to "
+            "clear. Run a Venton calibration first.")
+        self.venton_axes_btn.toggled.connect(self._on_toggle_venton_axes)
+
+        overlay_row = QHBoxLayout()
+        overlay_row.addWidget(self.venton_axes_btn)
+        overlay_row.addStretch(1)
 
         layout = QVBoxLayout()
         layout.addWidget(self.flowcell)
         layout.addWidget(self.camera, stretch=1)
+        layout.addLayout(overlay_row)
         layout.addWidget(button_box)
         layout.addWidget(self._build_goto_group())
         layout.addWidget(self._build_teach_group())
@@ -69,7 +103,22 @@ class ConfigTab(QWidget):
 
     def _on_search(self, station):
         self._send_command(cmd.search_apriltag_command(
-            station, skip_roll=self.skip_roll_check.isChecked()))
+            station, skip_roll=self.skip_roll_check.isChecked(),
+            from_current=self.from_current_check.isChecked()))
+
+    def _on_toggle_venton_axes(self, checked):
+        """Turn the frozen Venton axes overlay on or off. On failure to compute
+        it (no calibration yet, robot busy, ...) leave the button off and say
+        why, rather than showing a stale or empty overlay."""
+        ok, message = self.camera.set_venton_axes_visible(checked)
+        if checked and not ok:
+            # Revert without re-firing this handler.
+            self.venton_axes_btn.blockSignals(True)
+            self.venton_axes_btn.setChecked(False)
+            self.venton_axes_btn.blockSignals(False)
+            QMessageBox.warning(self, "Show Venton Axes",
+                                "Could not show the Venton axes:\n\n%s"
+                                % (message or "unknown error"))
 
     # -- go to a taught position -----------------------------------------------
     def _build_goto_group(self):

@@ -26,6 +26,14 @@
         "cleaning_station_open_extra_m": 0.02,
         "mixer_head_open_extra_m": 0.01
     },
+    "charuco": {
+        "dictionary": "DICT_4X4_100",
+        "squares_x": 9,
+        "squares_y": 12,
+        "square_length_m": 0.018,
+        "marker_length_m": 0.014,
+        "min_corners": 8
+    },
     "carousel": {
         "size": 16,
         "step": 1.0,
@@ -56,6 +64,20 @@
         "owner_badge": "",
         "required": false,
         "timeout_s": 10.0
+    },
+    "apriltags": {
+        "flowcell_1": {"id": 1, "size_m": 0.0095},
+        "flowcell_2": {"id": 2, "size_m": 0.0095},
+        "mixer_head": {"id": 25, "size_m": 0.016},
+        "venton_table_a": {"id": 11, "size_m": 0.0315, "table_xy_mm": [544.2, -26.0]},
+        "venton_table_b": {"id": 12, "size_m": 0.0315, "table_xy_mm": [233.5, -28.0]},
+        "venton_table_c": {"id": 13, "size_m": 0.0315, "table_xy_mm": [29.0, -230.0]}
+    },
+    "venton_table_frame": {
+        "origin": "corner of the Venton table",
+        "axes": "parallel to the UR5 base X and Y",
+        "units": "mm",
+        "notes": "table_xy_mm in apriltags.* is measured in this frame. Cross-check: a and b are 310.7 mm apart by these coordinates and 311 mm by tape. The same pair measured through the camera at 31.5 mm / f=810 reads 321.7 mm, i.e. 3.5% high -- the error is in the camera chain, not in the hand measurements."
     },
     "search_refs": {
         "sample_table": [-0.22, -0.37, 0.12, -2.18860535, 2.25379435, 0],

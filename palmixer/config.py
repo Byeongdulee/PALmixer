@@ -82,6 +82,17 @@ _DEFAULTS = {
         },
     },
     "motor": {"pv": "12idb:m6"},
+    # ChArUco board used as the hand-eye calibration target (camtcp). MUST match
+    # the physical board: `dictionary` is an OpenCV aruco dictionary name,
+    # squares_x/_y are the board's columns/rows of chessboard squares, and the
+    # two lengths are in metres (square = full chessboard square, marker = the
+    # aruco marker inside a white square). A wrong square_length_m scales the
+    # pose and corrupts the solve. These are placeholders -- set them to the
+    # board on the bench. See PAL12idb.calibrate_camtcp / calibration.py.
+    "charuco": {"dictionary": "DICT_4X4_100",
+                "squares_x": 9, "squares_y": 12,
+                "square_length_m": 0.018, "marker_length_m": 0.014,
+                "min_corners": 8},
     # Robotiq Hand-E on the UR3. Its command is a 0-255 position count, 0 fully
     # open and 255 fully closed, with no read-back -- so an opening in metres
     # has to be converted, and "the current opening" has to be known rather
@@ -149,6 +160,62 @@ _DEFAULTS = {
     # mixer_station and mixer_cleaning_station start out identical (they sit
     # beside each other and shared one constant before this was config), but
     # they are separate entries and can be given separate poses.
+    # The physical AprilTags, keyed by the thing each one is stuck to rather
+    # than by station: the flowcell carries its tag to every station it
+    # visits, so one station's search looks for a different tag depending on
+    # which flowcell is in use (PAL12idb.APRILTAG_SUBJECT maps the two).
+    #
+    # size_m is the BLACK SQUARE's edge, not the printed sheet. A tag36h11 is
+    # 8 cells of black inside a white quiet zone and the detector means the
+    # black border; measuring the sheet reads ~1.3x high and scales every
+    # distance with it.
+    #
+    # id tells two tags apart -- every tag36h11 looks alike to the detector
+    # and only the number distinguishes them. null means "whichever is nearest
+    # the image center", decided afresh on every frame: fine where one tag at
+    # a time is visible, a hazard where two are, since a search tilts, rolls
+    # and descends over many frames and can change its mind partway through.
+    # Entries nothing searches for are allowed and are inert: survey_* below
+    # are fiducials on the mixer-side table, placed to fix the tags' positions
+    # relative to each other. They are recorded here so their numbers and
+    # sizes are not folklore, and because a future calibration from a couple
+    # of camera motions needs exactly this.
+    #
+    # MEASURED: flowcell_1/2 (9.5 mm with calipers) and the two Venton tags
+    # (31.5 mm, 311 mm apart centre to centre by tape). NOT measured:
+    # sample_table and mixer_head, whose sizes are inherited from the old
+    # hardcoded 12 mm and 16 mm. Those were written the way the flowcell's
+    # 12 mm was -- the printed sheet -- so the mixer head's black square is
+    # probably nearer 12.7 mm, and sample_table's is a guess at the same
+    # 9.5 mm stock as the flowcells. Both want a caliper.
+    "apriltags": {
+        "flowcell_1": {"id": 1, "size_m": 0.0095},
+        "flowcell_2": {"id": 2, "size_m": 0.0095},
+        "mixer_head": {"id": 25, "size_m": 0.016},
+        "venton_table_a": {"id": 11, "size_m": 0.0315,
+                           "table_xy_mm": [544.2, -28.0]},
+        "venton_table_b": {"id": 12, "size_m": 0.0315,
+                           "table_xy_mm": [233.5, -28.0]},
+        # 31.5 mm ASSUMED from the other two -- this one was not calipered.
+        "venton_table_c": {"id": 13, "size_m": 0.0315,
+                           "table_xy_mm": [29.0, -230.0]},
+    },
+    # The frame `table_xy_mm` above is measured in. Recorded as data rather
+    # than left in someone's notebook because the planned calibration -- fix
+    # the tags' real-space relationship from a couple of camera motions --
+    # needs a datum, and "the corner of the table" is only unambiguous while
+    # the person who chose it is standing there.
+    "venton_table_frame": {
+        "origin": "corner of the Venton table",
+        "axes": "parallel to the UR5 base X and Y",
+        "units": "mm",
+        "notes": "table_xy_mm in apriltags.* is measured in this frame. "
+                 "Cross-check: a and b are 310.7 mm apart by these "
+                 "coordinates and 311 mm by tape. The same pair measured "
+                 "through the camera at 31.5 mm / f=810 reads 321.7 mm, i.e. "
+                 "3.5% high -- the error is in the camera chain, not in the "
+                 "hand measurements.",
+    },
     "search_refs": {
         "sample_table": [-0.22, -0.37, 0.12, -2.18860535, 2.25379435, 0],
         "cleaning_station": [0.38, -0.16, -0.1, 2.231, -2.212, 0],

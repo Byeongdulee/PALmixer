@@ -14,6 +14,8 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import QLabel, QSizePolicy
 
+from .. import commands as cmd
+
 CAMERA_URL_TMPL = "http://{ip}:4242/current.jpg?type=color"
 POLL_INTERVAL_MS = 200  # ~5 fps; the camera's own HTTP server is the real limit
 REQUEST_TIMEOUT_S = 1.0
@@ -23,9 +25,13 @@ AT_MIN_MARGIN = 30.0
 class CameraWidget(QLabel):
     """A QLabel that keeps repainting itself with the latest camera frame."""
 
-    def __init__(self, robot_ip, parent=None):
+    def __init__(self, robot_ip, query=None, parent=None):
         super().__init__(parent)
         self.robot_ip = robot_ip
+        # Synchronous "send a command, get the reply string" callable (the app's
+        # ZMQ client). Used only to fetch the Venton axes overlay pixels when the
+        # operator turns the overlay on; None disables that feature.
+        self._query = query
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(320, 240)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -38,6 +44,12 @@ class CameraWidget(QLabel):
         self._detector = None
         self._detector_error = None
         self._tags_seen = 0
+
+        # Frozen Venton axes overlay: pixel positions computed once when the
+        # operator toggles it on, then drawn unchanged until they toggle it off.
+        # Deliberately does not track the arm (see set_venton_axes_visible).
+        self._axes = None
+        self._last_frame_wh = None
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_frame)
@@ -65,8 +77,11 @@ class CameraWidget(QLabel):
         if image is None:
             self.setText("Camera: received unreadable image data")
             return
+        self._last_frame_wh = (image.shape[1], image.shape[0])
 
         self._draw_apriltag_boxes(image)
+        if self._axes:
+            self._draw_venton_axes(image)
         if self._detector_error:
             # On the image rather than in a log nobody is watching: a feed that
             # never boxes a tag is indistinguishable from one pointed at
@@ -151,3 +166,55 @@ class CameraWidget(QLabel):
             cv2.circle(image, (cX, cY), 4, (0, 0, 255), -1)
             cv2.putText(image, "id %d" % detection.tag_id, (corners[0][0][0], corners[0][0][1] - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    # -- Venton axes overlay --------------------------------------------------
+    def set_venton_axes_visible(self, visible):
+        """Freeze (or clear) the Venton coordinate-axes overlay.
+
+        When turned on, the origin and axis-tip pixels are computed ONCE, from
+        the current arm pose, and then drawn unchanged on every later frame --
+        so the overlay marks where the table frame was at the moment it was
+        toggled, and does not chase the camera if the arm later moves. Returns
+        (ok, message); on failure the caller should leave the toggle off and show
+        the message.
+        """
+        if not visible:
+            self._axes = None
+            return True, ""
+        if self._query is None:
+            return False, "no server connection for the overlay"
+        w, h = self._last_frame_wh or (640, 480)
+        try:
+            reply = self._query(cmd.venton_axes_command(w, h), timeout_ms=5000)
+        except Exception as e:                           # noqa: BLE001
+            return False, str(e)
+        if reply.startswith("ERROR"):
+            return False, reply[len("ERROR:"):].strip()
+        import json
+        try:
+            self._axes = json.loads(reply)
+        except Exception as e:                           # noqa: BLE001
+            self._axes = None
+            return False, "unreadable overlay reply: %s" % e
+        return True, ""
+
+    def _draw_venton_axes(self, image):
+        """Draw the frozen Venton origin + X/Y/Z axes on a BGR frame."""
+        import cv2
+
+        a = self._axes
+
+        def px(key):
+            return (int(round(a[key][0])), int(round(a[key][1])))
+
+        origin = px("origin")
+        # BGR: X red, Y green, Z blue -- the usual RGB=XYZ convention.
+        for key, color, lbl in (("x", (0, 0, 255), "X"),
+                                 ("y", (0, 255, 0), "Y"),
+                                 ("z", (255, 0, 0), "Z")):
+            tip = px(key)
+            cv2.arrowedLine(image, origin, tip, color, 2, tipLength=0.2)
+            cv2.putText(image, lbl, tip, cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.circle(image, origin, 5, (0, 0, 255), -1)
+        cv2.putText(image, "(0,0)", (origin[0] + 7, origin[1] - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)

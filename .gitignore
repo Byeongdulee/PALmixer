@@ -16,3 +16,8 @@ palmixer/daq_positions.ini
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# calibration results and overlays -- machine-specific, regenerated on the rig
+json/camera_intrinsics.json
+json/venton_frame.json
+venton_origin_dot.png

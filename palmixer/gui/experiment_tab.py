@@ -60,6 +60,53 @@ class ExperimentTab(QWidget):
         self.zalign_btn.clicked.connect(lambda: self._send_command(cmd.zalign_command()))
         layout.addWidget(self.zalign_btn)
 
+        # Swap which tool frame stands on the current pose. Both translate the
+        # arm by the camera offset without reorienting it, so Camera to TCP
+        # also leaves the camera face-down whenever the tool was -- which is
+        # what the Configuration tab's "Start from the current position"
+        # search needs before it will run without reorienting anything.
+        self.camera_to_tcp_btn = QPushButton("Camera to TCP")
+        self.camera_to_tcp_btn.setToolTip(
+            "Move the camera onto the pose the gripper tip is on now.\n\n"
+            "The arm shifts by the camera offset; nothing rotates. With the "
+            "tool face-down this leaves the camera face-down too, which is "
+            "how you set it up for a \"Start from the current position\" "
+            "AprilTag search.")
+        self.camera_to_tcp_btn.clicked.connect(
+            lambda: self._send_command(cmd.put_camera_to_tcp_command()))
+        layout.addWidget(self.camera_to_tcp_btn)
+        self._all_buttons.append(self.camera_to_tcp_btn)
+
+        self.tcp_to_camera_btn = QPushButton("TCP to Camera")
+        self.tcp_to_camera_btn.setToolTip(
+            "Move the gripper tip onto the pose the camera is on now -- the "
+            "way back from Camera to TCP.\n\n"
+            "Having lined the camera up on something, this brings the tool to "
+            "that same spot.")
+        self.tcp_to_camera_btn.clicked.connect(
+            lambda: self._send_command(cmd.put_tcp_to_camera_command()))
+        layout.addWidget(self.tcp_to_camera_btn)
+        self._all_buttons.append(self.tcp_to_camera_btn)
+
+        # A checkable toggle, not a one-shot: checked pushes the arm into
+        # freedrive, unchecked takes it out. Deliberately left out of
+        # _all_buttons so it stays live while the server is BUSY -- the same
+        # reasoning as the Unlock button below. Turning freedrive *off* is a
+        # recovery that must always work; the server refuses turning it *on*
+        # while busy on its own. `clicked(bool)` fires only on operator clicks
+        # (not on any programmatic setChecked), carrying the new checked state.
+        self.freedrive_btn = QPushButton("Free Drive")
+        self.freedrive_btn.setCheckable(True)
+        self.freedrive_btn.setToolTip(
+            "Release the arm's brakes so you can push it to a pose by hand, "
+            "then press again to stiffen it.\n\n"
+            "Refused while the robot is busy. The controller re-stiffens the "
+            "arm on its own after a while, so if this is left on the robot "
+            "recovers by itself -- press again to sync the button.")
+        self.freedrive_btn.clicked.connect(
+            lambda checked: self._send_command(cmd.freedrive_command(checked)))
+        layout.addWidget(self.freedrive_btn)
+
         self.release_btn = QPushButton("Release Gripper")
         self.release_btn.setToolTip(
             "Open the gripper where the arm is standing.\n\n"

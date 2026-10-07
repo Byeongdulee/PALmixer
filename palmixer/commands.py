@@ -18,12 +18,23 @@ IDLE alone says nothing about success.
     "set_orientation_here <station>"      -> "OK <pose>" | "ERROR: <reason>"
     "tweak_orientation x|y|z <degrees>"   -> "ACCEPTED" | "ERROR: <reason>"
     "tweak_position x|y|z <millimetres>"  -> "ACCEPTED" | "ERROR: <reason>"
+    "put_camera_to_tcp"                   -> "ACCEPTED" | "ERROR: <reason>"
+    "put_tcp_to_camera"                   -> "ACCEPTED" | "ERROR: <reason>"
+    "align_camera_north +x|-x|+y|-y|<deg>"-> "ACCEPTED" | "ERROR: <reason>"
+    "calibrate_venton_table"              -> "ACCEPTED" | "ERROR: <reason>"
+    "calibrate_venton_level [id ...]"     -> "ACCEPTED" | "ERROR: <reason>"
+    "estimate_venton_table"               -> "ACCEPTED" | "ERROR: <reason>"
+    "venton_axes <w> <h> [mm]"            -> "<json pixels>" | "ERROR: <reason>"
+    "measure_venton_tag <id>"             -> "ACCEPTED" | "ERROR: <reason>"
+    "fit_venton_table"                    -> "<frame>" | "ERROR: <reason>"
+    "clear_venton_measurements"           -> "OK ..." | "ERROR: <reason>"
     "goto_position <station>"             -> "ACCEPTED" | "ERROR: <reason>"
     "goto_transfer_point"                 -> "ACCEPTED" | "ERROR: <reason>"
     "<transport_name>"                    -> "ACCEPTED" | "ERROR: <reason>"
     "zalign"                              -> "ACCEPTED" | "ERROR: <reason>"
     "release_gripper"                     -> "ACCEPTED" | "ERROR: <reason>"
     "unlock_stop"                         -> "OK <detail>" | "ERROR: <reason>"
+    "freedrive on|off"                    -> "OK <detail>" | "ERROR: <reason>"
     "motor_tweak forward|reverse <step>"  -> "ACCEPTED" | "ERROR: <reason>"
     "pump <op>"                           -> "ACCEPTED" | "ERROR: <reason>"
     "stop_pump"                           -> "OK <detail>" | "ERROR: <reason>"
@@ -101,6 +112,22 @@ STOP_SEARCH = "stop_search"
 # the recorded orientation differs.
 SKIP_ROLL = "skip_roll"
 
+# Optional trailing flag on search_apriltag. Search from wherever the arm is
+# standing instead of driving to the station's configured reference first --
+# for a station that has moved far enough that the reference no longer looks
+# anywhere near its tag. Nothing is read from waypoints.ini or search_refs, so
+# it also works when a stored position is wrong in a way that would send the
+# arm somewhere unhelpful. Combinable with SKIP_ROLL; order does not matter.
+FROM_CURRENT = "from_current"
+
+# Swap which of the two tool frames is standing on the current pose: move the
+# camera onto the gripper tip's pose, or the tip onto the camera's. Both
+# translate the arm by the camera offset without reorienting it. PUT_CAMERA_TO_TCP
+# is how an operator gets the camera looking down before a FROM_CURRENT search,
+# which will not reorient it for them.
+PUT_CAMERA_TO_TCP = "put_camera_to_tcp"
+PUT_TCP_TO_CAMERA = "put_tcp_to_camera"
+
 # Teach a station from where the robot is standing instead of by searching for
 # its AprilTag -- for a station whose tag is obscured, or one being nudged off
 # a position that is already nearly right. Records exactly what the search
@@ -139,6 +166,63 @@ GOTO_POSITION = "goto_position"
 # taught position at all: nothing to search for, nothing in waypoints.ini, and
 # so nothing for the position pre-check to refuse.
 GOTO_TRANSFER_POINT = "goto_transfer_point"
+
+# Measure the Venton table's surface frame in robot base coordinates by reading
+# the table fiducials (apriltags.venton_table_* with id + table_xy_mm) from the
+# current view. A worker action -- it moves the arm to centre on each tag. The
+# reply carries the fitted frame and the per-tag residual.
+CALIBRATE_VENTON_TABLE = "calibrate_venton_table"
+
+# Move the tool TCP to an absolute base-frame x/y/z (metres), keeping the
+# current orientation. A general positioning move -- e.g. to hover over the
+# Venton origin a calibration just found. Worker action.
+GOTO_XYZ = "goto_xyz"
+
+# Hand-eye calibration of the camera-in-flange transform (camtcp): drive to
+# varied poses, read one tag's pose at each, solve AX=XB. Optional tag id arg
+# (default 13). Reports the solved camtcp for review; does not apply it.
+CALIBRATE_CAMTCP = "calibrate_camtcp"
+
+# Camera intrinsics (focal length + distortion) from ChArUco views at varied
+# poses. Stored and then used by every ChArUco pose, replacing the assumed
+# focal length. Run this BEFORE calibrate_camtcp. No arguments.
+CALIBRATE_CAMERA_INTRINSICS = "calibrate_camera_intrinsics"
+
+# Two-tag Venton calibration: assume the table is LEVEL (surface normal = base
+# +Z) and take the in-plane heading from each tag's own measured orientation,
+# instead of needing three non-collinear tag positions. No motion. Optional
+# trailing tag ids restrict it to those fiducials (e.g. the two currently in
+# view); with none it uses every configured Venton tag it can see. Also drops a
+# red dot on the table origin in a saved camera frame for a visual check.
+CALIBRATE_VENTON_LEVEL = "calibrate_venton_level"
+
+# Quick, no-motion estimate of the same frame: read the fiducials from the
+# current view and fit, without centring or descending. Carries the camera's
+# mount-geometry error, so it is a rough answer (its reply says how rough);
+# calibrate_venton_table is the accurate, moving version.
+ESTIMATE_VENTON_TABLE = "estimate_venton_table"
+
+# Project the last-calibrated Venton frame (origin + X/Y/Z axes) into the
+# current camera view and return the pixel positions, for the GUI to draw the
+# coordinate axes on the live image. Fast and no-motion: it reads the arm pose
+# and projects, computing the overlay once at the moment the operator toggles it
+# on. Args are the width/height of the frame being drawn on (so the camera
+# matrix matches it) and an optional axis length in millimetres (default 50).
+VENTON_AXES = "venton_axes"
+
+# Spin the camera in place so its image-up (north) axis points along a named
+# robot direction (+x/-x/+y/-y, or a bare azimuth in degrees; default +x) -- a
+# setup step that fixes the camera's in-plane heading before a Venton read.
+# Worker action: it moves the wrist.
+ALIGN_CAMERA_NORTH = "align_camera_north"
+CAMERA_DIRECTIONS = ("+x", "-x", "+y", "-y")
+
+# Operator-assisted Venton calibration: the operator jogs the camera over one
+# tag at a time, measure_venton_tag localizes it closed-loop (centre + descend),
+# fit_venton_table fits the frame once three are collected, clear starts over.
+MEASURE_VENTON_TAG = "measure_venton_tag"       # arg: tag id
+FIT_VENTON_TABLE = "fit_venton_table"
+CLEAR_VENTON_MEASUREMENTS = "clear_venton_measurements"
 
 # Explicit sync between waypoints.ini (which every move reads) and the
 # 12idUR:WaypointL:* EPICS PVs (the beamline-wide interchange). These are the
@@ -199,6 +283,17 @@ ZALIGN = "zalign"
 # stuck move does not block it either.
 RELEASE_GRIPPER = "release_gripper"
 UNLOCK_STOP = "unlock_stop"
+
+# Hand-guiding (freedrive): release the arm's brakes so an operator can push it
+# to a pose by hand, then re-stiffen it. A toggle on the Experiment tab's Robot
+# panel. Like UNLOCK_STOP it is answered on the fast path and not gated on the
+# busy flag, so turning freedrive *off* always works -- that is a recovery.
+# Turning it *on* is refused while a worker action is running: letting the
+# brakes go mid-move is dangerous. The controller re-stiffens on its own after a
+# while (see robUR.set_freedrive), so a toggle left on fails safe.
+FREEDRIVE = "freedrive"
+FREEDRIVE_ON = "on"
+FREEDRIVE_OFF = "off"
 
 MOTOR_TWEAK = "motor_tweak"
 MOTOR_FORWARD = "forward"
@@ -361,15 +456,30 @@ def position_not_configured_error(missing_labels):
         POSITION_NOT_CONFIGURED, ", ".join(missing_labels))
 
 
-def search_apriltag_command(station, skip_roll=False):
+def search_apriltag_command(station, skip_roll=False, from_current=False):
     """Build the wire command for searching a station's AprilTag.
 
     ``skip_roll`` appends the SKIP_ROLL flag, keeping the camera level (face
     straight down) instead of rolling it face-down / squaring it to the tag.
+    ``from_current`` appends FROM_CURRENT, searching from where the arm stands
+    rather than driving to the station's configured reference first.
     """
+    parts = [SEARCH_APRILTAG, station]
     if skip_roll:
-        return "%s %s %s" % (SEARCH_APRILTAG, station, SKIP_ROLL)
-    return "%s %s" % (SEARCH_APRILTAG, station)
+        parts.append(SKIP_ROLL)
+    if from_current:
+        parts.append(FROM_CURRENT)
+    return " ".join(parts)
+
+
+def put_camera_to_tcp_command():
+    """Build the wire command to move the camera onto the gripper tip's pose."""
+    return PUT_CAMERA_TO_TCP
+
+
+def put_tcp_to_camera_command():
+    """Build the wire command to move the gripper tip onto the camera's pose."""
+    return PUT_TCP_TO_CAMERA
 
 
 def stop_search_command():
@@ -414,6 +524,80 @@ def goto_transfer_point_command():
     return GOTO_TRANSFER_POINT
 
 
+def calibrate_venton_table_command():
+    """Build the wire command to calibrate the Venton table frame."""
+    return CALIBRATE_VENTON_TABLE
+
+
+def goto_xyz_command(x, y, z):
+    """Build the wire command to move the tool TCP to absolute base x/y/z (m)."""
+    return "%s %s %s %s" % (GOTO_XYZ, x, y, z)
+
+
+def calibrate_camtcp_command(tag_id=13):
+    """Build the wire command to run hand-eye camtcp calibration on `tag_id`."""
+    return "%s %s" % (CALIBRATE_CAMTCP, tag_id)
+
+
+def calibrate_camera_intrinsics_command():
+    """Build the wire command to calibrate camera intrinsics from ChArUco."""
+    return CALIBRATE_CAMERA_INTRINSICS
+
+
+def estimate_venton_table_command():
+    """Build the wire command for the quick no-motion Venton estimate."""
+    return ESTIMATE_VENTON_TABLE
+
+
+def venton_axes_command(width, height, axis_len_mm=None):
+    """Build the wire command for the Venton axes overlay pixels in a
+    ``width`` x ``height`` frame (optionally sized ``axis_len_mm`` long)."""
+    if axis_len_mm is not None:
+        return "%s %d %d %g" % (VENTON_AXES, int(width), int(height), axis_len_mm)
+    return "%s %d %d" % (VENTON_AXES, int(width), int(height))
+
+
+VENTON_HEADING_MODES = ("orientation", "positions")
+
+
+def calibrate_venton_level_command(tag_ids=None, heading=None):
+    """Build the wire command for the level two-tag Venton fit.
+
+    ``tag_ids`` optionally restricts the fit to those fiducials (the two in view,
+    say); omit it to use every configured Venton tag the camera can see.
+    ``heading`` picks where the in-plane yaw comes from: ``"orientation"`` (each
+    tag's own measured pose) or ``"positions"`` (the robust position-only fit);
+    omit it for the server default.
+    """
+    parts = [CALIBRATE_VENTON_LEVEL]
+    if heading:
+        parts.append(heading)
+    if tag_ids:
+        parts.extend(str(int(t)) for t in tag_ids)
+    return " ".join(parts)
+
+
+def align_camera_north_command(direction="+x"):
+    """Build the wire command to point the camera's north axis along `direction`
+    (+x/-x/+y/-y, or an azimuth in degrees)."""
+    return "%s %s" % (ALIGN_CAMERA_NORTH, direction)
+
+
+def measure_venton_tag_command(tag_id):
+    """Build the wire command to closed-loop measure one Venton fiducial."""
+    return "%s %s" % (MEASURE_VENTON_TAG, tag_id)
+
+
+def fit_venton_table_command():
+    """Build the wire command to fit the table frame from collected tags."""
+    return FIT_VENTON_TABLE
+
+
+def clear_venton_measurements_command():
+    """Build the wire command to discard collected Venton measurements."""
+    return CLEAR_VENTON_MEASUREMENTS
+
+
 def push_positions_command():
     """waypoints.ini -> EPICS waypoint PVs."""
     return PUSH_POSITIONS
@@ -437,6 +621,11 @@ def release_gripper_command():
 def unlock_stop_command():
     """Build the wire command to clear the robot's protective stop."""
     return UNLOCK_STOP
+
+
+def freedrive_command(on):
+    """Build the wire command to enter (``on`` true) or leave freedrive mode."""
+    return "%s %s" % (FREEDRIVE, FREEDRIVE_ON if on else FREEDRIVE_OFF)
 
 
 def motor_tweak_command(direction, step):

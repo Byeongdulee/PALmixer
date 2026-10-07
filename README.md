@@ -51,6 +51,11 @@ orientation are used as written, the X/Y coming from the station's taught
 position. See
 [Where an AprilTag search starts looking](#where-an-apriltag-search-starts-looking).
 
+`apriltags` describes the physical tags -- each one's number and its black
+square's edge length -- keyed by the thing it is stuck to rather than by
+station. See
+[Which tag, when more than one is in view](#which-tag-when-more-than-one-is-in-view).
+
 `gripper` converts a finger opening in metres into the Hand-E's 0-255 position
 count, and sets how much wider than normal the fingers open for the two grabs
 that need it -- the flowcell off its cleaning station, and the mixer head. See
@@ -163,11 +168,13 @@ that call. See the docstring in `_winenv.py`.
 | Command | Path | Effect |
 |---|---|---|
 | `status` | fast | `IDLE` or `BUSY` |
-| `search_apriltag <station>` | worker | Locate a station's AprilTag (`sample_table`, `cleaning_station`, `mixer_station`, `mixer_cleaning_station`) and record its position |
-| `stop_search` | fast | Abort an in-progress `search_apriltag`: stops the robot immediately (`stopj`) and signals the search loop to give up rather than continue to the next tilt/step. `ERROR: no AprilTag search is running` if nothing is searching |
+| `search_apriltag <station> [skip_roll] [from_current]` | worker | Locate a station's AprilTag (`sample_table`, `cleaning_station`, `mixer_station`, `mixer_cleaning_station`) and record its position. Both flags are optional and order-free; an unrecognised one is an error rather than being ignored. `from_current` searches from where the arm stands -- see [Where an AprilTag search starts looking](#where-an-apriltag-search-starts-looking) |
+| `stop_search` | fast | Abort an in-progress `search_apriltag`: sets the stop event the search loop polls between tilt/steps, and fires `stopj` to halt the move in flight sooner. The event is what ends the search and is set synchronously; `stopj` is dispatched on a throwaway thread so a stalled controller comms path (`secmon.send_program` waits unbounded) cannot freeze the reply thread and with it every command. `ERROR: no AprilTag search is running` if nothing is searching |
 | `release_gripper` | worker | Open the gripper where the arm stands. Refused while busy, so it cannot be pressed mid-carry; a flowcell the tracking says was in the gripper is set to `unknown`, since after this it is wherever it fell. The Experiment tab's **Release Gripper** button, behind a confirmation |
 | `unlock_stop` | fast | Clear the robot's protective stop (`robUR.unlock_stop`). Fast and ungated by the busy flag: a protective stop happens *during* a move, and the action it interrupted may still be holding the server busy. It reaches the robot over the dashboard socket, not the motion one, so a wedged move does not block it. Reads the state back and says whether the stop actually cleared. The Experiment tab's **Unlock Protective Stop** button, which stays enabled while BUSY |
 | `goto_transfer_point` | worker | Move to the fixed corridor pose every cross-cell leg routes through. Not a taught position, so it needs no configuration and is never refused as unconfigured -- the Configuration tab's **Transfer Point** button, next to the per-station Go To buttons |
+| `calibrate_venton_table` | worker | Measure the Venton table's surface frame in robot base coordinates from the table fiducials in view (`apriltags.venton_table_*`). Centres the camera on each, projects it to a base-frame point, and fits the transform from the known `table_xy_mm` coordinates. The reply gives the frame (origin, X/Y axes, normal), the fit's scale and residual. See [Calibrating the Venton table frame](#calibrating-the-venton-table-frame) |
+| `put_camera_to_tcp` / `put_tcp_to_camera` | worker | Move the camera onto the pose the gripper tip is on, or the tip onto the camera's. Both translate the arm by the camera offset without rotating anything, so with the tool face-down the first leaves the camera face-down too -- which is how you set up for a `from_current` search. The Experiment tab's **Camera to TCP** / **TCP to Camera** buttons |
 | `tweak_position x\|y\|z <millimetres>` | worker | Jog the arm along a **base** axis, keeping the tool's orientation, so a taught X/Y/Z can be corrected by eye before `set_position_here` records it. Base frame because that is the frame the stored numbers are in: the step is exactly how much the saved value changes. Capped at 50 mm per press (`PAL12idb.MAX_POSITION_TWEAK`), refused before ACCEPTED -- a jog is close-quarters work, and anything bigger is a typo or a wrong unit. The Configuration tab's **Move Robot by Hand** panel |
 | `tweak_orientation x\|y\|z <degrees>` | worker | Rotate the tool about its own axis, in the **tool** frame, so the gripper tip stays put and the wrist swings around it. The opposite frame choice to `tweak_position`, and for the opposite reason. The same **Move Robot by Hand** panel |
 | `set_position_here <station>` | worker | Record the arm's current pose -- X/Y/Z **and** RX/RY/RZ -- as the station's taught position. Both the per-station **Set Current Robot Position As** buttons and the jog panel's **Save Position & Orientation** button |
@@ -399,6 +406,185 @@ what these poses were originally written for.
 this was configuration) but are separate keys and can be given separate poses.
 They already differ in practice, since each takes its X/Y from its own taught
 position.
+
+### Calibrating the Venton table frame
+
+The Venton table (the bench carrying the flowcell cleaning station and the
+mixer stations) wears three fiducials whose positions on its surface are known
+by hand measurement -- `apriltags.venton_table_*`, each with a `table_xy_mm`
+in the table's own frame (origin at a corner, axes parallel to the UR5's X/Y;
+see `venton_table_frame`). The calibration turns those into the table's frame
+expressed in robot base coordinates: **origin (table (0,0) in robot x/y/z) plus
+the table's X, Y and surface-normal unit vectors in the robot frame.** The fit
+is `palmixer/calibration.py` (Umeyama least-squares similarity, pure math, no
+robot); three non-collinear tags are the minimum.
+
+**Procedure (kept for reuse):**
+
+1. Jog the camera so **all three tags (11, 12, 13) are in the frame** at once
+   -- the Configuration tab's camera view labels each (`id 11`, ...). The
+   calibration's moves are small (±50 mm) and won't bring a tag in from
+   outside, so all three must be visible to start.
+2. Optionally `align_camera_north +x` (or `+y`/`-y`/`-x`/`<deg>`) to point the
+   camera's image-up axis along a robot axis -- a convenience so the frame
+   reads off the image intuitively; it does not affect the result.
+3. `calibrate_venton_table` -- it sets the TCP to the camera centre (`camtcp`),
+   steps the camera **±50 mm along X, then Y, then Z** (seven poses including
+   the start), reads all three tags open-loop at each, averages, fits, and
+   **returns the camera to the start pose with the gripper TCP (`self.tcp`)
+   active**. The reply gives origin, X/Y/normal, the similarity `scale`, the
+   fit `rmse_mm`, and the per-tag spread across poses.
+   - `estimate_venton_table` is the no-move version: one frame from the current
+     pose, same output. Quick, rougher.
+
+Deliberately **no descent and no large centring move**: descending to a
+standoff drops the tags out of the narrow view, and a large centring move does
+not reliably complete on this controller. The small ±50 mm camera-centre steps
+run cleanly and keep every tag in frame.
+
+**Reading the quality numbers.** The result is an *estimate* -- it carries the
+camera mount-geometry (`camtcp`) error, which shows up two ways: the `scale`
+drifting from 1.0, and the surface **normal tilting off vertical** (a flat
+table should give ~`[0,0,1]`). At a fixed camera pose the estimate is
+repeatable to ~1-2 mm, but because the error is systematic it does **not**
+average down, and the absolute origin shifts if the camera is moved a long way.
+The acceptance test is invariance: measure, move the camera in X/Y/Z, measure
+again; a trustworthy frame holds its origin still and keeps `scale` ~1.0. Until
+the camera's hand-eye (`camtcp`) calibration is corrected, treat the origin as
+good to ~1-2 cm at the pose it was taken from and do not rely on the axis tilt.
+
+An **operator-assisted closed-loop** path also exists for when `camtcp` is
+trustworthy enough to centre+descend reliably: `measure_venton_tag <id>` (jog a
+tag near centre, it localizes that one closed-loop), repeated for each tag, then
+`fit_venton_table`; `clear_venton_measurements` discards the collected set.
+
+All of these **move the robot** (except `estimate`/`fit`/`clear`), so they go
+through the same `get_safety_mode` path every move does and cannot run while the
+realtime interface is down. Every one restores the gripper TCP (`self.tcp`) on
+exit.
+
+#### Which tag, when more than one is in view
+
+Every tag in the tag36h11 family looks alike to the detector; they are told
+apart only by their number, which the Configuration tab's camera view draws
+beside each tag it sees (`id 11`, `id 12`, ...).
+
+With nothing configured, a frame containing several tags resolves to **the one
+nearest the image center** -- decided afresh on every frame. That is correct
+while only one tag can ever be in view, and a hazard once two can: a search
+tilts across a ±10° grid, rolls, descends and re-centres over many frames, and
+can land on a different tag partway through than the one it started on.
+`AT_physical_size` makes it worse, not better -- it is set per *station*
+(12 mm at the flowcell stations, 16 mm at the mixer), so measuring a
+neighbouring tag of the other size gives a wrong distance, not just a wrong
+target.
+
+`apriltags` in `json/palmixer_config.json` pins it. It is keyed by **the thing
+the tag is stuck to**, not by station, because that is what a tag belongs to:
+
+```json
+"apriltags": {
+    "flowcell_1":     {"id": 1,  "size_m": 0.0095},
+    "flowcell_2":     {"id": 2,  "size_m": 0.0095},
+    "mixer_head":     {"id": 25, "size_m": 0.016},
+    "venton_table_a": {"id": 11, "size_m": 0.0315, "station": null},
+    "venton_table_b": {"id": 12, "size_m": 0.0315, "station": null}
+}
+```
+
+Only three things in the cell carry a tag, and there is no entry for the
+sample table because it has none -- what a search sees there is the flowcell
+transferred onto it, wearing the tag it wore at its cleaning station.
+
+Entries nothing searches for are allowed and inert. `venton_table_a` / `_b`
+are fiducials on the Venton table -- the bench carrying the flowcell cleaning
+station and the mixer stations -- placed to fix the tags' positions relative
+to one another; they are 311 mm apart centre to centre. They are recorded so
+their numbers and sizes are not folklore, and because calibrating the set from
+a couple of camera motions needs exactly this.
+
+A station-keyed mapping could not express this cell at all: the flowcell
+carries its tag to every station it visits, so `cleaning_station` looks for
+tag 1 or tag 2 depending on which flowcell is in use, while the mixer head
+carries one tag between *its* two stations.
+`PAL12idb.APRILTAG_SUBJECT` maps station to subject:
+
+| station | looks at |
+|---|---|
+| `sample_table`, `cleaning_station` | `flowcell_1` / `flowcell_2`, by the flowcell in use |
+| `mixer_station`, `mixer_cleaning_station` | `mixer_head` (tag 25) |
+
+So the two flowcell stations look for the *same* tag as each other, and a
+different one depending on which flowcell is in use; the two mixer stations
+share the head's tag whatever the flowcell is doing. Neither pattern is
+expressible by numbering stations.
+
+`id: null` keeps the nearest-the-center behaviour, so there is no need to
+number tags in a part of the cell where only one can be seen. Read live, so a
+tag can be identified and named without restarting the server. A nonsense
+entry is ignored with a warning rather than raised on -- a typo must not break
+a search that worked yesterday.
+
+**`size_m` is the black square's edge, not the printed sheet.** A tag36h11 is
+8 cells of black inside a white quiet zone, and the detector's `tag_size`
+means the black border's outer edge. Distance is measured as
+`size_m / (tag edge in pixels) × focal length`, so this scales every reading
+linearly. Measuring the sheet reads about 1.3× high: the flowcell entry was
+12 mm (the sheet) against a square that calipers at 9.5 mm, which had every
+flowcell-tag distance 26% long and a descent aimed at 0.2 m stopping
+somewhere else.
+
+`flowcell_1`, `flowcell_2` and the two Venton fiducials have been measured.
+**`mixer_head`'s 16 mm has not** -- it is the old hardcoded value, written the
+way the flowcell's 12 mm was. If that was the sheet too, the black square is
+nearer 12.7 mm, which is 43 mm of standoff on every mixer-head search. Worth a
+caliper before trusting it.
+
+Two things changed so the mapping can be discovered and mistakes are legible:
+
+- A successful search prints the tag it actually measured, and the full list
+  when more than one was in frame: `Found mixer_station on AprilTag 11 (tags
+  in view: [11, 12])`. That is how you read off the numbers to configure.
+- A search for a named tag that is **not** in view says so, and names what
+  was: `AprilTag 11 not found within the tilt search range; the tags in view
+  were [12]`. Without this, a wrong `apriltag_ids` entry and an empty frame
+  both read as "no AprilTag found".
+
+In UR_12idb the camera carries `AT_preferred_id` alongside `AT_physical_size`,
+and `decodeAT` falls back to it. Both describe the tag being looked for rather
+than the frame in hand, so neither has to be threaded through every call.
+
+#### Starting from where the arm is
+
+All of the above assumes the stored position is close enough that the search
+reference points the camera somewhere useful. When it is not -- a station that
+has been moved, or whose taught position is wrong in a way that would drive
+the arm somewhere unhelpful -- tick **Start from the current position** in the
+Search AprilTag panel (`from_current` on the wire). Put the camera over the
+tag by eye, the view being right there in the same tab, and search from there.
+Nothing is read from `waypoints.ini` or `search_refs`, and the corridor
+approach is skipped outright.
+
+**The camera has to be looking down.** If it already is, nothing is
+reoriented and the view does not shift at all:
+
+| camera | what happens before the tilt grid |
+|---|---|
+| already face-down | nothing -- no levelling, no reference move, no reframing |
+| not face-down | brought face-down with `put_camera2tcp`, which **moves the arm** by the camera offset |
+
+That second row is the thing to know. `put_camera2tcp` translates the arm
+rather than rotating it, so running it on an already-level camera would drag
+the view ~4 cm off the tag -- the one thing this mode exists to avoid. It is
+still run on a camera that is *not* level, because the tilt grid sweeps only
+±10° about wherever it starts and cannot recover a wrist left at an arbitrary
+angle. To control that yourself, use the Experiment tab's Robot panel:
+**Camera to TCP** puts the camera where the tool is (face-down, if the tool
+is), and **TCP to Camera** is the way back.
+
+This needed a change in the sibling UR_12idb repo:
+`camera_tools.search_apriltag_by_tilt` grew a `from_current` flag, since its
+step 1 unconditionally levelled, drove to the reference, and reframed.
 
 ## Taught positions and the EPICS waypoint PVs
 

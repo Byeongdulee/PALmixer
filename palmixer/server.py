@@ -15,6 +15,7 @@ Run directly:
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -174,6 +175,13 @@ class PALmixerServer:
             print("PALmixerServer: %s at %s, tool TCP %s"
                   % (robot_name, cfg["robot"].get("ip"),
                      getattr(robot_class, "tcp", "unknown")))
+            # Apply calibrated camera intrinsics (if any) so every distance
+            # measurement uses the real focal length, not the assumed one. A
+            # no-op when the camera has never been calibrated.
+            try:
+                pal.apply_camera_intrinsics(self.rob)
+            except Exception as e:
+                print("PALmixerServer: could not apply camera intrinsics: %s" % e)
             self.PAL12idb = pal
         else:
             print("PALmixerServer: --simulate mode, no hardware will be touched.")
@@ -228,10 +236,36 @@ class PALmixerServer:
         if name == cmd.STOP_SEARCH:
             return self._stop_search()
 
+        if name == cmd.FIT_VENTON_TABLE:
+            # Fast: no motion, just fits the points measure_venton_tag has
+            # collected. Answered inline so the operator gets the frame back
+            # without it riding the worker path.
+            if args:
+                return "ERROR: %s takes no arguments" % cmd.FIT_VENTON_TABLE
+            if self.simulate:
+                return "simulated venton fit"
+            try:
+                fit = self.PAL12idb.venton_fit_from_measurements(self._venton_points())
+            except Exception as e:
+                return "ERROR: %s" % e
+            return self._venton_reply(fit)
+
+        if name == cmd.CLEAR_VENTON_MEASUREMENTS:
+            if args:
+                return "ERROR: %s takes no arguments" % cmd.CLEAR_VENTON_MEASUREMENTS
+            self._venton_points().clear()
+            return "OK (Venton measurements cleared)"
+
+        if name == cmd.VENTON_AXES:
+            return self._venton_axes(args)
+
         if name == cmd.UNLOCK_STOP:
             if args:
                 return "ERROR: %s takes no arguments" % cmd.UNLOCK_STOP
             return self._unlock_stop()
+
+        if name == cmd.FREEDRIVE:
+            return self._freedrive(args)
 
         if name == cmd.STOP_PUMP:
             if args:
@@ -486,19 +520,34 @@ class PALmixerServer:
         Raises ValueError for anything unrecognized or malformed.
         """
         if name == cmd.SEARCH_APRILTAG:
-            skip_roll = len(args) == 2 and args[1] == cmd.SKIP_ROLL
-            if skip_roll:
-                args = args[:1]
-            if len(args) != 1 or args[0] not in cmd.STATIONS:
-                raise ValueError("usage: %s <%s> [%s]" % (
-                    cmd.SEARCH_APRILTAG, "|".join(cmd.STATIONS), cmd.SKIP_ROLL))
+            # Both flags are optional and order-independent, so they are pulled
+            # out by name rather than by position. An unrecognised extra word
+            # is left in `args` and falls through to the usage error below --
+            # a misspelled flag must not be read as "no flag" and silently
+            # drive the arm across the cell.
+            flags = set(args[1:])
+            skip_roll = cmd.SKIP_ROLL in flags
+            from_current = cmd.FROM_CURRENT in flags
+            flags -= {cmd.SKIP_ROLL, cmd.FROM_CURRENT}
+            if len(args) < 1 or args[0] not in cmd.STATIONS or flags:
+                raise ValueError("usage: %s <%s> [%s] [%s]" % (
+                    cmd.SEARCH_APRILTAG, "|".join(cmd.STATIONS),
+                    cmd.SKIP_ROLL, cmd.FROM_CURRENT))
             station = args[0]
-            label = "%s %s%s" % (cmd.SEARCH_APRILTAG, station,
-                                 " (skip roll)" if skip_roll else "")
+            label = "%s %s%s%s" % (
+                cmd.SEARCH_APRILTAG, station,
+                " (skip roll)" if skip_roll else "",
+                " (from current position)" if from_current else "")
             # Created here (on the synchronous reply path, before ACCEPTED is
             # sent) so a stop_search sent right after is guaranteed to find it.
             self._search_stop_event = threading.Event()
-            return (lambda: self._search_apriltag(station, skip_roll)), label
+            return (lambda: self._search_apriltag(
+                station, skip_roll, from_current)), label
+
+        if name in (cmd.PUT_CAMERA_TO_TCP, cmd.PUT_TCP_TO_CAMERA):
+            if args:
+                raise ValueError("%s takes no arguments" % name)
+            return (lambda: self._swap_tool_frame(name)), name
 
         if name in (cmd.PUSH_POSITIONS, cmd.PULL_POSITIONS):
             if args:
@@ -535,6 +584,95 @@ class PALmixerServer:
             # PAL12idb, not a taught one, so there is nothing that could be
             # unconfigured about it.
             return self._goto_transfer_point, cmd.GOTO_TRANSFER_POINT
+
+        if name == cmd.CALIBRATE_VENTON_TABLE:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.CALIBRATE_VENTON_TABLE)
+            return self._calibrate_venton_table, cmd.CALIBRATE_VENTON_TABLE
+
+        if name == cmd.CALIBRATE_VENTON_LEVEL:
+            heading, id_args = "orientation", list(args)
+            modes = [a for a in id_args if a in cmd.VENTON_HEADING_MODES]
+            if len(modes) > 1:
+                raise ValueError("give at most one of %s"
+                                 % "|".join(cmd.VENTON_HEADING_MODES))
+            if modes:
+                heading = modes[0]
+                id_args = [a for a in id_args if a != heading]
+            try:
+                tag_ids = [int(a) for a in id_args] or None
+            except ValueError:
+                raise ValueError("usage: %s [%s] [tag_id ...]  (ids are integers)"
+                                 % (cmd.CALIBRATE_VENTON_LEVEL,
+                                    "|".join(cmd.VENTON_HEADING_MODES)))
+            label = "%s %s%s" % (
+                cmd.CALIBRATE_VENTON_LEVEL, heading,
+                " " + " ".join(str(t) for t in tag_ids) if tag_ids else "")
+            return (lambda: self._calibrate_venton_level(tag_ids, heading)), label
+
+        if name == cmd.GOTO_XYZ:
+            if len(args) != 3:
+                raise ValueError("usage: %s <x> <y> <z>  (metres)" % cmd.GOTO_XYZ)
+            try:
+                xyz = [float(v) for v in args]
+            except ValueError:
+                raise ValueError("%s needs three numeric coordinates" % cmd.GOTO_XYZ)
+            return (lambda: self._goto_xyz(xyz)),\
+                   "%s %s" % (cmd.GOTO_XYZ, xyz)
+
+        if name == cmd.CALIBRATE_CAMTCP:
+            # No arg -> ChArUco board (default). 'apriltag [id]' -> single tag.
+            target, tag_id = 'charuco', 13
+            if args and args[0].lower() == 'apriltag':
+                target = 'apriltag'
+                if len(args) > 1:
+                    try:
+                        tag_id = int(args[1])
+                    except ValueError:
+                        raise ValueError("tag id must be an integer, got %r" % args[1])
+            elif args:
+                raise ValueError("usage: %s [apriltag [tag_id]]" % cmd.CALIBRATE_CAMTCP)
+            return (lambda: self._calibrate_camtcp(target, tag_id)),\
+                   "%s %s" % (cmd.CALIBRATE_CAMTCP, target)
+
+        if name == cmd.CALIBRATE_CAMERA_INTRINSICS:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.CALIBRATE_CAMERA_INTRINSICS)
+            return self._calibrate_camera_intrinsics, cmd.CALIBRATE_CAMERA_INTRINSICS
+
+        if name == cmd.ESTIMATE_VENTON_TABLE:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.ESTIMATE_VENTON_TABLE)
+            return self._estimate_venton_table, cmd.ESTIMATE_VENTON_TABLE
+
+        if name == cmd.ALIGN_CAMERA_NORTH:
+            # Optional direction: a name (+x/-x/+y/-y) or a bare azimuth in
+            # degrees; defaults to +x. Resolved to an azimuth here so the robot
+            # layer only ever sees a number.
+            direction = args[0].lower() if args else "+x"
+            if len(args) > 1:
+                raise ValueError("usage: %s [%s|<degrees>]" % (
+                    cmd.ALIGN_CAMERA_NORTH, "|".join(cmd.CAMERA_DIRECTIONS)))
+            if self.PAL12idb is not None and direction in self.PAL12idb.CAMERA_AZIMUTH:
+                azimuth = self.PAL12idb.CAMERA_AZIMUTH[direction]
+            else:
+                try:
+                    azimuth = float(direction)
+                except ValueError:
+                    raise ValueError("usage: %s [%s|<degrees>]" % (
+                        cmd.ALIGN_CAMERA_NORTH, "|".join(cmd.CAMERA_DIRECTIONS)))
+            label = "%s %s" % (cmd.ALIGN_CAMERA_NORTH, direction)
+            return (lambda: self._align_camera_north(azimuth)), label
+
+        if name == cmd.MEASURE_VENTON_TAG:
+            if len(args) != 1:
+                raise ValueError("usage: %s <tag_id>" % cmd.MEASURE_VENTON_TAG)
+            try:
+                tag_id = int(args[0])
+            except ValueError:
+                raise ValueError("tag id must be an integer, got %r" % args[0])
+            return (lambda: self._measure_venton_tag(tag_id)),\
+                   "%s %d" % (cmd.MEASURE_VENTON_TAG, tag_id)
 
         if name == cmd.TWEAK_ORIENTATION:
             if len(args) != 2 or args[0].lower() not in cmd.ORIENTATION_AXES:
@@ -841,10 +979,21 @@ class PALmixerServer:
 
     def _stop_search(self):
         """Abort an in-progress search_apriltag: sets the cooperative stop
-        event the search loop polls between moves, and -- the part that
-        actually matters for how quickly it stops -- tells the robot
-        controller to halt whatever move is in flight right now, rather than
-        waiting for that move to finish on its own."""
+        event the search loop polls between moves, and -- to halt the move in
+        flight sooner than that -- tells the controller to stop now.
+
+        The event is the part that actually ends the search, and setting it is
+        instant and cannot block, so it is done first and unconditionally. The
+        stopj() only makes the stop *faster*; it goes through
+        secmon.send_program, whose condition.wait() is unbounded and only
+        returns once the secondary-interface receive loop next drains its
+        queue. A stalled 30002 socket therefore freezes that call -- and
+        because stop_search is a fast command answered inline on the single
+        ZMQ reply thread, freezing it here freezes every command, status
+        included (the "server stops responding after Stop Search" seen on a
+        controller whose realtime/secondary streams were dropping out). So the
+        stopj is fired on a throwaway thread: the reply goes out either way,
+        and the event above has already guaranteed the search will stop."""
         if (self._current_action is None
                 or not self._current_action.startswith(cmd.SEARCH_APRILTAG + " ")):
             return "ERROR: no AprilTag search is running"
@@ -852,11 +1001,18 @@ class PALmixerServer:
         if event is not None:
             event.set()
         if not self.simulate and self.rob is not None:
-            try:
-                self.rob.robot.stopj()
-            except Exception as e:
-                return "ERROR: failed to stop robot: %s" % e
+            threading.Thread(target=self._fire_stopj, daemon=True).start()
         return "OK"
+
+    def _fire_stopj(self):
+        """Send stopj() off the reply thread. Best effort: a failure or a hang
+        here must not be able to wedge the command loop, so it is reported to
+        the log rather than to the caller, who has already been told OK on the
+        strength of the stop event."""
+        try:
+            self.rob.robot.stopj()
+        except Exception as e:
+            print("PALmixerServer: stopj after stop_search failed: %s" % e)
 
     def _set_position_here(self, args, orientation_only=False):
         """Teach a station from the robot's current pose.
@@ -894,7 +1050,7 @@ class PALmixerServer:
         print(detail)
         return "OK %s" % detail
 
-    def _search_apriltag(self, station, skip_roll=False):
+    def _search_apriltag(self, station, skip_roll=False, from_current=False):
         if self.simulate:
             # Sleep in small slices so a stop_search sent during a --simulate
             # run is also honored, instead of only being useful against real
@@ -904,12 +1060,25 @@ class PALmixerServer:
                 if event is not None and event.is_set():
                     raise RuntimeError("AprilTag search for %s was stopped by the operator" % station)
                 time.sleep(0.1)
-            return "simulated AprilTag search for %s%s" % (
-                station, " (skip roll)" if skip_roll else "")
+            return "simulated AprilTag search for %s%s%s" % (
+                station, " (skip roll)" if skip_roll else "",
+                " (from current position)" if from_current else "")
         pos = self.PAL12idb.locate_apriltag(
             self.rob, pos=station, stop_event=self._search_stop_event,
-            skip_roll=skip_roll)
+            skip_roll=skip_roll, from_current=from_current)
         return "found %s at %s" % (station, pos)
+
+    def _swap_tool_frame(self, name):
+        """put_camera_to_tcp / put_tcp_to_camera. A worker action: both are
+        real ~4 cm moves, not frame bookkeeping."""
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated %s" % name
+        if name == cmd.PUT_CAMERA_TO_TCP:
+            pose = self.PAL12idb.put_camera_to_tcp(self.rob)
+            return "camera moved onto the tool pose, now at %s" % (pose,)
+        pose = self.PAL12idb.put_tcp_to_camera(self.rob)
+        return "tool moved onto the camera pose, now at %s" % (pose,)
 
     def _sync_positions(self, name):
         """Explicit waypoints.ini <-> EPICS PV sync, the only Channel Access
@@ -960,6 +1129,178 @@ class PALmixerServer:
             return "simulated goto transfer point"
         pose = self.PAL12idb.goto_transfer_point(self.rob)
         return "at the transfer point (%s)" % (pose,)
+
+    def _goto_xyz(self, xyz):
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated goto xyz %s" % (xyz,)
+        pose = self.PAL12idb.goto_xyz(self.rob, xyz)
+        return "tool at %s" % (pose,)
+
+    def _calibrate_camera_intrinsics(self):
+        if self.simulate:
+            time.sleep(1)
+            return "simulated camera intrinsics calibration"
+        r = self.PAL12idb.calibrate_camera_intrinsics(self.rob)
+        return ("camera intrinsics from %d ChArUco views: fx=%.1f fy=%.1f "
+                "cx=%.1f cy=%.1f, reprojection rms %.3f px (assumed f was %.0f). "
+                "Stored; now used by the ChArUco pose. Re-run calibrate_camtcp."
+                % (r['views'], r['fx'], r['fy'], r['cx'], r['cy'],
+                   r['rms_px'], r['assumed_f']))
+
+    def _calibrate_camtcp(self, target, tag_id):
+        if self.simulate:
+            time.sleep(1)
+            return "simulated camtcp calibration (%s)" % target
+        r = self.PAL12idb.run_handeye_calibration(self.rob, tag_id=tag_id, target=target)
+        return ("camtcp (flange->camera) solved from %d %s views: %s | "
+                "current camtcp %s | rot residual mean %.3f deg, max %.3f deg "
+                "over %d pairs. NOT applied -- review, then set robot camtcp."
+                % (r['samples'], target, r['camtcp'], r['current_camtcp'],
+                   r['rot_residual_deg_mean'], r['rot_residual_deg_max'], r['pairs']))
+
+    def _calibrate_venton_table(self):
+        if self.simulate:
+            time.sleep(1)
+            return "simulated Venton table calibration"
+        fit = self.PAL12idb.calibrate_venton_table(self.rob)
+        self._set_venton_frame(fit)
+        return self._venton_reply(fit)
+
+    def _estimate_venton_table(self):
+        if self.simulate:
+            time.sleep(1)
+            return "simulated Venton table estimate"
+        fit = self.PAL12idb.estimate_venton_table(self.rob)
+        self._set_venton_frame(fit)
+        return "ESTIMATE (open-loop, rough) -- " + self._venton_reply(fit)
+
+    def _set_venton_frame(self, fit):
+        """Remember the latest calibrated Venton frame (and persist it), so the
+        axes overlay can be drawn later without re-running a calibration."""
+        self._venton_frame = {k: [float(v) for v in fit[k]]
+                              for k in ('origin_m', 'x_axis', 'y_axis', 'normal')}
+        try:
+            self.PAL12idb.save_venton_frame(self._venton_frame)
+        except Exception:                                # noqa: BLE001
+            pass        # a non-writable json dir must not fail the calibration
+
+    def _venton_frame_or_load(self):
+        """The in-memory Venton frame, falling back to the persisted one."""
+        frame = getattr(self, "_venton_frame", None)
+        if frame is not None:
+            return frame
+        return self.PAL12idb.load_venton_frame() if self.PAL12idb else None
+
+    def _venton_axes(self, args):
+        """Project the stored Venton frame into the current view -- see
+        cmd.VENTON_AXES. Fast and synchronous: the GUI calls it once when the
+        overlay toggle goes on, then freezes the result."""
+        if not (2 <= len(args) <= 3):
+            return "ERROR: usage: %s <width> <height> [axis_len_mm]" % cmd.VENTON_AXES
+        try:
+            w, h = int(args[0]), int(args[1])
+            axis_len_m = (float(args[2]) / 1000.0) if len(args) == 3 else 0.05
+        except ValueError:
+            return "ERROR: %s needs integer width/height (and a numeric mm)" % cmd.VENTON_AXES
+        frame = self._venton_frame_or_load()
+        if frame is None:
+            return ("ERROR: no Venton frame calibrated yet -- run "
+                    "calibrate_venton_level (or calibrate_venton_table) first")
+        if self.simulate:
+            return json.dumps({"origin": [w / 2.0, h / 2.0],
+                               "x": [w / 2.0 + 40, h / 2.0],
+                               "y": [w / 2.0, h / 2.0 + 40],
+                               "z": [w / 2.0, h / 2.0 - 40],
+                               "in_front": [True, True, True, True],
+                               "axis_len_m": axis_len_m, "image_wh": [w, h]})
+        if self.rob is None:
+            return "ERROR: no robot connection"
+        if self._busy:
+            return ("ERROR: busy -- cannot read the camera pose while the robot "
+                    "is moving; try again when it is idle")
+        try:
+            overlay = self.PAL12idb.venton_axes_overlay(
+                self.rob, frame, (w, h), axis_len_m)
+        except Exception as e:                           # noqa: BLE001
+            return "ERROR: %s" % e
+        return json.dumps(overlay)
+
+    #: Where the level calibration drops its annotated frame (red origin dot).
+    _VENTON_DOT_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "venton_origin_dot.png")
+
+    def _calibrate_venton_level(self, tag_ids, heading="orientation"):
+        if self.simulate:
+            time.sleep(1)
+            return "simulated level Venton calibration (%s, tags %s)" % (
+                heading, tag_ids or "all")
+        fit = self.PAL12idb.calibrate_venton_table_level(
+            self.rob, tag_ids=tag_ids, heading=heading)
+        self._set_venton_frame(fit)
+        # Project the found origin back into a fresh frame and mark it, so the
+        # result can be eyeballed against the table, not just read as numbers.
+        # A failed render must not lose the calibration -- report it and go on.
+        dot = "not rendered"
+        try:
+            _path, pixel = self.PAL12idb.render_point_on_camera(
+                self.rob, fit['origin_m'], self._VENTON_DOT_PATH, label="(0,0)")
+            dot = ("origin dot at pixel (%.0f, %.0f) in %s" % (pixel[0], pixel[1], _path)
+                   if pixel else "origin projects OUTSIDE the frame; saved %s" % _path)
+        except Exception as e:                           # noqa: BLE001
+            dot = "could not render origin dot: %s" % e
+        s = self.PAL12idb.venton_calibration_summary(fit)
+        pos_yaw = fit.get('position_yaw_deg')
+        return ("%s fit over tags %s: origin %s m, X %s, Y %s, normal %s; "
+                "yaw %.2f deg (positions imply %s), rmse %.2f mm (max %.2f mm); %s"
+                % (fit.get('method', 'level').upper(), [t['id'] for t in s['tags']],
+                   s['origin_m'], s['x_axis'], s['y_axis'], s['normal'],
+                   fit['yaw_deg'],
+                   ("%.2f deg" % pos_yaw) if pos_yaw is not None else "n/a",
+                   s['rmse_mm'], s['max_error_mm'], dot))
+
+    def _venton_points(self):
+        """Base-frame positions collected one tag at a time by
+        measure_venton_tag, keyed by tag id. Lives on the server so it persists
+        across commands until fit or clear."""
+        if not hasattr(self, "_venton_pts"):
+            self._venton_pts = {}
+        return self._venton_pts
+
+    def _measure_venton_tag(self, tag_id):
+        if self.simulate:
+            time.sleep(0.5)
+            self._venton_points()[tag_id] = [0.0, 0.0, 0.0]
+            return "simulated measure of tag %d" % tag_id
+        pos = self.PAL12idb.measure_venton_tag(self.rob, tag_id)
+        if pos is None:
+            raise RuntimeError(
+                "could not acquire tag %d -- aim the camera so it is near the "
+                "image centre and in focus, then try again" % tag_id)
+        self._venton_points()[tag_id] = pos
+        got = sorted(self._venton_points())
+        more = [t for t in (self.PAL12idb.venton_table_tags()) if t not in got]
+        return ("tag %d at [%.4f, %.4f, %.4f] m; collected %s%s"
+                % (tag_id, pos[0], pos[1], pos[2], got,
+                   "; still need %s, then fit_venton_table" % more if more
+                   else "; run fit_venton_table"))
+
+    def _align_camera_north(self, azimuth):
+        if self.simulate:
+            time.sleep(0.3)
+            return "simulated align camera north to %.1f deg" % azimuth
+        before, after = self.PAL12idb.align_camera_north(self.rob, target_az_deg=azimuth)
+        return ("camera north azimuth %.1f -> %.1f deg (target %.1f)"
+                % (before, after, azimuth))
+
+    def _venton_reply(self, fit):
+        s = self.PAL12idb.venton_calibration_summary(fit)
+        return ("Venton table frame: origin %s m, X %s, Y %s, normal %s; "
+                "scale %.4f, fit rmse %.2f mm (max %.2f mm) over %d tags %s"
+                % (s['origin_m'], s['x_axis'], s['y_axis'], s['normal'],
+                   s['scale'], s['rmse_mm'], s['max_error_mm'],
+                   len(s['tags']), [t['id'] for t in s['tags']]))
 
     def _tweak_orientation(self, axis, degrees):
         if self.simulate:
@@ -1105,6 +1446,31 @@ class PALmixerServer:
         return ("OK protective-stop unlock sent and accepted, but the robot "
                 "still reports a stop -- the cause is probably still there; "
                 "clear it and press again")
+
+    def _freedrive(self, args):
+        """Toggle freedrive (hand-guiding) -- see cmd.FREEDRIVE.
+
+        Fast, like _unlock_stop: ending freedrive must work even while the
+        server is holding busy, because that is a recovery. Starting it is
+        refused while a worker action is running -- letting the arm's brakes go
+        in the middle of a move is dangerous.
+        """
+        if len(args) != 1 or args[0] not in (cmd.FREEDRIVE_ON, cmd.FREEDRIVE_OFF):
+            return "ERROR: usage: %s %s|%s" % (
+                cmd.FREEDRIVE, cmd.FREEDRIVE_ON, cmd.FREEDRIVE_OFF)
+        on = args[0] == cmd.FREEDRIVE_ON
+        if self.simulate:
+            return "OK simulated freedrive %s" % args[0]
+        if self.rob is None:
+            return "ERROR: no robot connection"
+        if on and self._busy:
+            return ("ERROR: cannot enter freedrive while the robot is busy -- "
+                    "stop the running action first")
+        try:
+            self.rob.set_freedrive(on)
+        except Exception as e:                           # noqa: BLE001
+            return "ERROR: could not turn freedrive %s: %s" % (args[0], e)
+        return "OK freedrive %s" % args[0]
 
     def _motor_tweak(self, direction, step):
         if self.simulate:

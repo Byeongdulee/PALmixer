@@ -1,7 +1,10 @@
 import configparser
 import functools
+import math
 import os
 import time
+
+import numpy as _np
 
 import camera_tools
 
@@ -24,6 +27,11 @@ try:
     from . import commands as _commands
 except ImportError:
     import commands as _commands
+
+try:
+    from . import calibration as _calibration
+except ImportError:
+    import calibration as _calibration
 
 # Where an AprilTag search stands to start looking -- a camera standoff above
 # each station, not a grab pose. locate_apriltag() drives here first and
@@ -118,20 +126,1139 @@ bump_approach_clearance = 0.03
 # the list of them lives here.
 BUMP_RELEASE_STATIONS = ('mixer_cleaning_station', 'sample_on_mixer_station',
                          'cleaning_station')
-# Physical edge length of the AprilTag each station shows the camera: the tag
-# on the flowcell is 12 mm, the one on the mixer head is 16 mm. The camera
-# measures distance as AT_physical_size / (tag edge in pixels) * focal length
-# (urcamera.getATdistance), so this scales every distance reading linearly --
-# with the robot's default 7.5 mm left in place the camera believes it is much
-# closer to the tag than it is, and a descent aimed at 0.2 m stops well short.
-flowcell_apriltag_size = 0.012
-mixer_apriltag_size = 0.016
-APRILTAG_SIZES = {
-    'sample_table': flowcell_apriltag_size,
-    'cleaning_station': flowcell_apriltag_size,
-    'mixer_station': mixer_apriltag_size,
-    'mixer_cleaning_station': mixer_apriltag_size,
+# Physical edge length of the AprilTag each station shows the camera. The
+# camera measures distance as AT_physical_size / (tag edge in pixels) * focal
+# length (urcamera.getATdistance), so this scales every distance reading
+# linearly -- with the robot's default 7.5 mm left in place the camera
+# believes it is much closer to the tag than it is, and a descent aimed at
+# 0.2 m stops well short.
+#
+# **This is the BLACK SQUARE's edge, not the printed tag's.** A tag36h11 is
+# 8 cells of black inside a white quiet zone, and the detector's tag_size
+# means the black border's outer edge. Measuring the sheet instead reads
+# about 1.3x high, and every distance with it: the flowcell value here was
+# 12 mm (the sheet) against a black square that calipers at 9.5 mm, which had
+# every flowcell-tag distance 26% long.
+# Whose tag each station's search is actually looking at. A tag belongs to the
+# thing it is stuck to, not to the place: the flowcell carries its tag to every
+# station it visits, so one station's search looks for a different tag
+# depending on which flowcell is in use, while the sample table and the two
+# mixer stations each have a tag that stays put.
+#
+# 'flowcell' is resolved to flowcell_1 / flowcell_2 at call time by the
+# flowcell in use, the same way 'cleaning_station' resolves to a position.
+APRILTAG_SUBJECT = {
+    # The sample table has no tag of its own: what the search sees there is
+    # the flowcell that was transferred onto it, wearing the same tag it wore
+    # at its cleaning station. So this station and cleaning_station look for
+    # the *same* tag, and which one depends on the flowcell in use.
+    'sample_table': 'flowcell',
+    'cleaning_station': 'flowcell',
+    'mixer_station': 'mixer_head',
+    'mixer_cleaning_station': 'mixer_head',
 }
+# Fallbacks for the `apriltags` config section, used when it says nothing about
+# a tag. Only sizes: an unconfigured *number* means "whichever tag is nearest
+# the image center", which is a real behaviour rather than a missing value.
+APRILTAG_FALLBACK_SIZES = {
+    'flowcell_1': 0.0095,
+    'flowcell_2': 0.0095,
+    'sample_table': 0.0315,
+    'mixer_head': 0.016,
+}
+DEFAULT_APRILTAG_SIZE = 0.0095
+
+
+def _apriltag_subject(station):
+    """Which entry in the `apriltags` config a station's search reads."""
+    subject = APRILTAG_SUBJECT.get(station)
+    if subject == 'flowcell':
+        return 'flowcell_%d' % (1 if flowcell_ID == 1 else 2)
+    return subject
+
+
+def _apriltag_entry(station):
+    subject = _apriltag_subject(station)
+    if subject is None:
+        return None, {}
+    try:
+        entry = _config.get_section('apriltags').get(subject) or {}
+    except Exception:
+        entry = {}
+    return subject, entry if isinstance(entry, dict) else {}
+
+
+def apriltag_size(station):
+    """Black-square edge length of the tag `station`'s search looks for.
+
+    **The black square, not the printed sheet.** A tag36h11 is 8 cells of
+    black inside a white quiet zone and the detector's tag_size means the
+    black border's outer edge; measuring the sheet reads about 1.3x high, and
+    every distance with it. The flowcell entry was 12 mm (the sheet) against a
+    square that calipers at 9.5 mm, which had every flowcell-tag distance 26%
+    long.
+
+    The camera measures distance as AT_physical_size / (tag edge in pixels) *
+    focal length (urcamera.getATdistance), so this scales every reading
+    linearly -- a search aimed at a 0.2 m standoff stops somewhere else
+    entirely if it is wrong.
+    """
+    subject, entry = _apriltag_entry(station)
+    try:
+        size = entry.get('size_m')
+        if size is not None:
+            return float(size)
+    except (TypeError, ValueError):
+        print("PAL12idb: ignoring non-numeric apriltags.%s.size_m" % subject)
+    return APRILTAG_FALLBACK_SIZES.get(subject, DEFAULT_APRILTAG_SIZE)
+
+
+def apriltag_id(station):
+    """The AprilTag number `station`'s search looks for, or None.
+
+    None means "whichever tag is nearest the image center", decided afresh on
+    every frame. That is correct only while one tag at a time can be in view;
+    where two can, a search that tilts, rolls and descends over many frames
+    can change its mind about which it is measuring partway through.
+
+    A non-numeric entry is ignored with a warning rather than raised on: a
+    typo here must not break a search that worked yesterday, and the tag
+    actually used is reported either way.
+    """
+    subject, entry = _apriltag_entry(station)
+    try:
+        value = entry.get('id')
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        print("PAL12idb: ignoring non-numeric apriltags.%s.id" % subject)
+        return None
+
+
+def venton_table_tags():
+    """Configured Venton-table fiducials usable for calibration, keyed by id.
+
+    Every ``apriltags.*`` entry that has BOTH a numeric ``id`` and a
+    ``table_xy_mm`` -- a tag with no id cannot be singled out in a frame, and
+    one with no table position has no known point to anchor the fit to, so
+    either missing drops it. Each value is {name, table_xy_mm, size_m}.
+    """
+    tags = {}
+    try:
+        section = _config.get_section('apriltags')
+    except Exception:
+        return tags
+    for name, entry in section.items():
+        if not isinstance(entry, dict):
+            continue
+        tid, xy = entry.get('id'), entry.get('table_xy_mm')
+        if tid is None or not xy:
+            continue
+        try:
+            size = entry.get('size_m')
+            tags[int(tid)] = {
+                'name': name,
+                'table_xy_mm': [float(xy[0]), float(xy[1])],
+                'size_m': float(size) if size is not None else DEFAULT_APRILTAG_SIZE}
+        except (TypeError, ValueError, IndexError):
+            print("PAL12idb: skipping malformed apriltags.%s for calibration" % name)
+    return tags
+
+
+def _measure_tag_in_base(robot, tag_id, size_m):
+    """Closed-loop base-frame position of one tag: centre, descend close,
+    re-centre, then project along the optical axis.
+
+    Returns a 3-list (metres) or None if the tag could not be acquired. This is
+    the path stations are taught with (center_camera2apriltag +
+    descend_to_apriltag), and the reason it is used here instead of a one-shot
+    open-loop read: an off-axis tag placed from a single frame is corrupted by
+    any error in the camera's mount geometry (camtcp), which showed up as a
+    ~120 mm spread between views. Centring drives the tag onto the optical axis,
+    where that error cancels, and descending to a short standoff shrinks what
+    little remains (lateral error scales with distance). What is left is the
+    accuracy the whole system already teaches positions with.
+    """
+    robot.camera.AT_physical_size = size_m
+    robot.camera.AT_preferred_id = tag_id
+    try:
+        if not robot.center_camera2apriltag(tag_id=tag_id):
+            return None
+        if descend_to_apriltag(robot) is None:
+            return None
+        # Re-centre at the close standoff: the descent re-detects but does not
+        # re-centre, and the projection below is only on-axis if the tag is.
+        if not robot.center_camera2apriltag(tag_id=tag_id):
+            return None
+        pos, _campos = robot.get_obj_position_from_camera_center(robot.camera.QRdistance)
+        return [float(pos[0]), float(pos[1]), float(pos[2])]
+    finally:
+        robot.set_tcp(robot.tcp)        # always leave the gripper TCP active
+
+
+def _flange_T_optical(robot):
+    """flange -> camera optical frame, from the (validated, mechanical) camtcp
+    and the fixed optical convention.
+
+    camtcp is flange -> camera-TCP frame; the camera's optical frame (solvePnP:
+    x right, y down, z forward) differs from it by a 180 deg turn about the
+    shared viewing (Z) axis -- measured by the hand-eye calibration as 173.9 deg
+    about ~Z, i.e. a clean axis flip with the few degrees being solve noise. So
+    optical = camtcp . Rz(180). This replaces get_camera_vector's hard-coded
+    mount angles with the real camtcp and an exact convention.
+    """
+    camtcp_T = _calibration.pose_vector_to_transform(
+        [float(v) for v in robot.camtcp])
+    flip = _np.eye(4)
+    flip[0, 0] = -1.0          # Rz(180): optical x,y are camtcp x,y flipped
+    flip[1, 1] = -1.0
+    return camtcp_T @ flip
+
+
+def _read_tags_in_view(robot, tags):
+    """Base-frame position of every configured tag in the current view -- no
+    motion. Returns {id: [x, y, z]} (metres).
+
+    Each tag's position is the proper chain of transforms, not a reconstruction:
+    base <- flange (robot kinematics) <- optical (validated camtcp + convention,
+    _flange_T_optical) <- tag (solvePnP on the tag corners with the *calibrated*
+    camera matrix, apriltag_pose_from_corners). No get_camera_vector, no assumed
+    focal length -- so it is bound only by the camtcp and intrinsics accuracy,
+    which are now calibrated. Tag orientation is bimodal but position is stable,
+    and position is all this uses.
+    """
+    robot.set_tcp(robot.tcp)
+    found = {}
+    try:
+        base_T_flange = _flange_transform(robot)      # restores tool TCP
+        flange_T_optical = _flange_T_optical(robot)
+        base_T_optical = base_T_flange @ flange_T_optical
+        for tid, info in tags.items():
+            robot.camera.AT_physical_size = info['size_m']
+            robot.camera.AT_preferred_id = tid
+            r = camera_tools._detect_apriltag(robot, tag_id=tid)
+            if r is None:
+                continue
+            img = robot.camera.image
+            K, dist = _camera_matrix_and_dist(robot, (img.shape[1], img.shape[0]))
+            cam_T_tag = _calibration.apriltag_pose_from_corners(
+                r.corners, info['size_m'], K, dist_coeffs=dist)
+            if cam_T_tag is None:
+                continue
+            base = (base_T_optical @ cam_T_tag)[:3, 3]
+            found[tid] = [float(base[0]), float(base[1]), float(base[2])]
+    finally:
+        robot.set_tcp(robot.tcp)        # always leave the gripper TCP active
+    return found
+
+
+def _read_tag_poses_in_view(robot, tags):
+    """Like _read_tags_in_view, but keep each tag's full base pose (4x4) and
+    hand back the base<-optical transform used.
+
+    Returns (poses, base_T_optical) where poses = {id: 4x4 base_T_tag}. The
+    position part of each pose is exactly what _read_tags_in_view returns; the
+    rotation part is the tag's orientation in base, which the level fit uses for
+    the in-plane heading (and which position-only fits deliberately ignore
+    because it is bimodal). No motion. base_T_optical is returned so a caller
+    can project base points back into the same image (the red origin dot).
+    """
+    robot.set_tcp(robot.tcp)
+    poses = {}
+    base_T_optical = None
+    try:
+        base_T_flange = _flange_transform(robot)      # restores tool TCP
+        flange_T_optical = _flange_T_optical(robot)
+        base_T_optical = base_T_flange @ flange_T_optical
+        for tid, info in tags.items():
+            robot.camera.AT_physical_size = info['size_m']
+            robot.camera.AT_preferred_id = tid
+            r = camera_tools._detect_apriltag(robot, tag_id=tid)
+            if r is None:
+                continue
+            img = robot.camera.image
+            K, dist = _camera_matrix_and_dist(robot, (img.shape[1], img.shape[0]))
+            cam_T_tag = _calibration.apriltag_pose_from_corners(
+                r.corners, info['size_m'], K, dist_coeffs=dist)
+            if cam_T_tag is None:
+                continue
+            poses[tid] = base_T_optical @ cam_T_tag
+    finally:
+        robot.set_tcp(robot.tcp)        # always leave the gripper TCP active
+    return poses, base_T_optical
+
+
+def _yaw_from_positions(poses, tags):
+    """Table yaw (rad) from the tag POSITIONS alone, under the level assumption.
+
+    A 2D rigid fit of the known table (x, y) onto the measured base (x, y): with
+    the surface level the only free rotation is a yaw about Z, so two or more tag
+    positions pin it. Returns None if the points are coincident. This is the
+    robust heading -- it does not touch the bimodal tag orientation.
+    """
+    ids = sorted(poses)
+    tc = _np.array([[tags[t]['table_xy_mm'][0] / 1000.0,
+                     tags[t]['table_xy_mm'][1] / 1000.0] for t in ids])
+    bc = _np.array([[float(poses[t][0, 3]), float(poses[t][1, 3])] for t in ids])
+    tc = tc - tc.mean(axis=0)
+    bc = bc - bc.mean(axis=0)
+    if _np.linalg.norm(tc) < 1e-9 or _np.linalg.norm(bc) < 1e-9:
+        return None
+    num = float(_np.sum(tc[:, 0] * bc[:, 1] - tc[:, 1] * bc[:, 0]))
+    den = float(_np.sum(tc[:, 0] * bc[:, 0] + tc[:, 1] * bc[:, 1]))
+    return math.atan2(num, den)
+
+
+def calibrate_venton_table_level(robot, tag_ids=None, heading='orientation'):
+    """Estimate the Venton table frame assuming the surface is LEVEL.
+
+    ``heading`` picks where the one free rotation (yaw about Z) comes from:
+
+      * ``'orientation'`` -- each tag's own measured +X axis (what the operator
+        asked for). Honest but only as good as solvePnP's orientation on a flat
+        tag, which is bimodal; when it is unreliable the per-tag residual and the
+        gap to the position-derived yaw below both blow up, so a bad fit is loud.
+      * ``'positions'`` -- the tag positions alone (``_yaw_from_positions``). The
+        robust path: it never touches the shaky tag orientation, and two tags are
+        enough once the surface is assumed level.
+
+    This is the two-tag path: the three-point position fit (estimate_venton_table
+    / calibrate_venton_table) needs three non-collinear tags because two points
+    only ever give a line. Here the missing information comes from two added
+    assumptions instead of a third tag:
+
+      * the table is level, so the surface normal is base +Z and the frame's
+        only free rotation is a yaw about Z;
+      * each flat-lying tag's +X axis runs along the table +X, so the tag's own
+        orientation gives that yaw directly.
+
+    For every visible tag the tag's +X axis is projected onto the horizontal
+    plane and its azimuth taken; the azimuths are averaged (circular mean) into
+    one table yaw. The origin is each tag's base position minus the yaw-rotated
+    table offset, averaged over the tags. One tag is enough in principle; two or
+    more average down the per-tag noise and give a residual.
+
+    Returns a fit dict shaped like estimate_venton_table's (origin_m, x_axis,
+    y_axis, normal, scale=1.0, rmse_mm, max_error_mm, tags) plus 'method',
+    'yaw_deg', the per-tag 'headings_deg', and 'position_yaw_deg' -- the yaw the
+    tag *positions* alone imply, as an independent cross-check on the tag-X ==
+    table-X mounting assumption (a big gap between it and yaw_deg means the tags
+    are not mounted square to the table). No motion.
+    """
+    tags = venton_table_tags()
+    if tag_ids is not None:
+        want = [int(t) for t in tag_ids]
+        tags = {t: tags[t] for t in want if t in tags}
+        missing = [t for t in want if t not in tags]
+        if missing:
+            raise RuntimeError("no configured Venton fiducial for id(s) %s" % missing)
+    if not tags:
+        raise RuntimeError("no Venton fiducials configured")
+
+    poses, _ = _read_tag_poses_in_view(robot, tags)
+    if len(poses) < 2:
+        raise RuntimeError(
+            "saw only %d usable Venton fiducial(s) in the current view; need at "
+            "least 2 for the level/orientation fit -- aim the camera so two tags "
+            "are in frame and in focus" % len(poses))
+
+    # Per-tag yaw from each tag's +X axis flattened onto the horizontal plane --
+    # computed either way, because it is reported as a per-tag diagnostic even
+    # when the robust position yaw is the one used.
+    headings = {}
+    for tid, T in poses.items():
+        x_axis = _np.array(T[:3, 0], dtype=float)
+        x_axis[2] = 0.0
+        if _np.linalg.norm(x_axis) < 1e-6:
+            continue            # tag edge-on: its yaw is undefined, skip it
+        headings[tid] = math.atan2(float(x_axis[1]), float(x_axis[0]))
+
+    pos_yaw = _yaw_from_positions(poses, tags)
+    if heading == 'positions':
+        if pos_yaw is None:
+            raise RuntimeError("tag positions are coincident; cannot derive a "
+                               "heading from them")
+        yaw = pos_yaw
+    elif heading == 'orientation':
+        if not headings:
+            raise RuntimeError("no tag gave a usable horizontal heading")
+        # Circular mean of the per-tag headings.
+        sin_sum = sum(math.sin(h) for h in headings.values())
+        cos_sum = sum(math.cos(h) for h in headings.values())
+        yaw = math.atan2(sin_sum, cos_sum)
+    else:
+        raise ValueError("heading must be 'orientation' or 'positions', got %r"
+                         % (heading,))
+    c, s = math.cos(yaw), math.sin(yaw)
+    R = _np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+    def table_offset_m(txy):
+        return R @ _np.array([txy[0] / 1000.0, txy[1] / 1000.0, 0.0])
+
+    # Origin: average of (tag position - rotated table offset).
+    origins = [_np.array(T[:3, 3], float) - table_offset_m(tags[tid]['table_xy_mm'])
+               for tid, T in poses.items()]
+    origin = _np.mean(origins, axis=0)
+
+    # Per-tag residual: how far each measured position is from the fitted frame.
+    tags_out, errs = [], []
+    for tid in sorted(poses):
+        p = _np.array(poses[tid][:3, 3], float)
+        pred = origin + table_offset_m(tags[tid]['table_xy_mm'])
+        err = float(_np.linalg.norm(p - pred))
+        errs.append(err)
+        tags_out.append({'id': tid, 'name': tags[tid]['name'],
+                         'table_xy_mm': list(tags[tid]['table_xy_mm']),
+                         'base_m': [float(v) for v in p],
+                         'error_mm': err * 1000.0})
+    rmse_mm = math.sqrt(sum(e * e for e in errs) / len(errs)) * 1000.0
+    max_error_mm = max(errs) * 1000.0
+
+    # The position-derived yaw is always reported as a cross-check: when the
+    # orientation heading is in use, a big gap to this means the tag-X == table-X
+    # mounting assumption (or solvePnP's orientation) is off.
+    position_yaw_deg = None if pos_yaw is None else (
+        (math.degrees(pos_yaw) + 180.0) % 360.0 - 180.0)
+
+    return {'method': 'level+' + heading,
+            'origin_m': origin, 'x_axis': R[:, 0], 'y_axis': R[:, 1],
+            'normal': R[:, 2], 'scale': 1.0,
+            'rmse_mm': rmse_mm, 'max_error_mm': max_error_mm,
+            'yaw_deg': math.degrees(yaw),
+            'headings_deg': {t: math.degrees(h) for t, h in headings.items()},
+            'position_yaw_deg': position_yaw_deg,
+            'tags': tags_out}
+
+
+def render_point_on_camera(robot, base_xyz, path, base_T_optical=None,
+                           radius=9, label=None):
+    """Capture the current camera frame, project the base-frame point
+    ``base_xyz`` (metres) into it, draw a red dot there, and save a PNG to
+    ``path``. No motion.
+
+    Returns (path, (u, v)) with the pixel the point landed on, or (path, None)
+    if it falls behind the camera or outside the frame (the dot is still drawn
+    when it is merely near an edge, so the operator can see which way it is off).
+    ``base_T_optical`` may be passed in to reuse the transform a calibration
+    already computed; otherwise it is read fresh from the current pose.
+    """
+    import cv2
+    from PIL import Image, ImageDraw
+
+    robot.set_tcp(robot.tcp)
+    if base_T_optical is None:
+        base_T_flange = _flange_transform(robot)
+        base_T_optical = base_T_flange @ _flange_T_optical(robot)
+
+    robot.camera.capture()
+    img = _np.array(robot.camera.image)                 # RGB (H, W, 3)
+    K, dist = _camera_matrix_and_dist(robot, (img.shape[1], img.shape[0]))
+
+    optical_T_base = _np.linalg.inv(base_T_optical)
+    pt = _np.array([float(base_xyz[0]), float(base_xyz[1]), float(base_xyz[2]), 1.0])
+    in_cam = optical_T_base @ pt
+    rvec, _ = cv2.Rodrigues(optical_T_base[:3, :3])
+    tvec = optical_T_base[:3, 3]
+    uv, _ = cv2.projectPoints(
+        _np.array([[pt[0], pt[1], pt[2]]], dtype=float), rvec, tvec, K,
+        _np.zeros(5) if dist is None else _np.asarray(dist, float))
+    u, v = (float(x) for x in uv.reshape(2))
+
+    h, w = img.shape[:2]
+    pil = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil)
+    if in_cam[2] > 0:       # only draw a point that is actually in front of the lens
+        draw.ellipse([u - radius, v - radius, u + radius, v + radius],
+                     fill=(255, 0, 0), outline=(255, 255, 255))
+        if label:
+            draw.text((u + radius + 3, v - radius), str(label), fill=(255, 0, 0))
+    pil.save(path)
+    on_frame = bool(in_cam[2] > 0 and 0 <= u < w and 0 <= v < h)
+    return path, ((u, v) if on_frame else None)
+
+
+def _project_base_points(base_T_optical, K, dist, points):
+    """Project base-frame 3D points into the image. Returns (uv, in_front):
+    uv is a list of [u, v] pixels, in_front a list of bools (False = behind the
+    lens, where the projection is meaningless)."""
+    import cv2
+    optical_T_base = _np.linalg.inv(base_T_optical)
+    rvec, _ = cv2.Rodrigues(optical_T_base[:3, :3])
+    tvec = optical_T_base[:3, 3]
+    objp = _np.array([[float(p[0]), float(p[1]), float(p[2])] for p in points],
+                     dtype=float)
+    uv, _ = cv2.projectPoints(objp, rvec, tvec, K,
+                              _np.zeros(5) if dist is None else _np.asarray(dist, float))
+    uv = uv.reshape(-1, 2)
+    in_front = []
+    for p in points:
+        cp = optical_T_base @ _np.array([float(p[0]), float(p[1]), float(p[2]), 1.0])
+        in_front.append(bool(cp[2] > 0))
+    return [[float(u), float(v)] for u, v in uv], in_front
+
+
+def venton_axes_overlay(robot, frame, image_wh, axis_len_m=0.05):
+    """Pixel positions of the Venton frame's origin and its X/Y/Z axis tips in
+    the current view, for drawing the coordinate axes on the live image. No
+    motion.
+
+    ``frame`` carries origin_m/x_axis/y_axis/normal in base coordinates (a
+    calibration result or the stored one); ``image_wh`` is the (width, height) of
+    the frame the overlay will be drawn on, so the camera matrix matches it.
+    Returns {origin, x, y, z: [u, v]} plus 'in_front' (per point) and the
+    'axis_len_m' used. Computed once; the caller freezes it until the operator
+    turns the overlay off, so it does not track the arm.
+    """
+    robot.set_tcp(robot.tcp)
+    base_T_flange = _flange_transform(robot)
+    base_T_optical = base_T_flange @ _flange_T_optical(robot)
+    K, dist = _camera_matrix_and_dist(robot, (int(image_wh[0]), int(image_wh[1])))
+    o = _np.array([float(v) for v in frame['origin_m']])
+    x = _np.array([float(v) for v in frame['x_axis']])
+    y = _np.array([float(v) for v in frame['y_axis']])
+    z = _np.array([float(v) for v in frame['normal']])
+    uv, in_front = _project_base_points(
+        base_T_optical, K, dist,
+        [o, o + axis_len_m * x, o + axis_len_m * y, o + axis_len_m * z])
+    return {'origin': uv[0], 'x': uv[1], 'y': uv[2], 'z': uv[3],
+            'in_front': in_front, 'axis_len_m': axis_len_m,
+            'image_wh': [int(image_wh[0]), int(image_wh[1])]}
+
+
+#: Where the last calibrated Venton frame is kept, so the axes overlay survives a
+#: server restart without re-running a calibration.
+_VENTON_FRAME_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'json', 'venton_frame.json')
+
+
+def save_venton_frame(frame, path=_VENTON_FRAME_PATH):
+    """Persist a calibrated Venton frame (origin + axes, base coordinates)."""
+    import json
+    data = {k: [float(v) for v in frame[k]]
+            for k in ('origin_m', 'x_axis', 'y_axis', 'normal')}
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+    return path
+
+
+def load_venton_frame(path=_VENTON_FRAME_PATH):
+    """The stored Venton frame dict, or None if none has been saved."""
+    try:
+        import json
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+#: Azimuths in the base XY plane for the named robot directions, for pointing
+#: the camera's image-up (north) axis along one of them.
+CAMERA_AZIMUTH = {'+x': 0.0, '+y': 90.0, '-x': 180.0, '-y': -90.0}
+
+
+def align_camera_north(robot, target_az_deg=0.0):
+    """Spin the camera in place so its image-up (north) axis points at
+    `target_az_deg` in the base XY plane (0 = +X, 90 = +Y, -90 = -Y, 180 = -X),
+    keeping it looking at the same spot. Returns (before, after) north azimuths
+    in degrees.
+
+    Rotated about the CAMERA's own axis (camtcp Z), not base Z: a base-Z
+    rotation orbits the whole arm about the base and, for anything but a tiny
+    angle, swings the camera off the table. Rotating about the camera axis
+    spins the image in place and keeps the tags in frame. North's azimuth in
+    the base XY plane is atan2(ny, nx). The camera axis points down (camtcp Z
+    is ~-Z base), so a positive rotz about it DECREASES that azimuth -- verified
+    on the robot, a +89 deg rotz moved north from -179 to +92. So the turn that
+    lands north on the target is rotz(azimuth - target), normalized to the
+    shortest direction so it never spins the long way round.
+    """
+    _camvec, northv, _eastv = robot.get_camera_vector()
+    azimuth = math.degrees(math.atan2(float(northv[1]), float(northv[0])))
+    delta = (azimuth - target_az_deg + 180.0) % 360.0 - 180.0   # shortest spin
+    robot.set_tcp(robot.camtcp)
+    robot.rotz(delta, coordinate='tcp')
+    robot.set_tcp(robot.tcp)
+    _camvec, northv, _eastv = robot.get_camera_vector()
+    after = math.degrees(math.atan2(float(northv[1]), float(northv[0])))
+    return azimuth, after
+
+
+def goto_xyz(robot, xyz):
+    """Move the tool TCP to absolute base-frame `xyz` (metres), keeping the
+    current orientation. A general positioning move -- e.g. hovering over a
+    calibrated Venton origin. Straight-line (movel) from wherever the arm is, so
+    the caller is responsible for the path being clear. Returns the pose."""
+    robot.set_tcp(robot.tcp)
+    robot.moveto([float(xyz[0]), float(xyz[1]), float(xyz[2])],
+                 acc=placement_accel, vel=placement_speed)
+    return list(robot.get_pos())
+
+
+def rotate_base_z(robot, degrees):
+    """Rotate the arm about the base Z axis by `degrees`. Orbits the TCP about
+    the base -- a large angle moves the camera a long way. Here mainly to undo
+    such an orbit; align_camera_north spins in place instead."""
+    robot.set_tcp(robot.tcp)
+    robot.rotz(float(degrees), coordinate='base')
+    return list(robot.get_pos())
+
+
+def estimate_venton_table(robot, with_scale=True):
+    """Quick, no-motion estimate of the Venton table frame in base coordinates.
+
+    Reads the fiducials from the current view open-loop (_read_tags_in_view)
+    and fits the transform -- no centring, no descending, no guard. Returns the
+    same fit dict as calibrate_venton_table (origin_m, x_axis, y_axis, normal,
+    scale, rmse_mm, tags), but it is an ESTIMATE: the open-loop read carries
+    the camera mount-geometry error, so rmse_mm (and the scale) report how
+    rough it is. For an accurate frame use calibrate_venton_table.
+    """
+    tags = venton_table_tags()
+    if len(tags) < 3:
+        raise RuntimeError("need at least 3 configured Venton fiducials; have %d"
+                           % len(tags))
+    view = _read_tags_in_view(robot, tags)
+    if len(view) < 3:
+        raise RuntimeError("saw only %d of %d fiducials in the current view; "
+                           "aim the camera so all three are visible"
+                           % (len(view), len(tags)))
+    measured, source_mm, target_m = [], [], []
+    for tid in sorted(view):
+        info = tags[tid]
+        source_mm.append([info['table_xy_mm'][0], info['table_xy_mm'][1], 0.0])
+        target_m.append(view[tid])
+        measured.append({'id': tid, 'name': info['name'],
+                         'table_xy_mm': info['table_xy_mm'], 'base_m': view[tid]})
+    fit = _calibration.table_frame_in_base(source_mm, target_m, with_scale=with_scale)
+    fit['tags'] = measured
+    return fit
+
+
+#: Poses for hand-eye data collection, each applied relative to the start pose:
+#: a tool-frame rotation ('rot', axis, deg) or a base translation ('xyz', dx,
+#: dy, dz). The rotations give the orientation variety the hand-eye solve needs;
+#: the translations help the translation part. Kept small so tag 13 stays in
+#: view (rotations pivot about the tool TCP, so the camera barely shifts).
+HANDEYE_ROT_DEG = 15.0
+HANDEYE_TRANS_M = 0.05
+HANDEYE_POSES = (
+    ('home',),
+    ('rot', 'x', HANDEYE_ROT_DEG), ('rot', 'x', -HANDEYE_ROT_DEG),
+    ('rot', 'y', HANDEYE_ROT_DEG), ('rot', 'y', -HANDEYE_ROT_DEG),
+    ('rot', 'z', HANDEYE_ROT_DEG), ('rot', 'z', -HANDEYE_ROT_DEG),
+    ('xyz', HANDEYE_TRANS_M, 0.0, 0.0), ('xyz', -HANDEYE_TRANS_M, 0.0, 0.0),
+    ('xyz', 0.0, HANDEYE_TRANS_M, 0.0), ('xyz', 0.0, -HANDEYE_TRANS_M, 0.0),
+    ('xyz', 0.0, 0.0, HANDEYE_TRANS_M), ('xyz', 0.0, 0.0, -HANDEYE_TRANS_M),
+)
+
+
+def _flange_transform(robot):
+    """base -> flange (tool0) as a 4x4, by reading the pose with a zero TCP.
+    camtcp is expressed relative to this flange, so this is the frame the
+    hand-eye X (flange -> camera) is solved in."""
+    robot.set_tcp([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    try:
+        fv = list(robot.get_pose().get_pose_vector())
+    finally:
+        robot.set_tcp(robot.tcp)
+    return _calibration.pose_vector_to_transform(fv)
+
+
+#: After a move the IP camera refocuses, so the first frames decode blurred or
+#: not at all. The ChArUco capture re-grabs for up to this long, taking the
+#: first frame that yields enough corners, before giving up on a pose.
+CHARUCO_REFOCUS_S = 4.0
+
+
+#: Calibrated camera intrinsics live here (git-ignored measured state, like the
+#: other *_positions files). Written by calibrate_camera_intrinsics, read by the
+#: ChArUco pose so it uses the real focal length and distortion instead of the
+#: assumed f.
+_INTRINSICS_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'json', 'camera_intrinsics.json')
+
+
+def load_camera_intrinsics():
+    """The stored intrinsics dict, or None if never calibrated."""
+    try:
+        import json
+        with open(_INTRINSICS_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_camera_intrinsics(data):
+    import json
+    with open(_INTRINSICS_PATH, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def apply_camera_intrinsics(robot):
+    """Apply the stored calibrated focal length to the whole system, so every
+    distance measurement (AprilTag QRdistance, descends, the Venton read) uses
+    it instead of the assumed f.
+
+    The camera recomputes self.camera_f from a module-level base on every
+    capture (urcamera.capture: camera_f / default_imgH * frame_width), so a
+    one-off instance override would be wiped the next frame. Instead the module
+    base is set so that recompute lands on the calibrated focal length at the
+    calibrated frame width. The ChArUco pose already uses the full stored matrix
+    and is unaffected. Returns the applied focal length, or None if no
+    intrinsics are stored. Safe to call at startup.
+    """
+    intr = load_camera_intrinsics()
+    if not intr or not intr.get('fx'):
+        return None
+    import sys
+    f_eff = 0.5 * (float(intr['fx']) + float(intr['fy']))
+    wh = intr.get('image_wh') or [getattr(robot.camera, 'imgH', 640), 0]
+    width = float(wh[0]) or 640.0
+    cam_mod = sys.modules[type(robot.camera).__module__]
+    # capture() does: self.camera_f = cam_mod.camera_f / cam_mod.default_imgH * frame_width
+    cam_mod.camera_f = f_eff * float(cam_mod.default_imgH) / width
+    robot.camera.camera_f = f_eff
+    print("PAL12idb: applied calibrated focal length %.1f px (was assumed ~810) "
+          "to the camera; distance measurements now use it." % f_eff)
+    return f_eff
+
+
+def _camera_matrix_and_dist(robot, image_wh):
+    """(camera_matrix 3x3, dist_coeffs) to use for ChArUco pose: the calibrated
+    intrinsics if present (and matching this frame size), else a rough pinhole
+    from the assumed focal length. Warns once if the stored size differs."""
+    intr = load_camera_intrinsics()
+    if intr and intr.get('camera_matrix'):
+        stored_wh = intr.get('image_wh')
+        if stored_wh and tuple(stored_wh) != tuple(image_wh):
+            print("PAL12idb: WARNING camera intrinsics were calibrated at %s "
+                  "but frames are %s; the focal length will not match."
+                  % (stored_wh, list(image_wh)))
+        return (_np.asarray(intr['camera_matrix'], float),
+                _np.asarray(intr.get('dist_coeffs') or [], float))
+    return (_calibration.camera_matrix_from_f(robot.camera.camera_f, image_wh), None)
+
+
+def _charuco_board_and_f(robot):
+    spec = _config.get_section('charuco')
+    board = _calibration.make_charuco_board(spec)
+    return board, spec, float(robot.camera.camera_f)
+
+
+def _charuco_gray(robot):
+    """Current camera frame as grayscale, or None. Captures if idle."""
+    import cv2
+    if not robot.camera._running:
+        robot.camera.capture()
+    img = robot.camera.image
+    if img is None:
+        return None
+    return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+
+
+def _detect_charuco_in_base(robot, board, min_corners, refocus_s):
+    """Capture (retrying through the post-move refocus) and return
+    (cam_T_board 4x4, n_corners), or (None, best_n) if the board never came in
+    sharp enough. Uses the calibrated intrinsics when available."""
+    deadline = time.time() + refocus_s
+    best_n = 0
+    while True:
+        gray = _charuco_gray(robot)
+        if gray is not None:
+            K, dist = _camera_matrix_and_dist(robot, (gray.shape[1], gray.shape[0]))
+            T, n = _calibration.charuco_board_pose(
+                gray, board, K, dist_coeffs=dist, min_corners=min_corners)
+            best_n = max(best_n, n)
+            if T is not None:
+                return T, n
+        if time.time() >= deadline:
+            return None, best_n
+        time.sleep(0.3)         # let the camera refocus, then look again
+
+
+#: Poses for intrinsics calibration: the board should appear across the image at
+#: varied angles AND distances (the Z steps), which is what constrains focal
+#: length and distortion. Relative to the start pose; same ('rot'/'xyz') format.
+INTRINSICS_POSES = (
+    ('home',),
+    ('rot', 'x', 15.0), ('rot', 'x', -15.0),
+    ('rot', 'y', 15.0), ('rot', 'y', -15.0),
+    ('rot', 'z', 12.0), ('rot', 'z', -12.0),
+    ('xyz', 0.06, 0.0, 0.0), ('xyz', -0.06, 0.0, 0.0),
+    ('xyz', 0.0, 0.06, 0.0), ('xyz', 0.0, -0.06, 0.0),
+    ('xyz', 0.0, 0.0, 0.07), ('xyz', 0.0, 0.0, -0.05),   # distance variety
+    ('xyz', 0.05, 0.05, 0.0), ('xyz', -0.05, -0.05, 0.05),
+)
+
+
+def _apply_relative_pose(robot, home, hx, hy, hz, pose):
+    """Move to one HANDEYE/INTRINSICS pose entry relative to home."""
+    robot.set_tcp(robot.tcp)
+    robot.set_pose(home)
+    kind = pose[0]
+    if kind == 'rot':
+        _, axis, deg = pose
+        {'x': robot.rotx, 'y': robot.roty, 'z': robot.rotz}[axis](deg, coordinate='tcp')
+    elif kind == 'xyz':
+        _, dx, dy, dz = pose
+        if dx or dy or dz:
+            robot.moveto([hx + dx, hy + dy, hz + dz])
+
+
+def _detect_charuco_corners_refocus(robot, board, min_corners, refocus_s):
+    """(charuco_corners, charuco_ids, n) once the board is sharp, or (None,
+    None, best_n) after `refocus_s`. Waits out the post-move camera refocus."""
+    deadline = time.time() + refocus_s
+    best = (None, None, 0)
+    while True:
+        gray = _charuco_gray(robot)
+        if gray is not None:
+            cc, ci = _calibration.detect_charuco_corners(gray, board)
+            n = 0 if ci is None else len(ci)
+            if n > best[2]:
+                best = (cc, ci, n)
+            if n >= min_corners:
+                return cc, ci, n
+        if time.time() >= deadline:
+            return None, None, best[2]
+        time.sleep(0.3)
+
+
+def collect_charuco_corner_views(robot, poses=INTRINSICS_POSES, settle_s=1.5,
+                                 refocus_s=CHARUCO_REFOCUS_S):
+    """Drive to each pose and collect (charuco_corners, charuco_ids) for
+    intrinsics. Returns (views, image_wh). Leaves the arm at the start pose."""
+    board, spec, _f = _charuco_board_and_f(robot)
+    min_corners = int(spec.get('min_corners', 6))
+    robot.set_tcp(robot.tcp)
+    home = robot.get_pose()
+    hx, hy, hz = float(home.pos[0]), float(home.pos[1]), float(home.pos[2])
+    views, image_wh = [], None
+    try:
+        for pose in poses:
+            _apply_relative_pose(robot, home, hx, hy, hz, pose)
+            time.sleep(settle_s)
+            gray = _charuco_gray(robot)
+            if gray is not None and image_wh is None:
+                image_wh = (gray.shape[1], gray.shape[0])
+            cc, ci, n = _detect_charuco_corners_refocus(robot, board, min_corners, refocus_s)
+            label = pose[0] if len(pose) == 1 else "%s" % (pose,)
+            if ci is None:
+                print("PAL12idb: intrinsics pose %s -- board not sharp (best %d), "
+                      "skipped" % (label, n))
+                continue
+            views.append((cc, ci))
+            print("PAL12idb: intrinsics pose %-18s %d corners" % (label, n))
+    finally:
+        robot.set_tcp(robot.tcp)
+        robot.set_pose(home)
+    return views, (image_wh or (640, 480))
+
+
+def calibrate_camera_intrinsics(robot):
+    """Calibrate the camera matrix + distortion from ChArUco views at varied
+    poses, store them (camera_intrinsics.json), and return the result dict. The
+    stored intrinsics are then used by every ChArUco pose, replacing the assumed
+    focal length -- which is what the hand-eye solve and the distance scale need.
+
+    Moves the robot. Leave the board comfortably in view first."""
+    board, spec, _f = _charuco_board_and_f(robot)
+    views, image_wh = collect_charuco_corner_views(robot)
+    result = _calibration.calibrate_intrinsics(
+        views, image_wh, board, min_corners=int(spec.get('min_corners', 6)))
+    result['assumed_f'] = float(robot.camera.camera_f)
+    save_camera_intrinsics(result)
+    apply_camera_intrinsics(robot)      # take effect now, no restart needed
+    return result
+
+
+def collect_handeye_charuco(robot, poses=HANDEYE_POSES, settle_s=1.5,
+                            refocus_s=CHARUCO_REFOCUS_S):
+    """Like collect_handeye_samples but the target is the ChArUco board, whose
+    pose is unambiguous. Returns (flanges, cams, labels). Waits out the camera
+    refocus after each move before trusting a frame."""
+    board, spec, _f = _charuco_board_and_f(robot)
+    min_corners = int(spec.get('min_corners', 6))
+    robot.set_tcp(robot.tcp)
+    home = robot.get_pose()
+    hx, hy, hz = float(home.pos[0]), float(home.pos[1]), float(home.pos[2])
+    flanges, cams, labels = [], [], []
+    try:
+        for pose in poses:
+            robot.set_tcp(robot.tcp)
+            robot.set_pose(home)
+            kind = pose[0]
+            if kind == 'rot':
+                _, axis, deg = pose
+                {'x': robot.rotx, 'y': robot.roty, 'z': robot.rotz}[axis](
+                    deg, coordinate='tcp')
+            elif kind == 'xyz':
+                _, dx, dy, dz = pose
+                if dx or dy or dz:
+                    robot.moveto([hx + dx, hy + dy, hz + dz])
+            time.sleep(settle_s)
+            C, n = _detect_charuco_in_base(robot, board, min_corners, refocus_s)
+            label = pose[0] if len(pose) == 1 else "%s" % (pose,)
+            if C is None:
+                print("PAL12idb: hand-eye pose %s -- ChArUco not sharp enough "
+                      "(best %d corners), skipped" % (label, n))
+                continue
+            flanges.append(_flange_transform(robot))
+            cams.append(C)
+            labels.append(label)
+            print("PAL12idb: hand-eye pose %-6s ChArUco %d corners" % (label, n))
+    finally:
+        robot.set_tcp(robot.tcp)
+        robot.set_pose(home)
+    return flanges, cams, labels
+
+
+def collect_handeye_samples(robot, tag_id, poses=HANDEYE_POSES, settle_s=1.0):
+    """Drive to each pose and record (base->flange, camera->tag) for `tag_id`.
+
+    Returns (flanges, cams, labels): matched lists of 4x4 transforms and the
+    pose labels that produced them. A pose where the tag is not detected (or has
+    no solvePnP pose) is skipped. Leaves the arm at the start pose, tool TCP
+    active. The camera->tag pose is the detector's solvePnP output (optical
+    frame: x right, y down, z forward), scaled by the tag's configured size.
+    """
+    tags = venton_table_tags()
+    size_m = tags.get(tag_id, {}).get('size_m', DEFAULT_APRILTAG_SIZE)
+    robot.set_tcp(robot.tcp)
+    home = robot.get_pose()
+    hx, hy, hz = float(home.pos[0]), float(home.pos[1]), float(home.pos[2])
+    flanges, cams, labels = [], [], []
+    try:
+        for pose in poses:
+            robot.set_tcp(robot.tcp)
+            robot.set_pose(home)
+            kind = pose[0]
+            if kind == 'rot':
+                _, axis, deg = pose
+                {'x': robot.rotx, 'y': robot.roty, 'z': robot.rotz}[axis](
+                    deg, coordinate='tcp')
+            elif kind == 'xyz':
+                _, dx, dy, dz = pose
+                if dx or dy or dz:
+                    robot.moveto([hx + dx, hy + dy, hz + dz])
+            time.sleep(settle_s)
+            robot.camera.AT_physical_size = size_m
+            robot.camera.AT_preferred_id = tag_id
+            r = camera_tools._detect_apriltag(robot, tag_id=tag_id)
+            if r is None or getattr(r, 'pose_R', None) is None:
+                print("PAL12idb: hand-eye pose %s -- tag %d not usable, skipped"
+                      % (pose[0] if len(pose) == 1 else pose, tag_id))
+                continue
+            C = _np.eye(4)
+            C[:3, :3] = _np.asarray(r.pose_R, float)
+            C[:3, 3] = _np.asarray(r.pose_t, float).ravel()
+            flanges.append(_flange_transform(robot))
+            cams.append(C)
+            labels.append(pose[0] if len(pose) == 1 else "%s" % (pose,))
+    finally:
+        robot.set_tcp(robot.tcp)
+        robot.set_pose(home)
+    return flanges, cams, labels
+
+
+def run_handeye_calibration(robot, tag_id=13, target='charuco'):
+    """Collect target views from varied poses and solve for camtcp.
+
+    target='charuco' (default) uses the ChArUco board -- an unambiguous,
+    many-corner pose, far better than a single AprilTag (whose bimodal pose
+    gave a 3.5 deg residual). target='apriltag' falls back to `tag_id`.
+
+    Returns a dict: `camtcp` (the solved [x,y,z,rx,ry,rz] flange->camera pose
+    vector), `current_camtcp` (what the robot uses now, for comparison),
+    `samples`, and the solve's rotation residual. Does NOT write the result --
+    it is reported for review; apply it by editing the robot's camtcp.
+
+    Moves the robot (small rotations/translations about the start pose). Leave
+    the target comfortably in view first.
+    """
+    if target == 'charuco':
+        flanges, cams, labels = collect_handeye_charuco(robot)
+        what = "the ChArUco board"
+    else:
+        flanges, cams, labels = collect_handeye_samples(robot, tag_id)
+        what = "tag %d" % tag_id
+    if len(flanges) < 3:
+        raise RuntimeError(
+            "only %d usable views of %s; need >= 3 (and varied orientation). "
+            "Aim the camera so the target stays in view across small tilts."
+            % (len(flanges), what))
+    out = _calibration.solve_hand_eye(flanges, cams)
+    camtcp = _calibration.transform_to_pose_vector(out['X'])
+    return {'camtcp': [round(v, 6) for v in camtcp],
+            'current_camtcp': [round(float(v), 6) for v in robot.camtcp],
+            'samples': len(flanges),
+            'rot_residual_deg_mean': round(out['rot_residual_deg_mean'], 4),
+            'rot_residual_deg_max': round(out['rot_residual_deg_max'], 4),
+            'pairs': out['pairs'], 'labels': labels}
+
+
+def measure_venton_tag(robot, tag_id):
+    """Closed-loop measure one Venton fiducial from the current pose, for the
+    operator-assisted calibration: the operator jogs the camera so the tag sits
+    near the image centre, then this centres precisely, descends close,
+    re-centres and projects (_measure_tag_in_base).
+
+    Near-centre to start keeps the centring move small (the large move from an
+    off-centre tag is what failed the fully automatic version), and ending
+    directly over the tag is what makes the result independent of where the
+    camera was -- the property the open-loop estimate lacked. Returns the base
+    [x, y, z] in metres, or None if the tag could not be acquired.
+    """
+    tags = venton_table_tags()
+    if tag_id not in tags:
+        raise RuntimeError("tag %d is not a configured Venton fiducial %s"
+                           % (tag_id, sorted(tags)))
+    return _measure_tag_in_base(robot, tag_id, tags[tag_id]['size_m'])
+
+
+def venton_fit_from_measurements(measurements, with_scale=True):
+    """Fit the table frame from {id: base_xyz} points collected one at a time
+    by measure_venton_tag. Needs >= 3 non-collinear tags. No residual guard:
+    the operator is iterating and sees rmse_mm in the reply to judge it."""
+    tags = venton_table_tags()
+    source_mm, target_m, used = [], [], []
+    for tid in sorted(measurements):
+        if tid not in tags:
+            continue
+        info = tags[tid]
+        source_mm.append([info['table_xy_mm'][0], info['table_xy_mm'][1], 0.0])
+        target_m.append(measurements[tid])
+        used.append({'id': tid, 'name': info['name'],
+                     'table_xy_mm': info['table_xy_mm'],
+                     'base_m': [round(float(v), 6) for v in measurements[tid]]})
+    if len(used) < 3:
+        raise RuntimeError("have %d measured tags; need 3 non-collinear "
+                           "(measure each with measure_venton_tag <id>)" % len(used))
+    fit = _calibration.table_frame_in_base(source_mm, target_m, with_scale=with_scale)
+    fit['tags'] = used
+    return fit
+
+
+#: Camera poses to read the fiducials from, each a small translation (metres,
+#: base frame) off wherever the arm starts. Deliberately ONLY +/-50 mm along X,
+#: Y and Z -- no descent to a standoff (that dropped the tags out of view) and
+#: no large centring move (that would not execute). Small bounded moves that
+#: run reliably, with every tag staying in frame at each. The first entry is
+#: the start pose itself.
+VENTON_CALIB_POSES = (
+    ('home', 0.0, 0.0, 0.0),
+    ('+X30', 0.03, 0.0, 0.0),
+    ('-X30', -0.03, 0.0, 0.0),
+    ('+Y30', 0.0, 0.03, 0.0),
+    ('-Y30', 0.0, -0.03, 0.0),
+    ('+Z30', 0.0, 0.0, 0.03),      # up only -- never step down toward the table
+)
+
+#: Pause after each move before reading, so the camera has refocused.
+VENTON_SETTLE_S = 1.0
+
+
+def calibrate_venton_table(robot, poses=VENTON_CALIB_POSES, with_scale=True,
+                           settle_s=VENTON_SETTLE_S):
+    """Find the Venton table's surface frame in robot base coordinates.
+
+    Reads the configured fiducials (venton_table_tags) open-loop from several
+    small camera offsets (`poses`: +/-50 mm along X, Y, Z from the start pose,
+    no descent, no centring) and fits one transform over all the readings
+    (calibration.table_frame_in_base). Each tag seen at each pose adds a
+    correspondence; the fit averages them, and the per-tag spread across poses
+    is reported as a quality number.
+
+    Open-loop here because the closed-loop path cannot run on this setup: the
+    descent to a standoff drops the tags out of view, and a large centring move
+    does not complete. These small +/-50 mm moves do run reliably and keep all
+    tags in frame. The reading still carries the camera mount-geometry error,
+    so the result is an estimate -- rmse_mm and the per-tag spread say how
+    rough -- not a taught-accuracy frame.
+
+    Returns the fit dict (origin_m, x_axis, y_axis, normal, scale, rmse_mm) plus
+    'tags'. Raises RuntimeError only if fewer than three tags were seen across
+    all poses; no residual guard, so the operator sees the numbers and judges.
+
+    MOVES the robot -- only the small offsets above, returning to the start pose
+    at the end.
+    """
+    tags = venton_table_tags()
+    if len(tags) < 3:
+        raise RuntimeError(
+            "need at least 3 configured Venton fiducials (id + table_xy_mm); "
+            "have %d" % len(tags))
+    # The TCP is the camera centre (camtcp) for the moves, so the +/-50 mm
+    # offsets translate the camera itself -- a clean, known camera baseline
+    # between views rather than a tool move that drags the camera along an arc.
+    # Re-asserted before every move because _read_tags_in_view switches back to
+    # the tool TCP internally (get_camera_vector rebuilds the view direction
+    # from the tool orientation).
+    robot.set_tcp(robot.camtcp)
+    home = robot.get_pose()                      # camera-centre pose
+    hx, hy, hz = float(home.pos[0]), float(home.pos[1]), float(home.pos[2])
+    per_tag = {tid: [] for tid in tags}
+    try:
+        for label, dx, dy, dz in poses:
+            robot.set_tcp(robot.camtcp)             # moves are of the camera centre
+            robot.set_pose(home)                    # full return, then one small offset
+            if dx or dy or dz:
+                robot.moveto([hx + dx, hy + dy, hz + dz])
+            time.sleep(settle_s)
+            view = _read_tags_in_view(robot, tags)  # manages its own TCP for the read
+            for tid, base in view.items():
+                per_tag[tid].append(base)
+            print("PAL12idb: Venton pose %-5s saw tags %s" % (label, sorted(view)))
+    finally:
+        robot.set_tcp(robot.camtcp)
+        robot.set_pose(home)                        # always leave the camera where it started
+        robot.set_tcp(robot.tcp)
+
+    measured, source_mm, target_m = [], [], []
+    for tid in sorted(tags):
+        views = per_tag[tid]
+        if not views:
+            print("PAL12idb: Venton tag %d (%s) not seen from any pose"
+                  % (tid, tags[tid]['name']))
+            continue
+        avg = [sum(v[i] for v in views) / len(views) for i in range(3)]
+        spread_mm = 1000.0 * max(
+            (sum((a - b) ** 2 for a, b in zip(v, avg)) ** 0.5 for v in views),
+            default=0.0)
+        info = tags[tid]
+        source_mm.append([info['table_xy_mm'][0], info['table_xy_mm'][1], 0.0])
+        target_m.append(avg)
+        measured.append({'id': tid, 'name': info['name'],
+                         'table_xy_mm': info['table_xy_mm'], 'base_m': avg,
+                         'passes': len(views), 'spread_mm': round(spread_mm, 2)})
+    if len(measured) < 3:
+        raise RuntimeError(
+            "saw only %d of %d configured Venton fiducials across all poses; "
+            "need 3 non-collinear to fit a frame" % (len(measured), len(tags)))
+    fit = _calibration.table_frame_in_base(source_mm, target_m, with_scale=with_scale)
+    fit['tags'] = measured
+    return fit
+
+
+def venton_calibration_summary(fit):
+    """A plain-float, JSON-safe view of a calibrate_venton_table result, for
+    reporting over ZMQ or logging. numpy arrays become lists; nothing here
+    touches the robot."""
+    rnd = lambda v, n=6: [round(float(x), n) for x in v]
+    return {
+        'origin_m': rnd(fit['origin_m']),
+        'x_axis': rnd(fit['x_axis']),
+        'y_axis': rnd(fit['y_axis']),
+        'normal': rnd(fit['normal']),
+        'scale': round(float(fit['scale']), 6),
+        'rmse_mm': round(float(fit['rmse_mm']), 3),
+        'max_error_mm': round(float(fit['max_error_mm']), 3),
+        'tags': [{'id': t['id'], 'name': t['name'],
+                  'table_xy_mm': t['table_xy_mm'], 'base_m': rnd(t['base_m']),
+                  'passes': t.get('passes'), 'spread_mm': t.get('spread_mm')}
+                 for t in fit['tags']],
+    }
 # Camera-to-tag distance the close-range pass of locate_apriltag works from.
 apriltag_view_distance = 0.2
 # Recovery for a tag that drops out of view partway through a teach, after the
@@ -164,6 +1291,8 @@ apriltag_reacquire_settle = 2.0
 # search skips Zalign() as well -- levelling the tool first would square it to
 # a surface the tag is not parallel to. See camera_tools.search_apriltag_by_tilt.
 APRILTAG_NOT_FLAT = ('cleaning_station',)
+
+
 # Speed and acceleration for setting the flowcell down on the sample stage:
 # half of what every other move runs at. Imported from robUR rather than
 # hard-coded to 0.05, so this stays half of whatever the default becomes.
@@ -263,7 +1392,7 @@ def _recoverable_station(station):
     cleaning station by a fixed offset (see _sample_on_mixer_from), and there
     is no tag on the seat itself to search for.
     """
-    return station in APRILTAG_SIZES
+    return station in APRILTAG_SUBJECT
 flowcell_ID = state.get_flowcell_in_use()
 from . import capath
 capath.ensure()                 # must precede the epics import: see capath.py
@@ -1728,6 +2857,34 @@ def tweak_position(robot, axis, metres):
     robot.moveto(target, acc=placement_accel, vel=placement_speed)
     return list(robot.get_pos())
 
+def put_camera_to_tcp(robot):
+    """Move the camera onto the pose the gripper tip occupies now.
+
+    The arm translates by the camera offset; it does not reorient. Since the
+    tool is normally face-down, the camera ends up face-down too, which is why
+    this is also how a search makes the camera level. Leaves the gripper TCP
+    active (robUR.put_camera2tcp), so a pose read afterwards is the tool's.
+
+    Exposed as a button because "start from the current position" needs the
+    camera already looking down before it will search without reorienting:
+    this is how the operator gets it there.
+    """
+    robot.put_camera2tcp()
+    return list(robot.get_pos())
+
+def put_tcp_to_camera(robot):
+    """Move the gripper tip onto the pose the camera occupies now.
+
+    The inverse of put_camera_to_tcp, and the way back after one: having lined
+    the camera up on something, this brings the tool to that same spot. Leaves
+    the camera TCP active (robUR.put_tcp2camera), which is what the caller
+    wants while still looking through it -- every PALmixer transport asserts
+    robot.tcp before it moves, so a camera TCP left live here cannot leak into
+    one.
+    """
+    robot.put_tcp2camera()
+    return list(robot.get_pos())
+
 def goto_station(robot, pos):
     """Move the robot to station `pos`'s taught position, via transfer_point.
 
@@ -1877,7 +3034,7 @@ def descend_to_apriltag(robot, distance = apriltag_view_distance, tolerance = 0.
     Returns the last measured camera-to-tag distance, or None if no tag could
     be read at all. robot.camera.AT_physical_size has to already be set to the
     size of the tag being looked at -- locate_apriltag() does that from
-    APRILTAG_SIZES -- since the measurement is directly proportional to it.
+    apriltag_size() -- the measurement is directly proportional to it.
 
     Measure and move is iterated rather than done once, because each step is
     only as good as the single frame behind it; the loop stops as soon as the
@@ -1923,7 +3080,8 @@ def descend_to_apriltag(robot, distance = apriltag_view_distance, tolerance = 0.
     return measured
 
 def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
-                    ref_pos=None, store=True, via_transferpoint=True):
+                    ref_pos=None, store=True, via_transferpoint=True,
+                    from_current=False):
     # Record the taught position of a station. Returns the pose it found, and
     # also stores it in sample_table / cleaning_station. stop_event, if given,
     # is a threading.Event the caller can set (alongside stopping the robot)
@@ -1939,16 +3097,38 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
     # ref_pos lets a caller say where to search from instead. Protective-stop
     # recovery does: it stands over the seat it just failed at, not at the
     # tuned teaching standoff (see _recovery_search_pose).
-    if ref_pos is None:
+    # from_current searches from wherever the arm is standing. For a station
+    # that has moved far enough that its configured reference no longer looks
+    # anywhere near the tag: drive or jog the camera over it by eye (the
+    # Configuration tab shows the view), then search from there. Nothing is
+    # read from waypoints.ini or search_refs, so it also works for a station
+    # whose stored position is wrong in a way that would send the arm
+    # somewhere unhelpful or unsafe.
+    if from_current:
+        robot.set_tcp(robot.tcp)
+        ref_pos = list(robot.get_pos())
+    elif ref_pos is None:
         ref_pos = search_reference(pos)
-    print(f"Looking for {pos} .... (from {[round(v, 4) for v in ref_pos[:3]]})")
+    print("Looking for %s .... (%s)" % (pos, "from where the arm is standing"
+          if from_current else "from %s" % [round(v, 4) for v in ref_pos[:3]]))
     # Tell the camera how big the tag it is about to look at actually is,
     # before anything measures a distance from it. This is read by every
     # distance-based step downstream, not just the descent below: the tilt
     # search's own "descend until the tag is 0.2 m away" loop, the pivot point
     # roll_around_tag() sets, and the pixels-to-meters conversion in
     # center_camera2apriltag() all scale with it.
-    robot.camera.AT_physical_size = APRILTAG_SIZES.get(pos, flowcell_apriltag_size)
+    robot.camera.AT_physical_size = apriltag_size(pos)
+    # And which tag it is, when the station names one. Same scope as the size
+    # above and set beside it for that reason: both describe the tag being
+    # looked for, and both are read by every detection downstream rather than
+    # being passed from step to step.
+    #
+    # Without this, a frame with two tags in it is resolved by "nearest the
+    # image center" -- decided afresh each time, so the tilt grid, the roll
+    # and the descent can each land on a different tag, and the size set above
+    # then belongs to the wrong one. None restores that behaviour, which is
+    # correct while only one tag can be in view.
+    robot.camera.AT_preferred_id = apriltag_id(pos)
     # Arrive at the reference pose through the corridor, like every other move
     # that crosses the cell. search_apriltag_by_tilt() opens with a direct
     # moveto(ref_pos), which from the far side sweeps the arm through whatever
@@ -1965,7 +3145,14 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
     # via_transferpoint=False for a recovery search: the arm is standing on the
     # seat it stopped at, so the corridor detour would drag it sideways out of
     # whatever it is touching before lifting off it.
-    if via_transferpoint:
+    #
+    # from_current skips the approach outright. Routing through the corridor to
+    # reach a pose the arm is already on would be the whole point of the mode
+    # thrown away, and already_at() cannot be relied on to notice: the operator
+    # may well have jogged to within its radius of some *other* station.
+    if from_current:
+        pass
+    elif via_transferpoint:
         move_via_transferpoint(robot, list(ref_pos))
     else:
         robot.moveto(list(ref_pos))
@@ -1980,7 +3167,7 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
     # sitting on the tag, for a result the first pass had already reached.
     found = camera_tools.search_apriltag_by_tilt(
         robot, ref_pos=ref_pos, align_to_tag=(pos in APRILTAG_NOT_FLAT),
-        stop_event=stop_event, skip_roll=skip_roll)
+        stop_event=stop_event, skip_roll=skip_roll, from_current=from_current)
     if not found:
         # Previously this fell through to grab/bump/record a position even
         # on a failed or aborted search -- since the robot could be
@@ -1996,6 +3183,15 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
         reason = getattr(camera_tools, 'last_search_failure', None)
         raise RuntimeError("AprilTag alignment for %s failed: %s"
                            % (pos, reason or "no reason reported"))
+    # Which tag this actually measured. Worth a line even when it is the only
+    # one that could have been: the position about to be recorded is derived
+    # from this tag, and with more than one in the cell "the search succeeded"
+    # does not by itself say it succeeded on the right thing. It is also how
+    # an operator reads off the number to put in apriltag_ids.
+    seen = list(getattr(robot.camera, 'AT_ids', []) or [])
+    print("Found %s on AprilTag %s%s." % (
+        pos, getattr(robot.camera, 'AT_id', None),
+        " (tags in view: %s)" % seen if len(seen) > 1 else ""))
     # Settle on a known standoff before the grab. Not for the recorded value --
     # the bump below feels for contact, so it lands in the same place either
     # way -- but so the bump always travels about the same distance, whether

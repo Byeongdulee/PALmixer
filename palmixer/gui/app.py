@@ -100,7 +100,10 @@ class MainWindow(QMainWindow):
         status_panel = self._build_status_panel()
 
         self.tabs = QTabWidget()
-        self.config_tab = ConfigTab(robot_ip, self.send_command)
+        # query: a synchronous send-and-get-reply, for the camera's Venton axes
+        # overlay (which needs the projected pixels back, not fire-and-forget).
+        self.config_tab = ConfigTab(robot_ip, self.send_command,
+                                    query=self.client.send)
         self.experiment_tab = ExperimentTab(self.send_command)
         self.workflow_tab = WorkflowTab(self.send_command)
         self.tabs.addTab(self.config_tab, "Configuration")
