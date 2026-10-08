@@ -186,6 +186,36 @@ def test_a_nonsense_entry_falls_back_instead_of_raising(tags, entry, capsys):
     assert PAL12idb.apriltag_size("sample_table") > 0
 
 
+# -- the search refuses to fall back to proximity --------------------------
+
+class _Cam:
+    pass
+
+
+class _Rob:
+    def __init__(self):
+        self.camera = _Cam()
+        self.tcp = [0, 0, 0.195, 0, 0, 0]
+        self.moved = False
+    def set_tcp(self, tcp):
+        pass
+    def get_pos(self):
+        return [0.0, 0.0, 0.2]
+    def moveto(self, *a, **k):
+        self.moved = True       # must never be reached when the id is missing
+
+
+def test_search_refuses_a_station_whose_id_is_unset(tags):
+    """With other tags now on the bench, a station search must lock onto its own
+    id -- never fall back to nearest-the-centre. A missing id stops the search
+    before it moves, rather than letting it lock onto a neighbour."""
+    tags["mixer_head"] = {"size_m": 0.016}      # present, but no id
+    rob = _Rob()
+    with pytest.raises(RuntimeError, match="no AprilTag id configured"):
+        PAL12idb.locate_apriltag(rob, pos="mixer_station")
+    assert not rob.moved, "the search moved the arm despite the missing id"
+
+
 # -- selection, in UR_12idb ------------------------------------------------
 
 def test_selectAT_prefers_the_named_tag_over_the_centered_one():

@@ -74,9 +74,12 @@ def test_two_centimetres_wider_is_exactly_two_centimetres():
         "asked for 20 mm wider, got %.1f mm" % widened)
 
 
-def test_the_configured_default_is_the_two_centimetres_asked_for():
-    assert PAL12idb.cleaning_station_open_extra() == pytest.approx(0.02)
-    assert PAL12idb.pickup_open_count() == PAL12idb.pickup_open_count(0.02)
+def test_the_cleaning_station_no_longer_opens_wider():
+    """The flowcell cleaning station now picks up at the ordinary release()
+    opening -- the earlier 2 cm widening was dropped. 0.0 makes pickup_open_count
+    fall back to the plain release() (None), so no raw count is commanded."""
+    assert PAL12idb.cleaning_station_open_extra() == pytest.approx(0.0)
+    assert PAL12idb.pickup_open_count() is None
 
 
 def test_the_mixer_head_opens_one_centimetre_wider():

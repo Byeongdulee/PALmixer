@@ -30,6 +30,7 @@ IDLE alone says nothing about success.
     "clear_venton_measurements"           -> "OK ..." | "ERROR: <reason>"
     "goto_position <station>"             -> "ACCEPTED" | "ERROR: <reason>"
     "goto_transfer_point"                 -> "ACCEPTED" | "ERROR: <reason>"
+    "set_transfer_point_here"             -> "OK <pose>" | "ERROR: <reason>"
     "<transport_name>"                    -> "ACCEPTED" | "ERROR: <reason>"
     "zalign"                              -> "ACCEPTED" | "ERROR: <reason>"
     "release_gripper"                     -> "ACCEPTED" | "ERROR: <reason>"
@@ -43,6 +44,7 @@ IDLE alone says nothing about success.
     "draw_load_sample <slot> [sample id]" -> "ACCEPTED" | "ERROR: <reason>"
     "unload_sample [aspirate]"            -> "ACCEPTED" | "ERROR: <reason>"
     "set_flowcell <1|2>"                  -> "OK" | "ERROR: <reason>"
+    "set_position_sample_table_motors on|off" -> "OK" | "ERROR: <reason>"
     "get_state"                           -> "<JSON snapshot>"
     "set_location <what> <value>"         -> "OK" | "ERROR: <reason>"
     "reset_carousel"                      -> "OK" | "ERROR: <reason>"
@@ -166,6 +168,13 @@ GOTO_POSITION = "goto_position"
 # taught position at all: nothing to search for, nothing in waypoints.ini, and
 # so nothing for the position pre-check to refuse.
 GOTO_TRANSFER_POINT = "goto_transfer_point"
+
+# Teach the transfer point from where the arm is standing now. The transfer
+# point was a fixed corridor pose; this records the current pose as it instead
+# (PAL12idb.record_current_transfer_point -> waypoints.ini [transfer_point]), so
+# goto_transfer_point and every cross-cell leg route through the new one. Fast
+# bookkeeping like set_position_here -- no move.
+SET_TRANSFER_POINT_HERE = "set_transfer_point_here"
 
 # Measure the Venton table's surface frame in robot base coordinates by reading
 # the table fiducials (apriltags.venton_table_* with id + table_xy_mm) from the
@@ -378,6 +387,16 @@ SET_FLOWCELL = "set_flowcell"
 GET_STATE = "get_state"
 SET_LOCATION = "set_location"
 
+# Whether the sample-table transports drive the DAQ sample-stage motors
+# (sth/sav/stv) to the recorded position before approaching the sample table.
+# A persisted setting, not an action -- "on" keeps the long-standing behaviour,
+# "off" leaves those EPICS motors untouched so a transport runs even when the
+# DAQ GUI is unreachable. Fast; reported in get_state as
+# position_sample_table_motors.
+SET_POSITION_SAMPLE_TABLE_MOTORS = "set_position_sample_table_motors"
+TOGGLE_ON = "on"
+TOGGLE_OFF = "off"
+
 # -- carousel slot inventory -------------------------------------------------
 # The carousel is a consumable: a fixed number of slots, each spent once a
 # sample has been mixed in it, and the whole thing swapped out when full. Its
@@ -522,6 +541,11 @@ def goto_position_command(station):
 def goto_transfer_point_command():
     """Build the wire command to drive to the transfer point."""
     return GOTO_TRANSFER_POINT
+
+
+def set_transfer_point_here_command():
+    """Build the wire command to teach the transfer point from the current pose."""
+    return SET_TRANSFER_POINT_HERE
 
 
 def calibrate_venton_table_command():
@@ -697,6 +721,12 @@ def set_flowcell_command(flowcell_id):
 def get_state_command():
     """Build the wire command to fetch the tracking state snapshot."""
     return GET_STATE
+
+
+def set_position_sample_table_motors_command(on):
+    """Build the wire command to turn DAQ sample-table motor positioning on/off."""
+    return "%s %s" % (SET_POSITION_SAMPLE_TABLE_MOTORS,
+                      TOGGLE_ON if on else TOGGLE_OFF)
 
 
 def set_location_command(what, location):

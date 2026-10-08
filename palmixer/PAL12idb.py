@@ -110,6 +110,18 @@ cleaningstation_approach_lift = 0.05
 # feeling for the seat is to release at the seat, and anything much larger
 # gives back the height the bump was there to find.
 bump_release_backoff = 0.002
+# Default release height above the grab point for a computed-Z drop
+# (dropdown_at). The flowcell cleaning station overrides it to 2 mm: it is set
+# down at a known Z rather than by feel, 2 mm above where the flowcell was
+# grabbed, then opened. It is come down on purely vertically
+# (move_to_cleaningstation), so there is nothing to brush on the way and a known
+# height is both safe and gentler than the deep-seat bump the mixer side uses.
+dropdown_release_above = 0.005
+cleaning_station_release_above = 0.002
+# The sample stage drop releases 1 mm above the grab point: the flowcell is set
+# onto the beamline stage open-loop, and a low release lands it gently where the
+# taught pose puts it rather than dropping it the default height.
+sampletable_release_above = 0.001
 # How far below the taught pose the fast descent stops, handing over to the
 # bump. A bump creeps -- it has to, to read contact -- so feeling out the whole
 # carry clearance costs most of a minute for travel that is over known empty
@@ -1411,6 +1423,20 @@ def set_flowcell_ID(n):
     flowcell_ID = int(n)
     state.set_flowcell_in_use(flowcell_ID)
 
+
+# Whether the sample-table transports drive the DAQ sample-stage motors
+# (sth/sav/stv) to the recorded position. Read live from state so the toggle
+# survives a restart; kept as a module global, synced by set_position_sample_
+# table_motors(), the same way flowcell_ID is.
+position_sample_table_motors = state.get_position_sample_table_motors()
+
+
+def set_position_sample_table_motors(on):
+    """Turn DAQ sample-table motor positioning on or off for the transports."""
+    global position_sample_table_motors
+    position_sample_table_motors = bool(on)
+    state.set_position_sample_table_motors(position_sample_table_motors)
+
 # Field names as the 12idUR IOC actually spells them: the rotations are mixed
 # case. Uppercase RX/RY/RZ named PVs that do not exist, so every push reported
 # "PV not writable" and every pull "no value from PV" for those three. Matches
@@ -1525,6 +1551,56 @@ def set_position(ID, pos):
     publishing to the rest of the beamline stays an explicit operator action.
     """
     _write_ini_position(ID, pos)
+
+
+# The transfer point was a fixed module constant (transfer_point); it can now be
+# taught, and a taught value is kept in waypoints.ini next to the station
+# positions -- its own section rather than a waypoint ID, since it is not one.
+# The module constant stays as the default used until it is taught.
+_TRANSFER_POINT_SECTION = 'transfer_point'
+
+
+def get_transfer_point():
+    """The transfer point pose: the taught value from waypoints.ini if present,
+    else the module default. Read live (like get_position) so a re-teach takes
+    effect without a restart."""
+    parser = configparser.ConfigParser()
+    parser.read(_INI_PATH)
+    if parser.has_section(_TRANSFER_POINT_SECTION):
+        try:
+            return [parser.getfloat(_TRANSFER_POINT_SECTION, f)
+                    for f in _POSITION_FIELDS]
+        except (ValueError, configparser.NoOptionError):
+            pass        # malformed entry -> fall back to the default below
+    return list(transfer_point)
+
+
+def store_transfer_point(pose):
+    """Persist the transfer point pose to waypoints.ini. Merges into the file so
+    the station positions beside it survive."""
+    parser = configparser.ConfigParser()
+    parser.read(_INI_PATH)
+    if not parser.has_section(_TRANSFER_POINT_SECTION):
+        parser.add_section(_TRANSFER_POINT_SECTION)
+    for f, v in zip(_POSITION_FIELDS, pose):
+        parser.set(_TRANSFER_POINT_SECTION, f, repr(float(v)))
+    with open(_INI_PATH, 'w') as fp:
+        parser.write(fp)
+    return list(pose)
+
+
+def record_current_transfer_point(robot):
+    """Record where the arm is standing now as the transfer point.
+
+    Read with the gripper TCP active, like record_current_position, so the
+    stored pose is in the same frame goto_transfer_point and
+    move_via_transferpoint drive to. Unlike a station teach, the transfer point
+    is a pose the arm goes *to* directly -- no descent is applied from it -- so
+    what is jogged to is exactly what is stored.
+    """
+    robot.set_tcp(robot.tcp)
+    pose = robot.get_pose().get_pose_vector().tolist()
+    return store_transfer_point(pose)
 
 
 # -- EPICS waypoint sync -------------------------------------------------------
@@ -1900,12 +1976,15 @@ def pickup(robot, height = needle_clear_height, open_extra_m = 0.0):
     # move high enough so the needle is cleared
     robot.mvr2z(height)
 
-def dropdown_at(robot, station_pos, acc=None, vel=None):
+def dropdown_at(robot, station_pos, acc=None, vel=None,
+                release_above=dropdown_release_above):
     """Descend to `station_pos`'s release height and let go.
 
-    The release Z is 0.005 m above where pickup() grabs -- pickup() descends
-    distance_gripper_tag + grab_depth from the taught pose, so this is
-    (taught Z - distance_gripper_tag) - grab_depth + 0.005.
+    The release Z is `release_above` m above where pickup() grabs -- pickup()
+    descends distance_gripper_tag + grab_depth from the taught pose, so this is
+    (taught Z - distance_gripper_tag) - grab_depth + release_above. The default
+    is 5 mm; the flowcell cleaning station passes 2 mm
+    (cleaning_station_release_above).
 
     The full taught pose is sent rather than a relative Z move, so where the
     flowcell is set down does not depend on the clearance it was carried in
@@ -1914,7 +1993,7 @@ def dropdown_at(robot, station_pos, acc=None, vel=None):
     flowcell, the arm's own deceleration -- reads as arrival.
     """
     p = list(station_pos)
-    p[2] = p[2]-distance_gripper_tag-grab_depth+0.005
+    p[2] = p[2]-distance_gripper_tag-grab_depth+release_above
     if acc is None or vel is None:
         robot.moveto(p)
     else:
@@ -1981,18 +2060,20 @@ def dropdown_by_bump(robot, station_pos = None, backoff = bump_release_backoff,
     robot.mvr2z(lift)
 
 def dropdown(robot, height = needle_clear_height, station_pos = None,
-             by_bump = False):
+             by_bump = False, release_above = dropdown_release_above):
     # Release onto a station. Given the destination's taught pose, this
     # descends to a computed Z (dropdown_at); without one it falls back to a
     # relative move down from wherever the caller left the arm, which is only
     # right if that was the travel height `height` describes.
     #
     # by_bump feels for the seat instead: the taught Z decides only where the
-    # fast part of the descent stops, not where the gripper opens.
+    # fast part of the descent stops, not where the gripper opens. release_above
+    # is the computed-Z release height above the grab point (dropdown_at); it has
+    # no effect when by_bump is set.
     if by_bump:
         return dropdown_by_bump(robot, station_pos)
     if station_pos is not None:
-        return dropdown_at(robot, station_pos)
+        return dropdown_at(robot, station_pos, release_above=release_above)
     # move down
     robot.mvr2z(-1*(height+grab_depth-0.005))
     robot.release()
@@ -2003,9 +2084,11 @@ def dropdown_sampletable(robot):
     # The sample table drop, at half speed: it is the one placement onto the
     # beamline stage, open-loop, so anything the taught position is off by is
     # taken up by the hardware. Halving the approach is cheap -- a 0.06 m move
-    # once per sample.
+    # once per sample. Releases 1 mm above the grab point, lower than the default,
+    # to set the flowcell down gently onto the stage.
     return dropdown_at(robot, get_sampletable_position(),
-                       acc=placement_accel, vel=placement_speed)
+                       acc=placement_accel, vel=placement_speed,
+                       release_above=sampletable_release_above)
 
 
 # -- protective-stop recovery -------------------------------------------------
@@ -2198,17 +2281,18 @@ def _pickup_recovering(robot, station, height, open_extra_m = 0.0):
 
 def _dropdown_recovering(robot, station, station_pos,
                          height = needle_clear_height, by_bump = False,
-                         place = None):
+                         place = None, release_above = dropdown_release_above):
     """Set down at `station`, recovering once from a protective stop there.
 
     `place` overrides how: transport2sampletable places at half speed via
     dropdown_sampletable(), and the recovery has to re-place the same way.
-    Defaults to the ordinary dropdown().
+    Defaults to the ordinary dropdown(). `release_above` is passed to that
+    default dropdown() (the computed-Z release height above the grab point).
     """
     if place is None:
         def place():
             dropdown(robot, height=height, station_pos=station_pos,
-                     by_bump=by_bump)
+                     by_bump=by_bump, release_above=release_above)
     try:
         place()
     except Exception as e:
@@ -2325,15 +2409,15 @@ def move_via_transferpoint(robot, target):
     # crosses between the sample table and the rest of the cell -- the mixer,
     # the mixer cleaning station, or the flowcell cleaning station -- in either
     # direction and whether or not the gripper is holding anything.
-    # transfer_point is sent as a copy so a caller cannot mutate the module
-    # constant through the robot API.
+    # The transfer point is read live (get_transfer_point: the taught value, or
+    # the module default), so re-teaching it takes effect at once.
     #
     # Unless the arm is standing at `target` already: then it is not crossing
     # between the two regions at all, and going out to the corridor and back
     # is travel for its own sake. The final moveto still runs -- there can be
     # a centimetre and an orientation left to take up -- it just goes direct.
     if not already_at(robot, target):
-        robot.moveto(list(transfer_point))
+        robot.moveto(get_transfer_point())
     robot.moveto(target)
 
 def _move_leg(robot, target, via_transferpoint):
@@ -2376,7 +2460,8 @@ def move_to_cleaningstation(robot, cleaning_station, via_transferpoint = True):
 
 def transport(robot, p1, p2, height = needle_clear_height, drop_height = None,
               via_transferpoint = False, drop_by_bump = False,
-              p1_station = None, p2_station = None, open_extra_m = 0.0):
+              p1_station = None, p2_station = None, open_extra_m = 0.0,
+              drop_release_above = dropdown_release_above):
     # picking up the flowcell at p1 and dropping it at p2. The robot is assumed to be empty.
     # assuming robot is empty
     # `drop_height` is the clearance held over p2, and defaults to `height`.
@@ -2418,7 +2503,7 @@ def transport(robot, p1, p2, height = needle_clear_height, drop_height = None,
     p2[2] = p2[2]-distance_gripper_tag+drop_height
     _move_leg_recovering(robot, p2, via_transferpoint, p2_station)
     _dropdown_recovering(robot, p2_station, destination, height=drop_height,
-                         by_bump=drop_by_bump)
+                         by_bump=drop_by_bump, release_above=drop_release_above)
 # State tracking. Every transport function below is wrapped with @_tracks so
 # that wherever it is called from -- a workflow or a single button on the
 # Experiment tab -- the tracked location is updated the same way. The state
@@ -2450,6 +2535,27 @@ def _tracks(get_setter, value):
 def _flowcell_setter():
     fc = flowcell_ID
     return lambda location: state.set_flowcell_location(fc, location)
+
+
+def _align_sample_table_if_enabled():
+    """Put the DAQ sample-stage motors on the recorded sample-table position and
+    return where they were (for _restore_stage), or do nothing and return None
+    when sample-table motor positioning is turned off.
+
+    Off means exactly that -- no get_pos, no align, no restore: the sth/sav/stv
+    EPICS motors are not touched at all. So a transport runs even when the DAQ
+    GUI is unreachable or the positions were never recorded, instead of
+    align_sample_table() raising before anything moves. On, the behaviour is
+    unchanged: capture where the stage is, align it, and the caller puts it back
+    afterwards with _restore_stage().
+    """
+    if not position_sample_table_motors:
+        print("PAL12idb: sample-table motor positioning is off; not moving "
+              "sth/sav/stv.")
+        return None
+    restore_to = daq_client.get_pos()
+    daq_client.align_sample_table()
+    return restore_to
 
 
 def _restore_stage(restore_to, what):
@@ -2505,18 +2611,12 @@ def mixer2mixingstation(robot):
 # This is for measuring water background. The flowcell is not loaded with sample.
 @_tracks(_flowcell_setter, state.FC_AT_BEAM)
 def load_flowcell_from_cleaningstation_to_beam(robot):
-    # Captured before align_sample_table() moves anything, so the stage can go
-    # back to the measuring position once the flowcell is seated -- see
-    # _restore_stage(). Read first for the same reason as in
-    # load_flowcell_from_beam_to_cleaningstation: it fails here, before either
-    # the stage or the robot has moved, if the DAQ GUI cannot be reached.
-    restore_to = daq_client.get_pos()
     # Bring the DAQ sample stage back to where it was when the robot's
-    # sample_table waypoint was taught, before the robot approaches it --
-    # see daq_client.align_sample_table(). Raises before anything moves if
-    # that has never been recorded, rather than placing the flowcell at a
-    # sample table the beam is not actually looking at.
-    daq_client.align_sample_table()
+    # sample_table waypoint was taught, before the robot approaches it, and
+    # capture where it was so _restore_stage() can put it back once the flowcell
+    # is seated. Skipped entirely when sample-table motor positioning is off (the
+    # stage is then left wherever it stands) -- see _align_sample_table_if_enabled().
+    restore_to = _align_sample_table_if_enabled()
     if flowcell_ID == 1:
         cleaning_station = get_cleaningstation_position(1)
     else:
@@ -2533,26 +2633,24 @@ def load_flowcell_from_cleaningstation_to_beam(robot):
 # Bring the flowcell from the beam to the cleaning station.
 @_tracks(_flowcell_setter, state.FC_AT_CLEANING)
 def load_flowcell_from_beam_to_cleaningstation(robot):
-    # Captured before align_sample_table() moves anything, so the DAQ stage
-    # can be put back once the flowcell has actually left the sample table --
-    # see the restore at the end of this function. Raises here (before either
-    # the stage or the robot has moved) if the DAQ GUI cannot be reached,
-    # which is also what align_sample_table() is about to need.
-    restore_to = daq_client.get_pos()
-    # Same alignment, on the way off the sample table: see
-    # daq_client.align_sample_table().
-    daq_client.align_sample_table()
+    # Align the DAQ stage on the way off the sample table too, capturing where
+    # it was so it can be put back once the flowcell has actually left. Skipped
+    # entirely when sample-table motor positioning is off --
+    # see _align_sample_table_if_enabled().
+    restore_to = _align_sample_table_if_enabled()
     if flowcell_ID == 1:
         cleaning_station = get_cleaningstation_position(1)
     else:
         cleaning_station = get_cleaningstation_position(2)
     # sample table -> cleaning station: crosses between the two regions.
-    # Set down by feel, like the two mixer-side seats (BUMP_RELEASE_STATIONS):
-    # how deep the flowcell sits in its station depends on how it is held, so
-    # the seat is found rather than computed.
+    # Set down at a computed Z, 2 mm above where the flowcell was grabbed, then
+    # opened -- not by feel. It is come down on purely vertically
+    # (move_to_cleaningstation), so there is nothing to brush on the way, and a
+    # known height avoids the deep-seat bump reading the arm's own deceleration
+    # as contact.
     transport(robot, get_sampletable_position(), cleaning_station,
               height=needle_clear_height, via_transferpoint=True,
-              drop_by_bump=True,
+              drop_release_above=cleaning_station_release_above,
               p1_station='sample_table', p2_station='cleaning_station')
     # The flowcell is off the sample table now, so nothing is left for the
     # stage to be aligned to it for; put it back where it was before this
@@ -2591,12 +2689,11 @@ def ready_flowcell_to_draw(robot):
 # after drawing, the robot is holding the flowcell. Move it to the beam and drop it.
 @_tracks(_flowcell_setter, state.FC_AT_BEAM)
 def load_sample_to_beam(robot):
-    # Captured before the alignment moves the stage: this is the position the
-    # sample is actually measured at, and it is what the stage goes back to once
-    # the flowcell is down. See _restore_stage().
-    restore_to = daq_client.get_pos()
-    # See daq_client.align_sample_table().
-    daq_client.align_sample_table()
+    # Align the DAQ stage on the sample-table position and capture the measuring
+    # position it was at, so _restore_stage() can return it there once the
+    # flowcell is down. Skipped entirely when sample-table motor positioning is
+    # off -- see _align_sample_table_if_enabled().
+    restore_to = _align_sample_table_if_enabled()
     robot.mvr2z(needle_clear_height)
     p2 = list(get_sampletable_position())
     p2[2] = p2[2]-distance_gripper_tag+sampletable_clear_height
@@ -2611,15 +2708,13 @@ def load_sample_to_beam(robot):
 # after data collection, pick up the flowcell from the beam and move it to the mixer to aspirate.
 @_tracks(_flowcell_setter, state.FC_IN_GRIPPER)
 def return_sample(robot):
-    # Captured before the alignment, and restored at the end once the flowcell
-    # has left the sample table. Without this the stage would be left standing
-    # at the handoff position, and the *next* load_sample_to_beam would read
-    # that as the position to go back to -- so the measuring position would be
-    # lost after the first sample and every one after it measured in the wrong
-    # place. See _restore_stage().
-    restore_to = daq_client.get_pos()
-    # See daq_client.align_sample_table().
-    daq_client.align_sample_table()
+    # Align the DAQ stage and capture where it was, restored at the end once the
+    # flowcell has left the sample table. Without the restore the stage would be
+    # left at the handoff position and the next load_sample_to_beam would read
+    # that as the measuring position, losing it for every later sample. Skipped
+    # entirely when sample-table motor positioning is off --
+    # see _align_sample_table_if_enabled().
+    restore_to = _align_sample_table_if_enabled()
     # move up to the sample table height.
     p = robot.get_pos()
     sample_table_pos = get_sampletable_position()
@@ -2912,20 +3007,20 @@ def goto_station(robot, pos):
 def goto_transfer_point(robot):
     """Move the arm to the corridor waypoint, and stop there.
 
-    Not a taught station: transfer_point is a fixed pose in this module, so
-    there is nothing to teach and nothing to check for. This is the manual
-    "park it out of the way" / "start from somewhere known" -- from the
-    corridor every station is one ordinary move away, which is the same
-    property move_via_transferpoint relies on.
+    The pose is read live with get_transfer_point() -- the taught value if one
+    has been recorded (record_current_transfer_point), else the module default.
+    This is the manual "park it out of the way" / "start from somewhere known"
+    -- from the corridor every station is one ordinary move away, which is the
+    same property move_via_transferpoint relies on.
 
     Sent direct rather than through move_via_transferpoint, which would be
-    circular. The gripper TCP is asserted first because transfer_point is
+    circular. The gripper TCP is asserted first because the transfer point is
     expressed in that frame: an aborted AprilTag search can leave the camera
     TCP active, and that would put the camera on the pose with the gripper an
     offset away from it.
     """
     robot.set_tcp(robot.tcp)
-    target = list(transfer_point)
+    target = get_transfer_point()
     robot.moveto(target)
     return target
 
@@ -3129,6 +3224,16 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
     # then belongs to the wrong one. None restores that behaviour, which is
     # correct while only one tag can be in view.
     robot.camera.AT_preferred_id = apriltag_id(pos)
+    # Fail closed for a station that names a specific tag. "Nearest the image
+    # centre" was safe only while one tag at a time could be in view; the Venton
+    # fiducials now sit on the bench near these stations, so a search that fell
+    # back to proximity could lock onto a neighbour. If the id is missing from
+    # config, stop here with a clear message rather than search by nearest.
+    if pos in APRILTAG_SUBJECT and robot.camera.AT_preferred_id is None:
+        raise RuntimeError(
+            "no AprilTag id configured for %s (apriltags.%s.id); set it so the "
+            "search matches only that tag instead of whichever is nearest the "
+            "image centre" % (pos, _apriltag_subject(pos)))
     # Arrive at the reference pose through the corridor, like every other move
     # that crosses the cell. search_apriltag_by_tilt() opens with a direct
     # moveto(ref_pos), which from the far side sweeps the arm through whatever

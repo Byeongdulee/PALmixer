@@ -671,6 +671,21 @@ def set_flowcell_in_use(flowcell_id):
     _set(_TRACKING, "flowcell_in_use", fc)
 
 
+# -- E) position the DAQ sample-table motors? -------------------------------
+# Whether the transports that move the flowcell onto/off the sample table drive
+# the DAQ sample-stage motors (sth/sav/stv) to the recorded position first. On
+# by default -- the long-standing behaviour -- but an operator can turn it off
+# so those EPICS motors are not touched at all (e.g. when the DAQ GUI is not
+# reachable, or the stage is being positioned by hand). Persisted so a restart
+# does not silently start moving them again.
+def get_position_sample_table_motors():
+    return _get(_TRACKING, "position_sample_table_motors", "1").strip() != "0"
+
+
+def set_position_sample_table_motors(on):
+    _set(_TRACKING, "position_sample_table_motors", "1" if on else "0")
+
+
 # -- the whole picture ------------------------------------------------------
 def snapshot():
     """Everything tracked, as a plain dict. This is what goes on the wire.
@@ -689,6 +704,7 @@ def _snapshot():
         WHAT_FLOWCELL_1: get_flowcell_location(1),
         WHAT_FLOWCELL_2: get_flowcell_location(2),
         "flowcell_in_use": get_flowcell_in_use(),
+        "position_sample_table_motors": get_position_sample_table_motors(),
         "carousel_slot": get_carousel_slot(),
         "carousel_slots": carousel_slots(),
         "carousel_size": get_carousel_size(),

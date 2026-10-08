@@ -141,17 +141,17 @@ class ConfigTab(QWidget):
             self.goto_buttons.append(btn)
 
         # The corridor waypoint, kept apart from the stations because it is not
-        # one: nothing is taught for it and nothing can be unconfigured about
-        # it, so this button works on a fresh install where the others refuse.
+        # one: it falls back to a built-in default when untaught, so this button
+        # works on a fresh install where the others refuse.
         layout.addSpacing(12)
         self.transfer_point_btn = QPushButton("Transfer Point")
         self.transfer_point_btn.setToolTip(
-            "Move the robot to the transfer point -- the fixed corridor pose "
-            "every move between the sample table and the mixer side routes "
-            "through.\n\nNot a taught position, so this works before anything "
-            "has been configured. Useful to park the arm clear, or to start "
-            "from a known place: from here every station is one ordinary move "
-            "away.")
+            "Move the robot to the transfer point -- the corridor pose every "
+            "move between the sample table and the mixer side routes through.\n\n"
+            "Uses a built-in default until you teach one (Set Current Robot "
+            "Position As > Transfer Point), so this works before anything has "
+            "been configured. Useful to park the arm clear, or to start from a "
+            "known place: from here every station is one ordinary move away.")
         self.transfer_point_btn.clicked.connect(
             lambda: self._send_command(cmd.goto_transfer_point_command()))
         layout.addWidget(self.transfer_point_btn)
@@ -184,6 +184,24 @@ class ConfigTab(QWidget):
             btn.clicked.connect(lambda _checked, s=station: self._on_teach_here(s))
             layout.addWidget(btn)
             self.teach_buttons.append(btn)
+
+        # The transfer point, kept apart from the stations because it is not one
+        # (no AprilTag, its own waypoints.ini section). Teaches the corridor pose
+        # from where the arm is standing now; stored as the pose the arm goes to
+        # directly, so no descent offset applies -- what you jog to is what is
+        # used.
+        layout.addSpacing(12)
+        self.teach_transfer_point_btn = QPushButton("Transfer Point")
+        self.teach_transfer_point_btn.setToolTip(
+            "Record the robot's current pose as the transfer point -- the "
+            "corridor pose every move between the sample table and the mixer "
+            "side routes through.\n\nUnlike a station, this pose is used as-is "
+            "with no descent, so jog the arm exactly where you want the corridor "
+            "to be and press this.")
+        self.teach_transfer_point_btn.clicked.connect(self._on_teach_transfer_point)
+        layout.addWidget(self.teach_transfer_point_btn)
+        self.teach_buttons.append(self.teach_transfer_point_btn)
+
         layout.addStretch(1)
         box.setLayout(layout)
         return box
@@ -200,6 +218,16 @@ class ConfigTab(QWidget):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         self._send_command(cmd.set_position_here_command(station))
+
+    def _on_teach_transfer_point(self):
+        if QMessageBox.question(
+                self, "Set Transfer Point",
+                "Record the robot's current position as the transfer point?\n\n"
+                "This replaces the corridor pose that every cross-cell move "
+                "routes through.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._send_command(cmd.set_transfer_point_here_command())
 
     # -- jog the pose by hand, then save it ------------------------------------
     def _build_jog_group(self):

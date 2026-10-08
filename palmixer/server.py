@@ -283,6 +283,9 @@ class PALmixerServer:
             return self._set_position_here(args, orientation_only=(
                 name == cmd.SET_ORIENTATION_HERE))
 
+        if name == cmd.SET_TRANSFER_POINT_HERE:
+            return self._set_transfer_point_here(args)
+
         if name == cmd.SET_FLOWCELL:
             if len(args) != 1:
                 return "ERROR: usage: %s <%s>" % (
@@ -297,6 +300,20 @@ class PALmixerServer:
                 self.PAL12idb.set_flowcell_ID(fc)
             state.set_flowcell_in_use(fc)
             return "OK"
+
+        if name == cmd.SET_POSITION_SAMPLE_TABLE_MOTORS:
+            if len(args) != 1 or args[0] not in (cmd.TOGGLE_ON, cmd.TOGGLE_OFF):
+                return "ERROR: usage: %s %s|%s" % (
+                    cmd.SET_POSITION_SAMPLE_TABLE_MOTORS, cmd.TOGGLE_ON, cmd.TOGGLE_OFF)
+            on = args[0] == cmd.TOGGLE_ON
+            # Through PAL12idb so its module global and the persisted state move
+            # together (set_position_sample_table_motors writes both); fall back
+            # to state alone if the robot module is not loaded (--simulate GUI).
+            if self.PAL12idb is not None:
+                self.PAL12idb.set_position_sample_table_motors(on)
+            else:
+                state.set_position_sample_table_motors(on)
+            return "OK sample-table motor positioning %s" % args[0]
 
         if name == cmd.SET_LOCATION:
             if len(args) != 2 or args[0] not in cmd.LOCATION_KEYS:
@@ -1047,6 +1064,28 @@ class PALmixerServer:
         detail = "taught %s%s at %s" % (station,
                                         " orientation" if orientation_only else "",
                                         pose)
+        print(detail)
+        return "OK %s" % detail
+
+    def _set_transfer_point_here(self, args):
+        """Teach the transfer point from the robot's current pose. Fast, like
+        _set_position_here: reads a pose and writes waypoints.ini, no motion --
+        and refused while busy for the same reason, a pose sampled mid-move
+        records a point the arm was only passing through."""
+        if args:
+            return "ERROR: %s takes no arguments" % cmd.SET_TRANSFER_POINT_HERE
+        if self._busy:
+            return ("ERROR: busy (running %r); the robot has to be standing still "
+                    "to teach from it" % self._current_action)
+        if self.simulate:
+            return "OK simulated %s" % cmd.SET_TRANSFER_POINT_HERE
+        if self.rob is None:
+            return "ERROR: no robot connection"
+        try:
+            pose = self.PAL12idb.record_current_transfer_point(self.rob)
+        except Exception as e:                           # noqa: BLE001
+            return "ERROR: could not record the transfer point: %s" % e
+        detail = "taught transfer point at %s" % (pose,)
         print(detail)
         return "OK %s" % detail
 

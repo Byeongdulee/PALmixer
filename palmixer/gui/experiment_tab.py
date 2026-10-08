@@ -6,8 +6,8 @@ Configuration tab -- this tab has no direct hardware access of its own.
 """
 
 from PyQt5.QtWidgets import (
-    QDoubleSpinBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QCheckBox, QDoubleSpinBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+    QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from .. import commands as cmd
@@ -24,8 +24,26 @@ class ExperimentTab(QWidget):
         self.flowcell = FlowcellSelector(send_command)
         self.pump_status = PumpStatusPanel()
 
+        # Whether the sample-table transports drive the DAQ sample-stage motors
+        # (sth/sav/stv) to the recorded position. Checked = the long-standing
+        # behaviour; unchecked leaves those EPICS motors untouched, so a beam
+        # transfer runs even when the DAQ GUI is unreachable. A persisted server
+        # setting, so update_state() drives the box from the snapshot; not a
+        # busy_widget -- it is a fast setting, answerable any time, and it only
+        # affects the *next* transport's decision.
+        self.position_motors_check = QCheckBox("Position sample_table motors (sth/sav/stv)")
+        self.position_motors_check.setToolTip(
+            "When checked, moving the flowcell onto or off the sample table first "
+            "drives the DAQ sample-stage motors to the position recorded when the "
+            "sample_table was taught, and restores them afterwards.\n\n"
+            "Uncheck to leave sth/sav/stv untouched -- the transport then runs "
+            "without touching those EPICS motors at all (useful when the DAQ GUI "
+            "is unreachable or you are positioning the stage by hand).")
+        self.position_motors_check.toggled.connect(self._on_toggle_position_motors)
+
         layout = QVBoxLayout()
         layout.addWidget(self.flowcell)
+        layout.addWidget(self.position_motors_check)
         layout.addWidget(self._build_transport_group())
         layout.addWidget(self._build_robot_group())
         layout.addWidget(self._build_motor_group())
@@ -202,6 +220,9 @@ class ExperimentTab(QWidget):
     def _on_teach_slot(self):
         self._send_command(cmd.teach_carousel_slot_command(self.slot_box.value()))
 
+    def _on_toggle_position_motors(self, checked):
+        self._send_command(cmd.set_position_sample_table_motors_command(checked))
+
     def update_state(self, snapshot):
         """Track the configured carousel size from a state.snapshot()-shaped dict.
 
@@ -212,6 +233,14 @@ class ExperimentTab(QWidget):
         is enabled and disabled by this alone.
         """
         self.pump_status.update_state(snapshot)
+        # Reflect the server's persisted setting without re-sending it: a
+        # programmatic setChecked would otherwise fire _on_toggle_position_motors
+        # and bounce the command straight back on every 3 s poll.
+        want = snapshot.get("position_sample_table_motors")
+        if isinstance(want, bool) and want != self.position_motors_check.isChecked():
+            self.position_motors_check.blockSignals(True)
+            self.position_motors_check.setChecked(want)
+            self.position_motors_check.blockSignals(False)
         size = snapshot.get("carousel_size", cmd.UNKNOWN)
         known = isinstance(size, int) and not isinstance(size, bool) and size >= 1
         self.slot_box.setEnabled(known)
