@@ -32,7 +32,7 @@ from .mqtt_status import (
     tracking_topic,
 )
 from .pump import Pump
-from .motor import Motor
+from .motor import Motor, GalilMotor
 from .workflows import Workflows, WorkflowError
 from .zmq_transport import ZMQCommandServer, ZMQError
 
@@ -73,6 +73,25 @@ def _robot_model(robot12idb, name):
         "json/palmixer_config.json to the arm actually connected -- note that "
         "the models differ in tool geometry, so taught positions do not carry "
         "between them." % (name, ", ".join(sorted(models)) or "none found"))
+
+
+def _build_motor(motor_cfg):
+    """The motor driver for the `motor` config section.
+
+    type "galil" drives a Galil controller channel (ip + channel) -- 12idb:m6
+    was replaced by channel A of the Galil; type "epics" drives an EPICS motor
+    record (pv). Defaults to galil, the hardware actually installed.
+    """
+    kind = str(motor_cfg.get("type", "galil")).strip().lower()
+    if kind == "epics":
+        return Motor(motor_cfg.get("pv", "12idb:m6"))
+    if kind == "galil":
+        ip = motor_cfg.get("ip")
+        if not ip:
+            raise ValueError("motor.type is 'galil' but motor.ip is not set in "
+                             "json/palmixer_config.json")
+        return GalilMotor(ip, motor_cfg.get("channel", "A"))
+    raise ValueError("motor.type must be 'galil' or 'epics', got %r" % (kind,))
 
 
 class PALmixerServer:
@@ -124,7 +143,7 @@ class PALmixerServer:
         self.PAL12idb = None
         self.pump = Pump(simulate=self.simulate)
         self.pump.on_mix_record = self._pump_mix_recorded
-        self.motor = Motor(cfg["motor"].get("pv", "12idb:m6"))
+        self.motor = _build_motor(cfg["motor"])
         #: Appends locally journaled mixing outcomes to PVapp. Credentials come
         #: from the environment at startup and may be replaced for the process's
         #: lifetime by a campaign's set_credentials -- see PVappUpdater.
@@ -182,6 +201,28 @@ class PALmixerServer:
                 pal.apply_camera_intrinsics(self.rob)
             except Exception as e:
                 print("PALmixerServer: could not apply camera intrinsics: %s" % e)
+            # Apply the calibrated AprilTag-distance correction (scale + offset)
+            # to the camera, so QRdistance reads true distance everywhere (the
+            # raw pinhole value has a small scale and offset error). No-op when
+            # unset. See camera.distance_scale / distance_offset_m in the config.
+            try:
+                cam_cfg = cfg.get("camera", {}) or {}
+                scale = float(cam_cfg.get("distance_scale", 1.0))
+                offset = float(cam_cfg.get("distance_offset_m", 0.0))
+                self.rob.camera.dist_scale = scale
+                self.rob.camera.dist_offset = offset
+                print("PALmixerServer: AT distance correction scale=%.4f offset=%+.4f m"
+                      % (scale, offset))
+            except Exception as e:
+                print("PALmixerServer: could not set AT distance correction: %s" % e)
+            # Activate the gripper now so the first grab does not pay the slow
+            # activation handshake mid-move. Non-fatal: a gripper that will not
+            # activate at startup must not stop the server from coming up.
+            try:
+                pal.activate_gripper(self.rob)
+                print("PALmixerServer: gripper activated")
+            except Exception as e:
+                print("PALmixerServer: could not activate gripper: %s" % e)
             self.PAL12idb = pal
         else:
             print("PALmixerServer: --simulate mode, no hardware will be touched.")
@@ -258,6 +299,14 @@ class PALmixerServer:
 
         if name == cmd.VENTON_AXES:
             return self._venton_axes(args)
+
+        if name == cmd.GET_POSE:
+            if args:
+                return "ERROR: %s takes no arguments" % cmd.GET_POSE
+            return self._get_pose()
+
+        if name == cmd.TAG_DISTANCE:
+            return self._tag_distance(args)
 
         if name == cmd.UNLOCK_STOP:
             if args:
@@ -602,6 +651,18 @@ class PALmixerServer:
             # unconfigured about it.
             return self._goto_transfer_point, cmd.GOTO_TRANSFER_POINT
 
+        if name == cmd.UNLOAD_CAROUSEL:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.UNLOAD_CAROUSEL)
+            self._require_positions(('carousel_on_mixer', 'carousel_used_stack'))
+            return self._unload_carousel, cmd.UNLOAD_CAROUSEL
+
+        if name == cmd.PLACE_NEW_CAROUSEL:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.PLACE_NEW_CAROUSEL)
+            self._require_positions(('carousel_in_stock', 'carousel_on_mixer'))
+            return self._place_new_carousel, cmd.PLACE_NEW_CAROUSEL
+
         if name == cmd.CALIBRATE_VENTON_TABLE:
             if args:
                 raise ValueError("%s takes no arguments" % cmd.CALIBRATE_VENTON_TABLE)
@@ -734,6 +795,16 @@ class PALmixerServer:
             if args:
                 raise ValueError("%s takes no arguments" % cmd.RELEASE_GRIPPER)
             return self._release_gripper, cmd.RELEASE_GRIPPER
+
+        if name == cmd.GRAB_GRIPPER:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.GRAB_GRIPPER)
+            return self._grab_gripper, cmd.GRAB_GRIPPER
+
+        if name == cmd.BUMP_Z:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.BUMP_Z)
+            return self._bump_z, cmd.BUMP_Z
 
         if name == cmd.MOTOR_TWEAK:
             if len(args) != 2 or args[0] not in (cmd.MOTOR_FORWARD, cmd.MOTOR_REVERSE):
@@ -1155,6 +1226,22 @@ class PALmixerServer:
         getattr(self.PAL12idb, name)(self.rob)
         return "%s complete" % name
 
+    def _unload_carousel(self):
+        if self.simulate:
+            time.sleep(2)
+            state.set_carousel_on_mixer(None)
+            return "simulated unload_carousel (mixer now empty)"
+        pose = self.PAL12idb.unload_current_carousel(self.rob)
+        return "carousel unloaded to the used stack (arm at %s)" % (pose,)
+
+    def _place_new_carousel(self):
+        if self.simulate:
+            time.sleep(2)
+            return "simulated place_new_carousel"
+        pose = self.PAL12idb.place_new_carousel(self.rob)
+        return "new carousel placed on the mixer (tag %s, arm at %s)" % (
+            state.get_carousel_on_mixer(), pose)
+
     def _goto_position(self, station):
         if self.simulate:
             time.sleep(1)
@@ -1230,6 +1317,60 @@ class PALmixerServer:
         if frame is not None:
             return frame
         return self.PAL12idb.load_venton_frame() if self.PAL12idb else None
+
+    def _get_pose(self):
+        """Report the current TCP pose in the gripper frame.
+
+        A fast read -- refused while the robot is moving, since a pose read
+        mid-move is a moving target. The gripper TCP is made active so the
+        numbers match the frame taught positions and the bump height use.
+        See cmd.GET_POSE.
+        """
+        if self.simulate:
+            return "pose (m, rad): [0.0000, 0.0000, 0.3000, 0.0000, 0.0000, 0.0000] [simulated]"
+        if self.rob is None:
+            return "ERROR: no robot connection"
+        if self._busy:
+            return ("ERROR: busy -- cannot read the pose while the robot is "
+                    "moving; try again when it is idle")
+        self.rob.set_tcp(self.rob.tcp)
+        v = self.rob.get_pose().get_pose_vector().tolist()
+        return "pose (m, rad): [%s]" % ", ".join("%.4f" % x for x in v)
+
+    def _tag_distance(self, args):
+        """Report the camera-to-tag distance for the AprilTag currently in view.
+
+        Optional station arg (args[0]) sets the tag size/ids so the distance is
+        scaled for that station's tag; without it the camera's current settings
+        are used. A fast read -- refused while the robot is moving, since a frame
+        grabbed mid-move is unreliable. See cmd.TAG_DISTANCE.
+        """
+        if len(args) > 1:
+            return "ERROR: usage: %s [station]" % cmd.TAG_DISTANCE
+        station = args[0] if args else None
+        if self.simulate:
+            return "tag ? at 0.2000 m (tag size 0.0064 m) [simulated]"
+        if self.rob is None:
+            return "ERROR: no robot connection"
+        if self._busy:
+            return ("ERROR: busy -- cannot read the tag distance while the robot "
+                    "is moving; try again when it is idle")
+        pal = self.PAL12idb
+        if station is not None:
+            if station not in pal.APRILTAG_SUBJECT:
+                return "ERROR: unknown station %r" % station
+            self.rob.camera.AT_physical_size = pal.apriltag_size(station)
+            self.rob.camera.AT_preferred_id = pal.apriltag_ids(station)
+        try:
+            det = pal.camera_tools._detect_apriltag(self.rob, settle=5)
+        except Exception as e:                           # noqa: BLE001
+            return "ERROR: %s" % e
+        if det is None:
+            seen = list(getattr(self.rob.camera, "AT_ids", []) or [])
+            return "ERROR: no AprilTag in view (tags seen: %s)" % seen
+        return "tag %s at %.4f m (tag size %.4f m)" % (
+            self.rob.camera.AT_id, self.rob.camera.QRdistance,
+            self.rob.camera.AT_physical_size)
 
     def _venton_axes(self, args):
         """Project the stored Venton frame into the current view -- see
@@ -1416,6 +1557,63 @@ class PALmixerServer:
             return ("%s; flowcell %d was being held, so its location is now "
                     "unknown -- reconcile it with set_location" % (what, dropped))
         return what
+
+    def _bump_z(self):
+        """Bump straight down until the tool touches, and report the height.
+
+        A worker action (a real force-sensed descent). The gripper TCP is made
+        active so the Z it stops at is in the frame the taught positions use;
+        backoff=0 leaves it right at contact. The returned height is also stored
+        as last_result, so a client can read it back from get_state.
+        """
+        if self.simulate:
+            time.sleep(0.3)
+            return "simulated bump; surface z = 0.0000 m"
+        self.rob.set_tcp(self.rob.tcp)
+        # Fully shut the gripper first so the fingertips make a clean, defined
+        # contact -- a surface measured with an open/part-open gripper is not the
+        # same height.
+        self.PAL12idb.close_gripper_fully(self.rob)
+        z0 = self.rob.get_pos()[2]           # before the descent
+        self.rob.bump(z=-1, backoff=0.0)
+        z1 = self.rob.get_pos()[2]           # at contact
+        travel = z0 - z1                     # how far it descended to touch
+        return ("bumped; traveled %.4f m down to contact (surface z = %.4f m)"
+                % (travel, z1))
+
+    def _grab_gripper(self):
+        """Close the gripper where the arm is standing.
+
+        The mirror of _release_gripper: a worker action, refused mid-transport.
+        Closing holds nothing new as far as the tracking is concerned, so there
+        is no held-flowcell bookkeeping -- it just shuts the jaws. Like release,
+        it clears a protective stop first (the controller runs no URScript while
+        stopped) and verifies the robot did not stop during the close, so a
+        command that did not happen is not reported as if it did.
+        """
+        if self.simulate:
+            time.sleep(0.2)
+            return "simulated gripper grab"
+        mode = self._safety_mode()
+        if mode == 3:
+            print("PALmixerServer: protective stopped; clearing it before "
+                  "closing the gripper.")
+            if not self.rob.unlock_protective_stop():
+                raise RuntimeError(
+                    "the protective stop would not clear, so the gripper "
+                    "cannot be closed -- clear the cause and try again")
+        elif mode is not None and mode > 2:
+            raise RuntimeError(
+                "the robot is in safety mode %d, not a protective stop -- the "
+                "gripper cannot be closed until that is cleared at the robot"
+                % mode)
+        self.PAL12idb.activate_gripper(self.rob)
+        self.rob.grab()
+        if self._safety_mode() not in (1, 2, None):
+            raise RuntimeError(
+                "the robot stopped while grabbing, so the gripper command was "
+                "discarded -- clear the cause and try again")
+        return "gripper grabbed"
 
     def _safety_mode(self):
         """The robot's safety mode, or None if it cannot be read.

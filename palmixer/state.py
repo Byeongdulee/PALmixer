@@ -671,6 +671,45 @@ def set_flowcell_in_use(flowcell_id):
     _set(_TRACKING, "flowcell_in_use", fc)
 
 
+# -- E2) which carousel is on the mixer -------------------------------------
+# The tag id of the carousel currently sitting on the mixer, or UNKNOWN when the
+# mixer is empty. Set by place_new_carousel (to the carousel it just seated) and
+# cleared by unload_current_carousel. Purely a record of the swap -- it does not
+# touch the carousel slot inventory.
+def get_carousel_on_mixer():
+    return _get(_TRACKING, "carousel_on_mixer", UNKNOWN)
+
+
+def set_carousel_on_mixer(value):
+    _set(_TRACKING, "carousel_on_mixer", UNKNOWN if value is None else str(value))
+
+
+# The real mixer seat pose [x, y, z] (gripper frame, metres) that unload's grab
+# measures -- the camera-centred X,Y and the bumped surface Z, not the camera-based
+# taught value. Place reuses it so it lands exactly where the unload grabbed (and
+# at the true surface), mirroring the lift; see PAL12idb._grab_carousel /
+# place_new_carousel. Persisted, so it survives a restart once an unload has
+# measured it; a fixed seat does not move.
+def get_carousel_mixer_seat():
+    """The measured mixer seat as [x, y, z] in metres, or None if never measured."""
+    value = _get(_TRACKING, "carousel_mixer_seat", UNKNOWN)
+    if value == UNKNOWN:
+        return None
+    try:
+        xyz = [float(v) for v in value.split(",")]
+        return xyz if len(xyz) == 3 else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def set_carousel_mixer_seat(xyz):
+    if xyz is None:
+        _set(_TRACKING, "carousel_mixer_seat", UNKNOWN)
+    else:
+        _set(_TRACKING, "carousel_mixer_seat",
+             ",".join(repr(float(v)) for v in xyz[:3]))
+
+
 # -- E) position the DAQ sample-table motors? -------------------------------
 # Whether the transports that move the flowcell onto/off the sample table drive
 # the DAQ sample-stage motors (sth/sav/stv) to the recorded position first. On
@@ -704,6 +743,7 @@ def _snapshot():
         WHAT_FLOWCELL_1: get_flowcell_location(1),
         WHAT_FLOWCELL_2: get_flowcell_location(2),
         "flowcell_in_use": get_flowcell_in_use(),
+        "carousel_on_mixer": get_carousel_on_mixer(),
         "position_sample_table_motors": get_position_sample_table_motors(),
         "carousel_slot": get_carousel_slot(),
         "carousel_slots": carousel_slots(),

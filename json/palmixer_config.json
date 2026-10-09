@@ -1,88 +1,191 @@
 {
-    "zmq": {
-        "host": "localhost",
-        "port": 9880
+  "zmq": {
+    "host": "localhost",
+    "port": 9880
+  },
+  "mqtt": {
+    "host": "localhost",
+    "port": 1883,
+    "prefix": "aps12",
+    "beamline": "12idb"
+  },
+  "robot": {
+    "name": "UR5",
+    "ip": "UR5-12idc.xray.aps.anl.gov",
+    "ur12idb_path": {
+      "linux": "/home/beams15/S12STAFF/python_codes/UR_12idb",
+      "windows": "C:/Users/s12idb/Documents/GitHub/UR_12idb"
+    }
+  },
+  "motor": {
+    "type": "galil",
+    "ip": "164.54.122.210",
+    "channel": "A",
+    "pv": "12idb:m6"
+  },
+  "gripper": {
+    "stroke_m": 0.05,
+    "release_count": 120,
+    "cleaning_station_open_extra_m": 0.0,
+    "mixer_head_open_extra_m": 0.01,
+    "carousel_open_extra_m": 0.05
+  },
+  "charuco": {
+    "dictionary": "DICT_4X4_100",
+    "squares_x": 9,
+    "squares_y": 12,
+    "square_length_m": 0.018,
+    "marker_length_m": 0.014,
+    "min_corners": 8
+  },
+  "carousel": {
+    "size": 16,
+    "step": 4500,
+    "draw_offset_steps": 4,
+    "radius_mm": 50.0,
+    "tube_diameter_mm": 10.0
+  },
+  "pump": {
+    "mixing_speed_rpm": 800.0,
+    "min_rpm": 0.0,
+    "max_rpm": 3000.0,
+    "host": "127.0.0.1",
+    "mixer_port": 5555,
+    "flowcell_port": 5556,
+    "request_timeout_s": 5.0,
+    "poll_interval_s": 0.5,
+    "operation_timeout_s": 600.0,
+    "startup_grace_s": 10.0
+  },
+  "daq": {
+    "host": "purple.xray.aps.anl.gov",
+    "port": 9876,
+    "request_timeout_s": 5.0
+  },
+  "pvapp": {
+    "base_url": "http://bleepc.xray.aps.anl.gov:5000",
+    "username": "",
+    "owner_badge": "",
+    "required": false,
+    "timeout_s": 10.0
+  },
+  "apriltags": {
+    "flowcell_1": {
+      "id": 1,
+      "size_m": 0.0095
     },
-    "mqtt": {
-        "host": "localhost",
-        "port": 1883,
-        "prefix": "aps12",
-        "beamline": "12idb"
+    "flowcell_2": {
+      "id": 2,
+      "size_m": 0.0095
     },
-    "robot": {
-        "name": "UR5",
-        "ip": "UR5-12idc.xray.aps.anl.gov",
-        "ur12idb_path": {
-            "linux": "/home/beams15/S12STAFF/python_codes/UR_12idb",
-            "windows": "C:/Users/s12idb/Documents/GitHub/UR_12idb"
-        }
-    },
-    "motor": {
-        "pv": "12idb:m6"
-    },
-    "gripper": {
-        "stroke_m": 0.05,
-        "release_count": 120,
-        "cleaning_station_open_extra_m": 0.0,
-        "mixer_head_open_extra_m": 0.01
-    },
-    "charuco": {
-        "dictionary": "DICT_4X4_100",
-        "squares_x": 9,
-        "squares_y": 12,
-        "square_length_m": 0.018,
-        "marker_length_m": 0.014,
-        "min_corners": 8
+    "mixer_head": {
+      "id": 25,
+      "size_m": 0.016
     },
     "carousel": {
-        "size": 16,
-        "step": 1.0,
-        "draw_offset_steps": 4,
-        "radius_mm": 50.0,
-        "tube_diameter_mm": 10.0
+      "id_range": [
+        31,
+        40
+      ],
+      "size_m": 0.016,
+      "rz_offset_deg": 90
     },
-    "pump": {
-        "mixing_speed_rpm": 800.0,
-        "min_rpm": 0.0,
-        "max_rpm": 3000.0,
-        "host": "127.0.0.1",
-        "mixer_port": 5555,
-        "flowcell_port": 5556,
-        "request_timeout_s": 5.0,
-        "poll_interval_s": 0.5,
-        "operation_timeout_s": 600.0,
-        "startup_grace_s": 10.0
+    "carousel_in_stock": {
+      "id": 32,
+      "size_m": 0.016,
+      "rz_offset_deg": 90
     },
-    "daq": {
-        "host": "purple.xray.aps.anl.gov",
-        "port": 9876,
-        "request_timeout_s": 5.0
+    "venton_table_a": {
+      "id": 11,
+      "size_m": 0.0315,
+      "table_xy_mm": [
+        544.2,
+        -26.0
+      ]
     },
-    "pvapp": {
-        "base_url": "http://bleepc.xray.aps.anl.gov:5000",
-        "username": "",
-        "owner_badge": "",
-        "required": false,
-        "timeout_s": 10.0
+    "venton_table_b": {
+      "id": 12,
+      "size_m": 0.0315,
+      "table_xy_mm": [
+        233.5,
+        -28.0
+      ]
     },
-    "apriltags": {
-        "flowcell_1": {"id": 1, "size_m": 0.0095},
-        "flowcell_2": {"id": 2, "size_m": 0.0095},
-        "mixer_head": {"id": 25, "size_m": 0.016},
-        "venton_table_a": {"id": 11, "size_m": 0.0315, "table_xy_mm": [544.2, -26.0]},
-        "venton_table_b": {"id": 12, "size_m": 0.0315, "table_xy_mm": [233.5, -28.0]},
-        "venton_table_c": {"id": 13, "size_m": 0.0315, "table_xy_mm": [29.0, -230.0]}
-    },
-    "venton_table_frame": {
-        "origin": "corner of the Venton table",
-        "axes": "parallel to the UR5 base X and Y",
-        "units": "mm",
-        "notes": "table_xy_mm in apriltags.* is measured in this frame. Cross-check: a and b are 310.7 mm apart by these coordinates and 311 mm by tape. The same pair measured through the camera at 31.5 mm / f=810 reads 321.7 mm, i.e. 3.5% high -- the error is in the camera chain, not in the hand measurements."
-    },
-    "search_refs": {
-        "sample_table": [-0.22, -0.37, 0.12, -2.18860535, 2.25379435, 0],
-        "cleaning_station": [0.38, -0.10, -0.1, 2.231, -2.212, 0],
-        "mixer_cleaning_station": [0.4, 0.1, 0.1, 2.231, -2.212, 0],
-        "mixer_station": [0.4, 0.1, 0.1, 2.231, -2.212, 0]
+    "venton_table_c": {
+      "id": 13,
+      "size_m": 0.0315,
+      "table_xy_mm": [
+        29.0,
+        -230.0
+      ]
     }
+  },
+  "venton_table_frame": {
+    "origin": "corner of the Venton table",
+    "axes": "parallel to the UR5 base X and Y",
+    "units": "mm",
+    "notes": "table_xy_mm in apriltags.* is measured in this frame. Cross-check: a and b are 310.7 mm apart by these coordinates and 311 mm by tape. The same pair measured through the camera at 31.5 mm / f=810 reads 321.7 mm, i.e. 3.5% high -- the error is in the camera chain, not in the hand measurements."
+  },
+  "search_refs": {
+    "sample_table": [
+      -0.22,
+      -0.37,
+      0.12,
+      -2.18860535,
+      2.25379435,
+      0
+    ],
+    "cleaning_station": [
+      0.38,
+      -0.1,
+      -0.1,
+      2.231,
+      -2.212,
+      0
+    ],
+    "mixer_cleaning_station": [
+      0.4,
+      0.1,
+      0.1,
+      2.231,
+      -2.212,
+      0
+    ],
+    "mixer_station": [
+      0.4,
+      0.1,
+      0.1,
+      2.231,
+      -2.212,
+      0
+    ],
+    "carousel_on_mixer": [
+      0.4,
+      0.1,
+      0.1,
+      2.231,
+      -2.212,
+      0
+    ],
+    "carousel_in_stock": [
+      0.4,
+      0.1,
+      0.1,
+      2.231,
+      -2.212,
+      0
+    ],
+    "carousel_used_stack": [
+      0.4,
+      0.1,
+      0.1,
+      2.231,
+      -2.212,
+      0
+    ]
+  },
+  "camera": {
+    "distance_scale": 1.0529,
+    "distance_offset_m": -0.0287
+  }
 }

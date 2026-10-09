@@ -230,6 +230,22 @@ def test_selectAT_returns_nothing_when_the_named_tag_is_absent():
                              tag_id=11, center=(320, 240)) is None
 
 
+def test_selectAT_accepts_a_set_of_ids_and_takes_the_nearest_match():
+    """Carousel tags are a range (31-40); a search accepts any of them. Given a
+    set, selectAT returns the nearest acceptable tag and ignores the rest."""
+    carousel_far = Detection(31, (500.0, 60.0))
+    carousel_near = Detection(37, (300.0, 250.0))
+    flowcell = Detection(1, (322.0, 241.0))     # closest, but not acceptable
+    chosen = urcamera.selectAT([carousel_far, carousel_near, flowcell],
+                               tag_id=set(range(31, 41)), center=(320, 240))
+    assert chosen.tag_id == 37
+
+
+def test_selectAT_returns_nothing_when_no_id_in_the_set_is_present():
+    assert urcamera.selectAT([Detection(1, (0, 0)), Detection(25, (0, 0))],
+                             tag_id=set(range(31, 41)), center=(320, 240)) is None
+
+
 def test_selectAT_without_a_tag_id_still_takes_the_nearest():
     near, far = Detection(12, (300.0, 250.0)), Detection(11, (80.0, 60.0))
     assert urcamera.selectAT([near, far], tag_id=None, center=(320, 240)).tag_id == 12

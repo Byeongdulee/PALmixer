@@ -168,7 +168,20 @@ APRILTAG_SUBJECT = {
     'cleaning_station': 'flowcell',
     'mixer_station': 'mixer_head',
     'mixer_cleaning_station': 'mixer_head',
+    # Carousel positions read the carousel tag at the centre. Carousels are
+    # numbered 31-40, and any one of them may be standing at any carousel
+    # position -- on the mixer, in stock, or on the used stack -- so all three
+    # use the shared 'carousel' entry (id_range 31-40) and accept any carousel.
+    'carousel_on_mixer': 'carousel',
+    'carousel_in_stock': 'carousel',
+    'carousel_used_stack': 'carousel',
 }
+
+# Stations that are a reference point, not something to grab: the search still
+# bumps down to the surface and backs off the same distance every other station
+# does (so the recorded Z is anchored to the real surface), but it does NOT grab
+# -- there is nothing to pick up at a carousel centre. See locate_apriltag.
+NO_GRAB_STATIONS = ('carousel_on_mixer', 'carousel_in_stock', 'carousel_used_stack')
 # Fallbacks for the `apriltags` config section, used when it says nothing about
 # a tag. Only sizes: an unconfigured *number* means "whichever tag is nearest
 # the image center", which is a real behaviour rather than a missing value.
@@ -177,6 +190,7 @@ APRILTAG_FALLBACK_SIZES = {
     'flowcell_2': 0.0095,
     'sample_table': 0.0315,
     'mixer_head': 0.016,
+    'carousel': 0.016,
 }
 DEFAULT_APRILTAG_SIZE = 0.0095
 
@@ -244,6 +258,55 @@ def apriltag_id(station):
     except (TypeError, ValueError):
         print("PAL12idb: ignoring non-numeric apriltags.%s.id" % subject)
         return None
+
+
+def apriltag_rz_offset(station):
+    """Degrees the station's tag is mounted turned about its own normal (Z).
+
+    0.0 when unset. The search squares the recorded heading to the tag, so a tag
+    that is stuck on rotated about its normal records a heading that much off the
+    seat's real frame; this is subtracted back out before the pose is stored (see
+    locate_apriltag). The carousel tag is mounted at +90 deg -- apriltags.carousel
+    carries rz_offset_deg. A non-numeric entry is ignored with a warning, like id.
+    """
+    subject, entry = _apriltag_entry(station)
+    try:
+        value = entry.get('rz_offset_deg')
+        return 0.0 if value is None else float(value)
+    except (TypeError, ValueError):
+        print("PAL12idb: ignoring non-numeric apriltags.%s.rz_offset_deg" % subject)
+        return 0.0
+
+
+def apriltag_ids(station):
+    """The set of AprilTag numbers `station`'s search will accept, or None.
+
+    Most stations name one tag (apriltags.<subject>.id). A seat that can show any
+    of several tags names a range instead -- apriltags.<subject>.id_range
+    [lo, hi], inclusive -- or an explicit apriltags.<subject>.ids list. The
+    carousel positions use id_range 31-40: the carousel standing there (at the
+    mixer or in stock) may be any one of them. None means no id is configured --
+    the search then refuses rather than locking onto the nearest tag (see
+    locate_apriltag). selectAT takes the set and matches any member.
+    """
+    subject, entry = _apriltag_entry(station)
+    rng = entry.get('id_range')
+    if rng is not None:
+        try:
+            lo, hi = int(rng[0]), int(rng[1])
+            return set(range(min(lo, hi), max(lo, hi) + 1))
+        except (TypeError, ValueError, IndexError):
+            print("PAL12idb: ignoring malformed apriltags.%s.id_range" % subject)
+    ids = entry.get('ids')
+    if ids is not None:
+        try:
+            out = set(int(i) for i in ids)
+            if out:
+                return out
+        except (TypeError, ValueError):
+            print("PAL12idb: ignoring malformed apriltags.%s.ids" % subject)
+    single = apriltag_id(station)
+    return {single} if single is not None else None
 
 
 def venton_table_tags():
@@ -1415,6 +1478,9 @@ cleaningstationID2 = 3
 mixerstationID = 4
 mixer_cleaningstationID = 5
 sample_on_mixerstationID = 6
+carousel_on_mixerID = 7
+carousel_in_stockID = 8
+carousel_used_stackID = 9
 
 
 def set_flowcell_ID(n):
@@ -1465,6 +1531,9 @@ _ID_NAMES = {
     mixerstationID: 'mixer_station',
     mixer_cleaningstationID: 'mixer_cleaning_station',
     sample_on_mixerstationID: 'sample_on_mixer_station',
+    carousel_on_mixerID: 'carousel_on_mixer',
+    carousel_in_stockID: 'carousel_in_stock',
+    carousel_used_stackID: 'carousel_used_stack',
 }
 
 
@@ -1706,6 +1775,24 @@ def set_cleaningstation_position(ID, pos):
         cleaning_station2 = pos
         set_position(cleaningstationID2, pos)
 
+def get_carousel_on_mixer_position():
+    return get_position(carousel_on_mixerID)
+
+def set_carousel_on_mixer_position(pos):
+    set_position(carousel_on_mixerID, pos)
+
+def get_carousel_in_stock_position():
+    return get_position(carousel_in_stockID)
+
+def set_carousel_in_stock_position(pos):
+    set_position(carousel_in_stockID, pos)
+
+def get_carousel_used_stack_position():
+    return get_position(carousel_used_stackID)
+
+def set_carousel_used_stack_position(pos):
+    set_position(carousel_used_stackID, pos)
+
 def get_mixerstation_position():
     global mixer_station
     mixer_station = get_position(mixerstationID)
@@ -1805,6 +1892,9 @@ _STATION_IDS = {
     'mixer_station': lambda: mixerstationID,
     'mixer_cleaning_station': lambda: mixer_cleaningstationID,
     'sample_on_mixer_station': lambda: sample_on_mixerstationID,
+    'carousel_on_mixer': lambda: carousel_on_mixerID,
+    'carousel_in_stock': lambda: carousel_in_stockID,
+    'carousel_used_stack': lambda: carousel_used_stackID,
     # Resolved at call time, like the transport functions do: which physical
     # cleaning station this means depends on the flowcell currently in use.
     'cleaning_station': lambda: cleaningstationID1 if flowcell_ID == 1 else cleaningstationID2,
@@ -1891,6 +1981,7 @@ def reset_gripper_activation():
 #: Robotiq position counts, 0 fully open and 255 fully closed. Fixed by the
 #: gripper's protocol, not a preference.
 GRIPPER_OPEN_COUNT = 0
+GRIPPER_CLOSE_COUNT = 255          # Robotiq count for a fully-shut gripper
 GRIPPER_CLOSED_COUNT = 255
 
 
@@ -1916,6 +2007,13 @@ def mixer_head_open_extra():
     should not silently move the other.
     """
     return _open_extra('mixer_head_open_extra_m')
+
+
+def carousel_open_extra():
+    """How much wider than release() to open before grabbing a carousel. The
+    config default (0.05 m, the full stroke) clamps to a full open in
+    pickup_open_count -- the fingers reach around the carousel rim."""
+    return _open_extra('carousel_open_extra_m')
 
 
 def pickup_open_count(extra_m=None):
@@ -1958,6 +2056,23 @@ def open_gripper(robot, extra_m=None):
         return None
     action(count)
     return count
+
+
+def close_gripper_fully(robot):
+    """Fully shut the gripper (count 255), for a clean fingertip contact.
+
+    grab()/close_gripper() is a force close that can stop short of fully shut --
+    fine for gripping an object, but when we bump the closed fingertips onto a
+    surface to measure its height we want them all the way together. Command the
+    full-close count directly; fall back to grab() on a robot that exposes no raw
+    count (a simulated or older robot still closes, just not to a tuned amount).
+    """
+    gripper = getattr(robot, 'gripper', None)
+    action = getattr(gripper, 'gripper_action', None)
+    if action is None:
+        robot.grab()
+        return
+    action(GRIPPER_CLOSE_COUNT)
 
 
 def pickup(robot, height = needle_clear_height, open_extra_m = 0.0):
@@ -2802,6 +2917,352 @@ def raise_to_sampletable_height(robot):
     p[2] = get_sampletable_position()[2]
     robot.moveto(p)
 
+
+# -- carousel swap (unload the spent one / place a fresh one) ------------------
+# Camera-guided pick-and-place of a whole carousel between the mixer, the stock
+# position, and the used-carousel stack. All relative moves are BASE frame.
+CAROUSEL_CLEAR_LIFT = 0.120          # straight-up clearance for carrying (m)
+CAROUSEL_SNAP_LIFT = 0.005           # straight up right after grabbing, before the diagonal (m)
+CAROUSEL_LOOK_LIFT = 0.100           # lift above the mixer seat to look (m)
+CAROUSEL_STACK_ABOVE = 0.100         # unload: stand this far above a found used-stack tag before bumping (m)
+# The 45 deg seat-clearance move after grab: 10 mm total, so cos45 along each of
+# -X and +Z. Sliding the carousel out from under its retainer while lifting.
+CAROUSEL_DIAG = 0.020 * math.cos(math.radians(45))   # ~0.014142 m per axis (20 mm total)
+# A carousel position is taught bump-to-surface then backed off by this, so the
+# taught Z sits this far ABOVE the grab surface -- a safe height to move to before
+# the grab bumps down to find the real surface.
+CAROUSEL_TEACH_BACKOFF = 0.060
+CAROUSEL_BUMP_LIFT = 0.001           # up after the grab bump finds the surface
+CAROUSEL_GRAB_UNDER = 0.012          # down after opening, to reach under the rim (11 mm net below surface)
+# Place: how far above the surface the carousel should stand after the reverse
+# 45 deg landing -- the bump then seats the rest. The gripper start Z is worked
+# back from this (see place_new_carousel).
+CAROUSEL_PLACE_STANDOFF = 0.005
+# The carousel acquire spends longer than the default on centring: the arm
+# arrives right after a move with the camera still refocusing, and a mis-centred
+# grab is costly. Longer detect/centre settle (seconds the camera keeps
+# refocusing) and more centring passes than the defaults, plus a confirming pass.
+CAROUSEL_CENTER_SETTLE = 10          # s to keep recapturing while the camera focuses
+CAROUSEL_CENTER_ITERS = 8            # centring passes (the default is 4)
+CAROUSEL_CENTER_TOL_M = 0.0002       # how close to centred counts as centred (m)
+CAROUSEL_LOAD_APPROACH_M = 0.200     # load: approach to this camera-to-tag distance before the grab
+
+
+def _fmt_m(x):
+    """Format a distance in metres for a log line, or '?' when it is unknown."""
+    try:
+        return "%.4f" % float(x)
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _pose_str(robot):
+    """Current pose as a short string for debug prints.
+
+    Full [x, y, z, rx, ry, rz] when the robot exposes get_pose(); otherwise the
+    xyz from get_pos() (so a simulated/fake robot in tests still works)."""
+    try:
+        v = robot.get_pose().get_pose_vector().tolist()
+    except Exception:                                    # noqa: BLE001
+        try:
+            v = list(robot.get_pos())
+        except Exception:                                # noqa: BLE001
+            return "?"
+    return "[" + ", ".join("%.4f" % x for x in v) + "]"
+
+
+def _acquire_carousel(robot, station, approach_distance_m=None):
+    """Centre and square the camera on the carousel at `station`.
+
+    Returns (tag_id, camera_to_tag_distance_m). Raises RuntimeError if no
+    acceptable carousel tag is in view. Mirrors locate_apriltag's centre+square
+    (including the tag mounting offset, apriltag_rz_offset) but does not drive to
+    a reference or grab -- the caller has already put the camera over the seat.
+
+    When approach_distance_m is set, after centring at the look height the camera
+    is driven down to that camera-to-tag distance and re-centred there (a closer,
+    steadier view before the grab). Used for loading, where a precise centre
+    matters most; the grab then takes over (put_tcp2camera, move down).
+    """
+    robot.set_tcp(robot.tcp)
+    robot.camera.AT_physical_size = apriltag_size(station)
+    robot.camera.AT_preferred_id = apriltag_ids(station)
+    # Give the camera time to refocus before the first read -- the arm has just
+    # arrived over the seat and the first frames are usually blurry.
+    if camera_tools._detect_apriltag(robot, settle=CAROUSEL_CENTER_SETTLE) is None:
+        seen = list(getattr(robot.camera, 'AT_ids', []) or [])
+        raise RuntimeError(
+            "no carousel at %s: looked for tag(s) %s, tags in view %s"
+            % (station, sorted(apriltag_ids(station) or []), seen))
+
+    def _center():
+        # A long settle so each centring pass waits out the camera's refocus,
+        # and extra passes so it actually converges on the tag centre.
+        return robot.center_camera2apriltag(
+            tol_m=CAROUSEL_CENTER_TOL_M, settle=CAROUSEL_CENTER_SETTLE,
+            max_iter=CAROUSEL_CENTER_ITERS)
+
+    # No descend-to-standoff: centre and square from the look height, then the
+    # grab moves to the taught height and bumps for the surface.
+    if not _center():
+        if not reacquire_apriltag(robot)[0] or not _center():
+            raise RuntimeError("could not centre the camera on the carousel at %s"
+                               % station)
+    # Square the heading to the seat frame -- the tag is mounted turned about its
+    # normal (apriltag_rz_offset), the same correction the search applies.
+    if robot.camera.AT_euler is not None:
+        robot.rotate_around_Zaxis_camera(
+            180 + robot.camera.AT_euler[2] + apriltag_rz_offset(station))
+        _center()
+    if approach_distance_m is not None:
+        # Approach to the requested camera-to-tag distance for a closer, steadier
+        # view, then re-centre there before the grab commits. Print the distances
+        # so the measurement can be checked against the real stand-off.
+        before = robot.camera.QRdistance
+        reached = camera_tools.approach_tag_distance(robot, approach_distance_m)
+        _center()
+        print("PAL12idb: carousel load approach to %s -- tag distance was %s m, "
+              "reached %s m, %s m after re-centre"
+              % (station, _fmt_m(before), _fmt_m(reached),
+                 _fmt_m(robot.camera.QRdistance)))
+    else:
+        # One more confirming pass: with the camera settled and the heading
+        # squared, make sure it is really centred before the grab commits here.
+        _center()
+    return robot.camera.AT_id, robot.camera.QRdistance
+
+
+def _grab_carousel(robot, station):
+    """Grab the carousel the camera is centred on, at `station`.
+
+    Move down to the taught carousel height (Z_carousel, a safe height above the
+    surface), then close the gripper and bump to feel the actual surface -- the
+    bump stops on contact, so it is robust to the taught height being off. Then
+    back up 1 mm, open wide, descend 8 mm to reach under the rim, and close to
+    grip.
+
+    Switches to the gripper TCP first and stays there: put_tcp2camera leaves the
+    CAMERA TCP active, so every height read / move after this must be in the
+    gripper frame -- otherwise the carousel is carried (and dropped) a camtcp
+    offset away from where it should be.
+    """
+    robot.put_tcp2camera()                              # gripper over the tag centre
+    robot.set_tcp(robot.tcp)                            # gripper frame for all height work
+    cur = robot.get_pos()
+    try:
+        z_carousel = get_station_position(station)[2]   # the taught carousel height
+    except (RuntimeError, ValueError):
+        z_carousel = None
+    if z_carousel is not None:
+        robot.moveto([cur[0], cur[1], z_carousel])      # down to the taught height
+    # else: stay at the camera standoff and let the bump below find the surface.
+    close_gripper_fully(robot)                          # fully shut for a clean bump contact
+    robot.bump(z=-1, backoff=0.0)                       # feel the real surface
+    if station == 'carousel_on_mixer':
+        # Record the true mixer seat the bump just found (gripper frame): the
+        # camera-centred X,Y and the bumped surface Z. place_new_carousel reuses it
+        # so it lands exactly where this grabbed -- the taught pose's X,Y are a
+        # millimetre or two off (not camera-centred) and its Z sits too low (the
+        # teach backoff was measured along the camera TCP).
+        state.set_carousel_mixer_seat(robot.get_pos()[:3])
+    robot.mvr2z(CAROUSEL_BUMP_LIFT)                     # up 1 mm
+    open_gripper(robot, carousel_open_extra())          # open wide
+    robot.mvr2z(-CAROUSEL_GRAB_UNDER)                   # down 8 mm, under the rim
+    robot.grab()                                        # close to grip
+
+
+def _carousel_lift(robot):
+    """The seat-clearance lift after grabbing on the mixer: up SNAP_LIFT, a 45 deg
+    move (-X / +Z) to slide out from under the retainer, then up CLEAR_LIFT. Prints
+    the pose after each step for debugging."""
+    robot.mvr2z(CAROUSEL_SNAP_LIFT)
+    print("unload lift: after snap-lift   %s" % _pose_str(robot))
+    robot.translate([-CAROUSEL_DIAG, 0.0, CAROUSEL_DIAG])
+    print("unload lift: after 45 deg      %s" % _pose_str(robot))
+    robot.mvr2z(CAROUSEL_CLEAR_LIFT)
+    print("unload lift: after clear-lift  %s" % _pose_str(robot))
+
+
+def _look_for_used_stack_tag(robot):
+    """Look over the used-carousel stack for a tag before unloading.
+
+    Returns (pose, distance): the gripper pose [x, y, z, ...] positioned over the
+    tag (at the look height) and the corrected camera-to-tag distance, so the
+    unload can set the new used carousel down on TOP of the stack (100 mm above
+    that tag, then bump). Returns None when the used stack is untaught or empty --
+    the unload then uses its normal taught-position drop. Non-fatal by design: any
+    trouble here means 'no tag'.
+    """
+    try:
+        used = list(get_station_position('carousel_used_stack'))
+    except (RuntimeError, ValueError):
+        return None
+    robot.set_tcp(robot.tcp)
+    clear_z = used[2] + CAROUSEL_CLEAR_LIFT
+    used_over = list(used)
+    used_over[2] = clear_z
+    # Route OVER the used stack via the transfer point -- never a blind descent at
+    # wherever the arm happens to be (that drove straight down into the mixer
+    # carousel and protective-stopped). The transfer point keeps it clear until it
+    # is above the stack, then it comes down to the look height.
+    move_via_transferpoint(robot, used_over)           # safely over the used-stack centre
+    robot.put_camera2tcp()                             # camera onto that pose
+    robot.camera.AT_physical_size = apriltag_size('carousel_used_stack')
+    robot.camera.AT_preferred_id = apriltag_ids('carousel_used_stack')
+    if camera_tools._detect_apriltag(robot, settle=CAROUSEL_CENTER_SETTLE) is None:
+        robot.set_tcp(robot.tcp)
+        print("unload: no tag on the used stack -- using the normal taught drop")
+        return None
+    # Centre on the top carousel's tag so the gripper can be put straight over it,
+    # and read the corrected distance (how far the tag is below the camera).
+    robot.center_camera2apriltag(tol_m=CAROUSEL_CENTER_TOL_M,
+                                 settle=CAROUSEL_CENTER_SETTLE,
+                                 max_iter=CAROUSEL_CENTER_ITERS)
+    # Centre only -- the drop does NOT match the heading of the carousel below; it
+    # uses the taught used-stack orientation (see unload_current_carousel). We only
+    # need the found tag's X,Y and its distance (how far below the camera it is).
+    dist = robot.camera.QRdistance
+    robot.put_tcp2camera()                             # gripper over the tag (where the camera was)
+    robot.set_tcp(robot.tcp)
+    pose = list(robot.get_pos())
+    print("unload: found a carousel on the used stack, tag distance %s m -- "
+          "will stack on top" % _fmt_m(dist))
+    return (pose, dist)
+
+
+@_tracks(lambda: state.set_carousel_on_mixer, state.UNKNOWN)
+def unload_current_carousel(robot):
+    """Take the carousel off the mixer and set it on the used-carousel stack.
+
+    First look over the used stack for a tag: if the stack already holds a
+    carousel, the one being unloaded is set down on TOP of it (straight down to
+    100 mm above that tag, then bump); if the stack is empty (no tag), the drop is
+    the normal taught used-stack position. Then grab the mixer carousel, lift clear
+    on the 45 deg path, carry over the used stack, and set it down by feel. MOVES
+    the robot. Requires carousel_on_mixer and carousel_used_stack to be taught.
+    """
+    robot.set_tcp(robot.tcp)
+    # Look over the used stack before grabbing: is there already a carousel there?
+    stack_tag = _look_for_used_stack_tag(robot)
+    move_via_transferpoint(robot, list(get_station_position('carousel_on_mixer')))
+    robot.mvr2z(CAROUSEL_LOOK_LIFT)
+    # Put the CAMERA over the carousel centre (not just face it down in place):
+    # the gripper is over the centre now, so put_camera2tcp moves the camera onto
+    # that pose. Levelling the camera where it stands would leave it the camtcp
+    # offset away from the centre, and the tag would fall outside the view.
+    robot.put_camera2tcp()
+    _tag, _dist = _acquire_carousel(robot, 'carousel_on_mixer')
+    _grab_carousel(robot, 'carousel_on_mixer')
+    _carousel_lift(robot)
+    robot.set_tcp(robot.tcp)                 # gripper frame: the carousel is carried, not the camera
+    clear_z = robot.get_pos()[2]
+    if stack_tag is not None:
+        # Stack on top of the carousel already on the used stack: carry over its
+        # tag, go straight down to 100 mm above it, then bump to set down by feel.
+        # Use the TAUGHT used-stack orientation (not the found tag's, and not the
+        # camera-centring pose) -- it faces straight down, so the carousel is set
+        # down at the recorded heading AND the bump's -Z travels straight down.
+        over, dist = stack_tag
+        heading = list(get_station_position('carousel_used_stack'))[3:]
+        above = [over[0], over[1], clear_z] + heading   # over the found tag, clear height, taught heading
+        robot.moveto(above)
+        print("unload stack: over the tag %s" % _pose_str(robot))
+        drop_z = over[2] - dist + CAROUSEL_STACK_ABOVE  # 100 mm above the tag (tag is dist below `over`)
+        robot.moveto([over[0], over[1], drop_z] + heading)   # straight down to 100 mm above the tag
+        print("unload stack: 100 mm above the tag %s" % _pose_str(robot))
+        robot.bump(z=-1, backoff=0.0)                   # bump straight down (long travel) onto the stack
+        print("unload stack: after bump %s" % _pose_str(robot))
+        robot.release()                                 # open as soon as it bumps -- do not force further down
+        robot.moveto(above)                             # back up to the clear height
+    else:
+        # Empty stack: drop at the taught used-stack pose (full pose -> the stack's
+        # own heading, not the mixer heading it was grabbed with).
+        used_clear = list(get_station_position('carousel_used_stack'))
+        used_clear[2] = clear_z
+        robot.moveto(used_clear)                         # over the used stack, at its heading
+        robot.bump(z=-1, backoff=0.0)                    # set down by feel
+        robot.release()                                  # open as soon as it bumps -- do not force further down
+        robot.moveto(used_clear)                         # back up to the clear height
+    return list(robot.get_pos())
+
+
+def place_new_carousel(robot):
+    """Bring a fresh carousel from the stock position onto the mixer.
+
+    Carry clear, swing the camera over the stock seat, grab the new carousel,
+    carry it to 120 mm above the mixer, and set it down onto the mixer seat --
+    sliding in along the reverse (+X / -Z) of the unload lift and bumping to the
+    seat. MOVES the robot. Requires carousel_in_stock and carousel_on_mixer
+    taught.
+
+    Not @_tracks-decorated like the transports: the tracked value is the tag id
+    of the carousel it grabs, known only at runtime. The mixer is marked unknown
+    up front (it is mid-swap, so a failure leaves it honestly unknown) and set to
+    the grabbed tag once it is seated.
+    """
+    robot.set_tcp(robot.tcp)
+    state.set_carousel_on_mixer(None)       # mid-swap: unknown until it is seated
+    mixer = list(get_station_position('carousel_on_mixer'))
+    clear_z = mixer[2] + CAROUSEL_CLEAR_LIFT
+    now = robot.get_pos()
+    robot.moveto([now[0], now[1], clear_z])             # up to the carry height
+    # Take the GRIPPER over the stock centre at the clear height, using the stock
+    # pose's own (down-facing) orientation, then put the CAMERA onto that pose.
+    # Same reason as unload: the camera has to be over the tag, not the camtcp
+    # offset away from it, or the tag falls outside the view.
+    stock = get_station_position('carousel_in_stock')
+    stock_over = list(stock)
+    stock_over[2] = clear_z
+    robot.moveto(stock_over)                            # gripper over stock centre, facing down
+    robot.put_camera2tcp()                              # camera onto that pose
+    tag, _dist = _acquire_carousel(robot, 'carousel_in_stock',
+                                   approach_distance_m=CAROUSEL_LOAD_APPROACH_M)
+    _grab_carousel(robot, 'carousel_in_stock')
+    robot.set_tcp(robot.tcp)                 # gripper frame: the carousel is carried, not the camera
+    robot.mvr2z(CAROUSEL_CLEAR_LIFT)                     # lift clear of the stock seat
+    # Reuse the REAL mixer seat measured by unload's grab (gripper frame): the
+    # camera-centred X,Y and the bumped surface Z. Fall back to the taught pose
+    # only if no unload has measured it. Using the measured X,Y (not the taught
+    # X,Y, which is a mm or two off) lets the landing be the exact reverse of the
+    # lift -- same 45 deg travel (CAROUSEL_DIAG), landing right on the seat.
+    seat = state.get_carousel_mixer_seat()
+    if seat is not None:
+        seat_x, seat_y, surface_z = seat
+    else:
+        seat_x, seat_y = mixer[0], mixer[1]
+        surface_z = mixer[2] - CAROUSEL_TEACH_BACKOFF
+    # Work back from where the carousel should end after the reverse 45 deg
+    # landing: CAROUSEL_PLACE_STANDOFF above the surface (the bump seats the rest).
+    # The carousel hangs net_under below the gripper, so the gripper there sits at
+    # (surface + STANDOFF - net_under); the 45 deg landing (+X / -Z by CAROUSEL_DIAG,
+    # the lift reversed) drops Z by CAROUSEL_DIAG and raises X by it, so the start
+    # before it is offset back along -X by CAROUSEL_DIAG and up by it.
+    net_under = CAROUSEL_GRAB_UNDER - CAROUSEL_BUMP_LIFT   # carousel hangs this far below the gripper
+    start = list(mixer)                                   # taught orientation (3:6)
+    start[0] = seat_x - CAROUSEL_DIAG                    # back along -X so the reverse diagonal reaches the seat X
+    start[1] = seat_y
+    start[2] = surface_z + CAROUSEL_DIAG + CAROUSEL_PLACE_STANDOFF - net_under
+    carry = list(start)
+    carry[2] = clear_z
+    robot.moveto(carry)                                  # carry above the landing start, seat heading
+    print("place seating: after carry-above %s" % _pose_str(robot))
+    robot.moveto(start)                                  # down to the stand-off, offset back along -X
+    print("place seating: after down-to-start %s" % _pose_str(robot))
+    # Reverse 45 deg landing: the exact reverse of the unload lift's diagonal
+    # (+X / -Z by CAROUSEL_DIAG), landing on the measured seat X,Y.
+    robot.translate([CAROUSEL_DIAG, 0.0, -CAROUSEL_DIAG])
+    print("place seating: after 45 deg landing %s" % _pose_str(robot))
+    robot.bump(z=-1, backoff=0.0)                        # bump down to seat at the real surface
+    print("place seating: after bump %s" % _pose_str(robot))
+    robot.release()
+    print("place seating: after release %s" % _pose_str(robot))
+    robot.mvr2z(CAROUSEL_CLEAR_LIFT)                     # retract clear
+    print("place seating: after retract %s" % _pose_str(robot))
+    # Record which carousel is now on the mixer (overrides the @_tracks default).
+    state.set_carousel_on_mixer(tag)
+    return list(robot.get_pos())
+
+
 ## Configuration functions. These functions are used to locate the positions of the sample table and cleaning station using AprilTags.
 def store_station_position(pos, v):
     """Record `v` as station `pos`'s taught position.
@@ -2824,6 +3285,12 @@ def store_station_position(pos, v):
         set_mixerstation_position(v)
     elif pos == 'sample_on_mixer_station':
         set_sample_on_mixerstation_position(v)
+    elif pos == 'carousel_on_mixer':
+        set_carousel_on_mixer_position(v)
+    elif pos == 'carousel_in_stock':
+        set_carousel_in_stock_position(v)
+    elif pos == 'carousel_used_stack':
+        set_carousel_used_stack_position(v)
     else:
         raise ValueError('unknown station %r' % (pos,))
     if pos == 'sample_table':
@@ -2858,6 +3325,12 @@ def get_station_position(pos):
         return get_mixerstation_position()
     if pos == 'sample_on_mixer_station':
         return get_sample_on_mixerstation_position()
+    if pos == 'carousel_on_mixer':
+        return get_carousel_on_mixer_position()
+    if pos == 'carousel_in_stock':
+        return get_carousel_in_stock_position()
+    if pos == 'carousel_used_stack':
+        return get_carousel_used_stack_position()
     raise ValueError('unknown station %r' % (pos,))
 
 def search_reference(pos):
@@ -3223,17 +3696,19 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
     # and the descent can each land on a different tag, and the size set above
     # then belongs to the wrong one. None restores that behaviour, which is
     # correct while only one tag can be in view.
-    robot.camera.AT_preferred_id = apriltag_id(pos)
-    # Fail closed for a station that names a specific tag. "Nearest the image
+    # The set of tag ids this seat accepts -- one tag for most, a range for the
+    # carousel positions (31-40); selectAT matches any member. See apriltag_ids.
+    robot.camera.AT_preferred_id = apriltag_ids(pos)
+    # Fail closed for a station that names specific tag(s). "Nearest the image
     # centre" was safe only while one tag at a time could be in view; the Venton
     # fiducials now sit on the bench near these stations, so a search that fell
-    # back to proximity could lock onto a neighbour. If the id is missing from
-    # config, stop here with a clear message rather than search by nearest.
-    if pos in APRILTAG_SUBJECT and robot.camera.AT_preferred_id is None:
+    # back to proximity could lock onto a neighbour. If no id is configured, stop
+    # here with a clear message rather than search by nearest.
+    if pos in APRILTAG_SUBJECT and not robot.camera.AT_preferred_id:
         raise RuntimeError(
-            "no AprilTag id configured for %s (apriltags.%s.id); set it so the "
-            "search matches only that tag instead of whichever is nearest the "
-            "image centre" % (pos, _apriltag_subject(pos)))
+            "no AprilTag id configured for %s (apriltags.%s.id / .id_range); set "
+            "it so the search matches only that tag instead of whichever is "
+            "nearest the image centre" % (pos, _apriltag_subject(pos)))
     # Arrive at the reference pose through the corridor, like every other move
     # that crosses the cell. search_apriltag_by_tilt() opens with a direct
     # moveto(ref_pos), which from the far side sweeps the arm through whatever
@@ -3272,7 +3747,8 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
     # sitting on the tag, for a result the first pass had already reached.
     found = camera_tools.search_apriltag_by_tilt(
         robot, ref_pos=ref_pos, align_to_tag=(pos in APRILTAG_NOT_FLAT),
-        stop_event=stop_event, skip_roll=skip_roll, from_current=from_current)
+        stop_event=stop_event, skip_roll=skip_roll, from_current=from_current,
+        rz_offset=apriltag_rz_offset(pos))
     if not found:
         # Previously this fell through to grab/bump/record a position even
         # on a failed or aborted search -- since the robot could be
@@ -3316,10 +3792,21 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
             raise RuntimeError(f"Lost the AprilTag for {pos} while centring")
         if not robot.center_camera2apriltag(tol_m=0.0002):
             raise RuntimeError(f"Could not centre the camera on {pos}'s AprilTag")
+    # The search already squared the camera to the seat frame, applying the
+    # tag's mounting offset (apriltag_rz_offset) itself -- see
+    # camera_tools.search_apriltag_by_tilt -- so nothing to undo here.
     robot.put_tcp2camera()
 
-    robot.grab()
-    robot.bump(z=-1,backoff=distance_gripper_tag)
+    # Bump to measure the distance down to the surface, then back off -- so the
+    # recorded Z is anchored to the real surface, not the camera standoff. A
+    # reference-only station (the carousel centre) is NOT grabbed (nothing to pick
+    # up there) and backs off CAROUSEL_TEACH_BACKOFF (60 mm), the amount
+    # _grab_carousel later descends from the taught pose; every other station
+    # backs off distance_gripper_tag as before.
+    if pos not in NO_GRAB_STATIONS:
+        robot.grab()
+    backoff = CAROUSEL_TEACH_BACKOFF if pos in NO_GRAB_STATIONS else distance_gripper_tag
+    robot.bump(z=-1, backoff=backoff)
     robot.set_tcp(robot.tcp)
     p = robot.get_pose()
     v = p.get_pose_vector().tolist()

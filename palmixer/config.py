@@ -81,7 +81,12 @@ _DEFAULTS = {
             "windows": "C:/Users/s12idb/Documents/GitHub/UR_12idb",
         },
     },
-    "motor": {"pv": "12idb:m6"},
+    # The carousel-rotation motor. type "galil" drives a Galil controller
+    # channel over gclib (ip + channel); type "epics" drives an EPICS motor
+    # record (pv). 12idb:m6 was replaced by channel A of the Galil at the ip
+    # below, so galil is the default; pv is kept for the epics fallback.
+    "motor": {"type": "galil", "ip": "164.54.122.210", "channel": "A",
+              "pv": "12idb:m6"},
     # ChArUco board used as the hand-eye calibration target (camtcp). MUST match
     # the physical board: `dictionary` is an OpenCV aruco dictionary name,
     # squares_x/_y are the board's columns/rows of chessboard squares, and the
@@ -307,6 +312,10 @@ def _merged():
         cfg["robot"]["ur12idb_path"] = env("PALMIXER_UR12IDB_PATH")
     if env("PALMIXER_MOTOR_PV"):
         cfg["motor"]["pv"] = env("PALMIXER_MOTOR_PV")
+    if env("PALMIXER_MOTOR_TYPE"):
+        cfg["motor"]["type"] = env("PALMIXER_MOTOR_TYPE")
+    if env("PALMIXER_GALIL_IP"):
+        cfg["motor"]["ip"] = env("PALMIXER_GALIL_IP")
     if env("PALMIXER_CAROUSEL_SIZE"):
         cfg["carousel"]["size"] = env("PALMIXER_CAROUSEL_SIZE")
     if env("PALMIXER_CAROUSEL_STEP"):

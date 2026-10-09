@@ -45,6 +45,7 @@ class ExperimentTab(QWidget):
         layout.addWidget(self.flowcell)
         layout.addWidget(self.position_motors_check)
         layout.addWidget(self._build_transport_group())
+        layout.addWidget(self._build_carousel_group())
         layout.addWidget(self._build_robot_group())
         layout.addWidget(self._build_motor_group())
         layout.addWidget(self._build_pump_group())
@@ -64,6 +65,55 @@ class ExperimentTab(QWidget):
             self._all_buttons.append(btn)
         box.setLayout(grid)
         return box
+
+    # -- carousel swap ----------------------------------------------------------
+    def _build_carousel_group(self):
+        """Swap the carousel on the mixer: unload the spent one onto the used
+        stack, or place a fresh one from stock. Both drive the arm across the
+        cell, so each asks first and is disabled while the server is BUSY."""
+        box = QGroupBox("Carousel")
+        layout = QHBoxLayout()
+
+        self.unload_carousel_btn = QPushButton("Unload Current Carousel")
+        self.unload_carousel_btn.setToolTip(
+            "Take the carousel off the mixer and set it on the used-carousel "
+            "stack.\n\nNeeds Carousel on Mixer and Used Carousel Stack taught. "
+            "The arm looks for the carousel first and stops with an error if "
+            "none is there.")
+        self.unload_carousel_btn.clicked.connect(self._on_unload_carousel)
+        layout.addWidget(self.unload_carousel_btn)
+
+        self.place_carousel_btn = QPushButton("Place New Carousel")
+        self.place_carousel_btn.setToolTip(
+            "Bring a fresh carousel from the stock position onto the mixer.\n\n"
+            "Needs Carousel in Stock and Carousel on Mixer taught. The arm "
+            "looks for a carousel in stock first and stops with an error if "
+            "none is there.")
+        self.place_carousel_btn.clicked.connect(self._on_place_new_carousel)
+        layout.addWidget(self.place_carousel_btn)
+
+        layout.addStretch(1)
+        self._all_buttons.extend([self.unload_carousel_btn, self.place_carousel_btn])
+        box.setLayout(layout)
+        return box
+
+    def _on_unload_carousel(self):
+        if QMessageBox.question(
+                self, "Unload Current Carousel",
+                "Take the carousel off the mixer and set it on the used stack?\n\n"
+                "The arm will move across the cell.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._send_command(cmd.unload_carousel_command())
+
+    def _on_place_new_carousel(self):
+        if QMessageBox.question(
+                self, "Place New Carousel",
+                "Bring a fresh carousel from stock onto the mixer?\n\n"
+                "The arm will move across the cell.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._send_command(cmd.place_new_carousel_command())
 
     # -- robot ------------------------------------------------------------------
     def _build_robot_group(self):
@@ -170,13 +220,13 @@ class ExperimentTab(QWidget):
 
     # -- motor ------------------------------------------------------------------
     def _build_motor_group(self):
-        box = QGroupBox("EPICS Motor (12idb:m6)")
+        box = QGroupBox("Carousel Motor (Galil ch A)")
         layout = QHBoxLayout()
 
         layout.addWidget(QLabel("Step:"))
         self.step_box = QDoubleSpinBox()
         self.step_box.setDecimals(4)
-        self.step_box.setRange(0.0001, 1000.0)
+        self.step_box.setRange(0.0001, 100000.0)
         self.step_box.setValue(1.0)
         layout.addWidget(self.step_box)
 

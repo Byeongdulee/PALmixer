@@ -18,6 +18,7 @@ the same way, and is checked for it -- pyepics only prints "cannot connect to
 tweak that looks accepted and then times out a minute later waiting on .DMOV.
 """
 
+import threading
 import time
 
 from . import capath
@@ -133,5 +134,125 @@ class Motor:
         self.check_in_range(position)
         self._caput("VAL", float(position))
         self._check_no_limit_violation(position)
+        self.wait_done(timeout=timeout)
+        return self.read()
+
+
+class GalilMotor:
+    """A Galil controller channel, exposing the same interface as :class:`Motor`.
+
+    12idb:m6 was replaced by channel A of a Galil controller, driven over gclib
+    (see ptychoSAXS/ptychosaxs/tw_galil.py). This is a drop-in for Motor: the
+    server and workflows call read()/tweak()/move_to()/check_in_range() without
+    knowing which one they hold.
+
+    Positions and steps are Galil step counts (integers), not EPICS engineering
+    units -- so the carousel reference and slot step have to be (re)taught in
+    those counts against this motor. The connection is opened lazily and the
+    motor turned on (SH<channel>) the first time it is used; gclib is imported
+    there too, so this module stays importable on a host without it.
+    """
+
+    def __init__(self, ip, channel="A"):
+        self.ip = ip
+        self.channel = str(channel).strip().upper()
+        self._g = None
+        self._lock = threading.RLock()
+
+    # -- connection ---------------------------------------------------------
+    def _conn(self):
+        """Open the controller once and enable the servo on this channel.
+
+        gclib and the controller are only reachable where this actually runs,
+        so both the import and the connect happen here rather than at
+        construction -- a GUI-only or test host can hold a GalilMotor without a
+        Galil present, exactly as Motor holds a PV without an IOC.
+        """
+        with self._lock:
+            if self._g is not None:
+                return self._g
+            try:
+                import gclib
+            except Exception as e:
+                # Not just ImportError: on Windows the pure-Python gclib wrapper
+                # loads gclib.dll at import, so a missing native runtime raises a
+                # TypeError/OSError here, not an ImportError. Either way the motor
+                # cannot be driven, and the operator needs the same two things.
+                raise MotorError(
+                    "the Galil motor at %s cannot be driven -- importing gclib "
+                    "failed (%s). Install the gclib Python package AND Galil's "
+                    "native gclib runtime (gclib.dll must be found by the system)."
+                    % (self.ip, e))
+            try:
+                g = gclib.py()
+                g.GOpen(self.ip)
+                g.GCommand("SH%s;" % self.channel)   # turn the motor on (servo here)
+            except Exception as e:                    # gclib.GclibError and friends
+                raise MotorError("could not open the Galil controller at %s "
+                                 "(channel %s): %s" % (self.ip, self.channel, e))
+            self._g = g
+            return g
+
+    def _command(self, cmd):
+        g = self._conn()
+        try:
+            with self._lock:
+                return g.GCommand(cmd)
+        except Exception as e:
+            raise MotorError("Galil command %r failed: %s" % (cmd, e))
+
+    # -- the Motor interface ------------------------------------------------
+    def read(self):
+        """The channel's current reference position (RP), as an integer count."""
+        raw = self._command("RP")          # all channels, CSV, like tw_galil
+        parts = [p for p in str(raw).replace(":", "").split(",") if p.strip()]
+        idx = ord(self.channel) - ord("A")
+        try:
+            return int(float(parts[idx]))
+        except (IndexError, ValueError) as e:
+            raise MotorError("could not read channel %s position from %r: %s"
+                             % (self.channel, raw, e))
+
+    def wait_done(self, timeout=120.0, poll_interval=0.1):
+        """Block until this channel's move completes.
+
+        gclib's GMotionComplete blocks on the controller itself; timeout is kept
+        for interface parity with Motor (its own GOpen timeout bounds the wait).
+        """
+        g = self._conn()
+        try:
+            g.GMotionComplete(self.channel)
+        except Exception as e:
+            raise MotorError("waiting for Galil channel %s to finish moving "
+                             "failed: %s" % (self.channel, e))
+
+    def check_in_range(self, position):
+        """No soft-limit pre-check for the Galil: unlike the EPICS motor record,
+        a Galil move past a configured limit is reported (it errors or stops at
+        the limit) rather than silently ignored, so there is no "looks done but
+        never moved" failure to guard against here. Kept for interface parity."""
+        return
+
+    def tweak(self, direction, step, timeout=60.0):
+        """Move one relative step (PR + BG) in ``direction``, wait, return the
+        new position. ``step`` is a Galil step count."""
+        if direction not in (FORWARD, REVERSE):
+            raise ValueError("direction must be %r or %r, got %r"
+                             % (FORWARD, REVERSE, direction))
+        counts = abs(int(round(float(step))))
+        if direction == REVERSE:
+            counts = -counts
+        self._command("PR%s=%i" % (self.channel, counts))
+        self._command("BG%s" % self.channel)
+        self.wait_done(timeout=timeout)
+        return self.read()
+
+    def move_to(self, position, timeout=120.0):
+        """Move to an absolute step count (PA + BG), wait, return the new
+        position. The taught carousel positions are read()/move_to() in the same
+        counts, so they stay consistent."""
+        self.check_in_range(position)
+        self._command("PA%s=%i" % (self.channel, int(round(float(position)))))
+        self._command("BG%s" % self.channel)
         self.wait_done(timeout=timeout)
         return self.read()

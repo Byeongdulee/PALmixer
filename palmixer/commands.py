@@ -41,6 +41,8 @@ IDLE alone says nothing about success.
     "stop_pump"                           -> "OK <detail>" | "ERROR: <reason>"
     "make_sample <slot> [sample id]"      -> "ACCEPTED" | "ERROR: <reason>"
     "draw_and_load"                       -> "ACCEPTED" | "ERROR: <reason>"
+    "unload_carousel"                     -> "ACCEPTED" | "ERROR: <reason>"
+    "place_new_carousel"                  -> "ACCEPTED" | "ERROR: <reason>"
     "draw_load_sample <slot> [sample id]" -> "ACCEPTED" | "ERROR: <reason>"
     "unload_sample [aspirate]"            -> "ACCEPTED" | "ERROR: <reason>"
     "set_flowcell <1|2>"                  -> "OK" | "ERROR: <reason>"
@@ -77,12 +79,26 @@ STATION_SAMPLE_TABLE = "sample_table"
 STATION_CLEANING_STATION = "cleaning_station"
 STATION_MIXER_STATION = "mixer_station"
 STATION_MIXER_CLEANING_STATION = "mixer_cleaning_station"
+# The carousel centre, located by the tag at its middle. One carousel carried
+# between the mixer and a stock spot, so both positions read the same tag
+# (apriltags.carousel) and each is taught when the carousel is standing at it.
+# Reference positions, not grab seats: the search bumps down to measure the
+# surface and backs off like every other station, but does not grab -- there is
+# nothing to pick up at a carousel centre (PAL12idb.NO_GRAB_STATIONS).
+STATION_CAROUSEL_ON_MIXER = "carousel_on_mixer"
+STATION_CAROUSEL_IN_STOCK = "carousel_in_stock"
+# Where spent carousels are stacked once used. A third carousel position, taught
+# and searched like the other two (shared tag range 31-40).
+STATION_CAROUSEL_USED_STACK = "carousel_used_stack"
 
 STATIONS = (
     STATION_SAMPLE_TABLE,
     STATION_CLEANING_STATION,
     STATION_MIXER_STATION,
     STATION_MIXER_CLEANING_STATION,
+    STATION_CAROUSEL_ON_MIXER,
+    STATION_CAROUSEL_IN_STOCK,
+    STATION_CAROUSEL_USED_STACK,
 )
 
 # The sample seat beside the mixer cleaning station. Taught like the four
@@ -102,6 +118,9 @@ STATION_LABELS = {
     STATION_MIXER_STATION: "Mixer Station",
     STATION_MIXER_CLEANING_STATION: "Mixer Cleaning Station",
     STATION_SAMPLE_ON_MIXER: "Sample on Mixer Station",
+    STATION_CAROUSEL_ON_MIXER: "Carousel on Mixer",
+    STATION_CAROUSEL_IN_STOCK: "Carousel in Stock",
+    STATION_CAROUSEL_USED_STACK: "Used Carousel Stack",
 }
 
 SEARCH_APRILTAG = "search_apriltag"
@@ -129,6 +148,17 @@ FROM_CURRENT = "from_current"
 # which will not reorient it for them.
 PUT_CAMERA_TO_TCP = "put_camera_to_tcp"
 PUT_TCP_TO_CAMERA = "put_tcp_to_camera"
+
+# Report the current TCP pose (gripper frame): x y z rx ry rz, metres and
+# radians. A read -- no motion -- but refused while the arm is moving.
+GET_POSE = "get_pose"
+
+# Report the camera-to-tag distance for the AprilTag currently in view. An
+# optional station scales the measurement for that station's tag size (the
+# distance is proportional to it); without one, the camera's current size is
+# used. A read -- no motion -- but refused while the arm is moving, since a frame
+# grabbed mid-move is unreliable.
+TAG_DISTANCE = "tag_distance"
 
 # Teach a station from where the robot is standing instead of by searching for
 # its AprilTag -- for a station whose tag is obscured, or one being nudged off
@@ -291,6 +321,13 @@ ZALIGN = "zalign"
 # reaches the robot over the dashboard socket rather than the motion one, so a
 # stuck move does not block it either.
 RELEASE_GRIPPER = "release_gripper"
+# GRAB_GRIPPER closes the jaws where the arm stands -- the mirror of
+# RELEASE_GRIPPER, and a worker command just the same (refused mid-transport).
+GRAB_GRIPPER = "grab_gripper"
+# BUMP_Z drives straight down until the tool touches, then reports the Z it
+# stopped at -- a surface measured by feel. A worker command (a real move); close
+# the gripper first for a clean fingertip contact. The result carries the height.
+BUMP_Z = "bump_z"
 UNLOCK_STOP = "unlock_stop"
 
 # Hand-guiding (freedrive): release the arm's brakes so an operator can push it
@@ -372,6 +409,14 @@ UNLOAD_SAMPLE_ASYNC = "unload_sample_async"
 # "unload_sample aspirate" -- so it consumes no carousel slot and assigns no
 # sample ID, unlike make_sample.
 DRAW_AND_LOAD = "draw_and_load"
+
+# Camera-guided carousel swap. unload_carousel takes the spent carousel off the
+# mixer onto the used-carousel stack; place_new_carousel brings a fresh one from
+# the stock position onto the mixer. Both are worker actions that move the arm
+# (PAL12idb.unload_current_carousel / place_new_carousel) and need their taught
+# positions first. No arguments.
+UNLOAD_CAROUSEL = "unload_carousel"
+PLACE_NEW_CAROUSEL = "place_new_carousel"
 
 # Optional trailing flag on unload_sample. Without it the flowcell comes off
 # the beam and goes straight to its cleaning station to be washed, and the
@@ -494,6 +539,19 @@ def search_apriltag_command(station, skip_roll=False, from_current=False):
 def put_camera_to_tcp_command():
     """Build the wire command to move the camera onto the gripper tip's pose."""
     return PUT_CAMERA_TO_TCP
+
+
+def get_pose_command():
+    """Build the wire command to read the current TCP pose (gripper frame)."""
+    return GET_POSE
+
+
+def tag_distance_command(station=None):
+    """Build the wire command to read the camera-to-tag distance.
+
+    With `station`, the measurement is scaled for that station's tag size.
+    """
+    return TAG_DISTANCE if station is None else "%s %s" % (TAG_DISTANCE, station)
 
 
 def put_tcp_to_camera_command():
@@ -642,6 +700,16 @@ def release_gripper_command():
     return RELEASE_GRIPPER
 
 
+def grab_gripper_command():
+    """Build the wire command to close the gripper where the arm stands."""
+    return GRAB_GRIPPER
+
+
+def bump_z_command():
+    """Build the wire command to bump straight down and report the surface Z."""
+    return BUMP_Z
+
+
 def unlock_stop_command():
     """Build the wire command to clear the robot's protective stop."""
     return UNLOCK_STOP
@@ -681,6 +749,16 @@ def make_sample_command(slot, sample_id=None):
     if sample_id and str(sample_id).strip():
         return "%s %s %s" % (MAKE_SAMPLE, slot, str(sample_id).strip())
     return "%s %s" % (MAKE_SAMPLE, slot)
+
+
+def unload_carousel_command():
+    """Build the wire command to unload the carousel from the mixer."""
+    return UNLOAD_CAROUSEL
+
+
+def place_new_carousel_command():
+    """Build the wire command to place a fresh carousel onto the mixer."""
+    return PLACE_NEW_CAROUSEL
 
 
 def draw_and_load_command():

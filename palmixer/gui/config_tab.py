@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
-"""Configuration tab: live camera view + AprilTag search buttons.
+"""Configuration tab: live camera view, one Position panel, and a jog panel.
 
-Each search button sends a ``search_apriltag <station>`` command over ZMQ to
-the PALmixer server, which drives the robot to look for the station's
-AprilTag (PAL12idb.locate_apriltag). The server replies "ACCEPTED"
-immediately and the outcome shows up in the shared MQTT status log.
+The Position panel is a single row -- pick a position from the dropdown, pick an
+action (Search AprilTag / Go To Position / Set Current Position), and press Go --
+rather than a button per position per action, which did not scale once there were
+eight taught positions. Each action maps to the same ZMQ commands as before:
 
-"Stop Search" sends ``stop_search``, a fast command the server answers even
-while busy (see server.py's fast_dispatch) -- it is deliberately left out of
-busy_widgets so it stays enabled for exactly the window where it is useful.
+* Search AprilTag -> ``search_apriltag <station> [skip_roll] [from_current]``;
+  the server drives the robot to find the station's tag (PAL12idb.locate_apriltag).
+* Go To Position  -> ``goto_position <station>`` (or ``goto_transfer_point``).
+* Set Current Position -> ``set_position_here <station>`` (or
+  ``set_transfer_point_here``) -- records where the arm is standing now.
+
+"Stop Search" sends ``stop_search``, a fast command the server answers even while
+busy (see server.py's fast_dispatch) -- deliberately left out of busy_widgets so
+it stays enabled for exactly the window where it is useful.
 """
 
 from PyQt5.QtWidgets import (
@@ -22,57 +28,19 @@ from .flowcell_selector import FlowcellSelector
 
 
 class ConfigTab(QWidget):
+    # Dropdown data sentinel for the corridor waypoint, which is not a taught
+    # station (no AprilTag, its own commands) but is a "position" for Go/Set.
+    _TRANSFER_POINT = "__transfer_point__"
+
+    # Action values carried as the action dropdown's itemData.
+    _SEARCH, _GOTO, _SET = "search", "goto", "set"
+
     def __init__(self, robot_ip, send_command, query=None, parent=None):
         super().__init__(parent)
         self._send_command = send_command
 
         self.flowcell = FlowcellSelector(send_command)
         self.camera = CameraWidget(robot_ip, query=query)
-
-        button_box = QGroupBox("Search AprilTag")
-        button_layout = QHBoxLayout()
-        self.station_buttons = []
-        for station in cmd.STATIONS:
-            btn = QPushButton(cmd.STATION_LABELS[station])
-            btn.clicked.connect(lambda _checked, s=station: self._on_search(s))
-            button_layout.addWidget(btn)
-            self.station_buttons.append(btn)
-        self.stop_search_button = QPushButton("Stop Search")
-        self.stop_search_button.setStyleSheet("color: darkred; font-weight: bold;")
-        self.stop_search_button.setToolTip(
-            "Abort an in-progress AprilTag search and stop the robot immediately.")
-        self.stop_search_button.clicked.connect(
-            lambda: self._send_command(cmd.stop_search_command()))
-        button_layout.addWidget(self.stop_search_button)
-        # Applies to whichever station is searched next: keep the camera level
-        # (face straight down) instead of rolling it face-down / squaring it to
-        # a tilted tag. Position is still recorded; teach a tilted seat's angle
-        # by hand (below) afterward. Default off = the current search behavior.
-        self.skip_roll_check = QCheckBox("Keep camera face-down (skip roll)")
-        self.skip_roll_check.setToolTip(
-            "Search for the tag and record the position, but leave the camera "
-            "level (facing straight down) instead of tipping it face-down or "
-            "squaring it to a tilted tag. Use for a seat whose tilt you teach "
-            "by hand afterward.")
-        button_layout.addWidget(self.skip_roll_check)
-        # Applies to whichever station is searched next, like skip-roll above.
-        # For a station that has moved far enough that its configured
-        # reference no longer looks anywhere near the tag: put the camera over
-        # it by eye -- the view is right here -- and search from there instead.
-        # Nothing is read from waypoints.ini or search_refs, so it also works
-        # when a stored position is wrong in a way that would send the arm
-        # somewhere unhelpful.
-        self.from_current_check = QCheckBox("Start from the current position")
-        self.from_current_check.setToolTip(
-            "Search from where the arm is standing now, instead of first "
-            "driving to the station's configured search reference.\n\n"
-            "The camera must be looking down. If it already is, nothing is "
-            "reoriented and the view does not shift; if it is not, the camera "
-            "is brought face-down first, which moves the arm. Use the Robot "
-            "panel's Camera to TCP button on the Experiment tab to get it "
-            "there yourself beforehand.")
-        button_layout.addWidget(self.from_current_check)
-        button_box.setLayout(button_layout)
 
         # Freeze the calibrated Venton coordinate frame onto the live image. A
         # checkable toggle, not a one-shot: on press it asks the server to
@@ -94,17 +62,126 @@ class ConfigTab(QWidget):
         layout.addWidget(self.flowcell)
         layout.addWidget(self.camera, stretch=1)
         layout.addLayout(overlay_row)
-        layout.addWidget(button_box)
-        layout.addWidget(self._build_goto_group())
-        layout.addWidget(self._build_teach_group())
+        layout.addWidget(self._build_position_group())
         layout.addWidget(self._build_jog_group())
-        layout.addWidget(self._build_sync_group())
         self.setLayout(layout)
+        self._sync_search_options()
 
-    def _on_search(self, station):
-        self._send_command(cmd.search_apriltag_command(
-            station, skip_roll=self.skip_roll_check.isChecked(),
-            from_current=self.from_current_check.isChecked()))
+    # -- position: pick one, pick an action, press Go --------------------------
+    def _build_position_group(self):
+        box = QGroupBox("Position")
+        rows = QVBoxLayout()
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Position:"))
+        self.position_combo = QComboBox()
+        for station in cmd.TAUGHT_STATIONS:
+            self.position_combo.addItem(cmd.STATION_LABELS[station], station)
+        # The corridor waypoint is a position for Go/Set but not a station -- it
+        # has no tag, falls back to a built-in default, and uses its own
+        # commands. Listed last so the taught stations stay together.
+        self.position_combo.addItem("Transfer Point", self._TRANSFER_POINT)
+        row.addWidget(self.position_combo)
+
+        row.addSpacing(8)
+        row.addWidget(QLabel("Action:"))
+        self.action_combo = QComboBox()
+        self.action_combo.addItem("Search AprilTag", self._SEARCH)
+        self.action_combo.addItem("Go To Position", self._GOTO)
+        self.action_combo.addItem("Set Current Position", self._SET)
+        self.action_combo.currentIndexChanged.connect(self._sync_search_options)
+        row.addWidget(self.action_combo)
+
+        self.go_btn = QPushButton("Go")
+        self.go_btn.setToolTip(
+            "Run the selected action on the selected position:\n"
+            " - Search AprilTag: drive to the station and find its tag.\n"
+            " - Go To Position: move to the taught pose and stop.\n"
+            " - Set Current Position: record where the arm is standing now.")
+        self.go_btn.clicked.connect(self._on_go)
+        row.addWidget(self.go_btn)
+
+        # Stays live while the server is BUSY -- that is when an in-progress
+        # search needs stopping -- so it is kept out of busy_widgets.
+        self.stop_search_button = QPushButton("Stop Search")
+        self.stop_search_button.setStyleSheet("color: darkred; font-weight: bold;")
+        self.stop_search_button.setToolTip(
+            "Abort an in-progress AprilTag search and stop the robot immediately.")
+        self.stop_search_button.clicked.connect(
+            lambda: self._send_command(cmd.stop_search_command()))
+        row.addWidget(self.stop_search_button)
+        row.addStretch(1)
+        rows.addLayout(row)
+
+        # Search-only options, enabled only when the action is Search.
+        opt_row = QHBoxLayout()
+        self.skip_roll_check = QCheckBox("Keep camera face-down (skip roll)")
+        self.skip_roll_check.setToolTip(
+            "Search for the tag and record the position, but leave the camera "
+            "level (facing straight down) instead of tipping it face-down or "
+            "squaring it to a tilted tag. Use for a seat whose tilt you teach "
+            "by hand afterward.")
+        opt_row.addWidget(self.skip_roll_check)
+        self.from_current_check = QCheckBox("Start from the current position")
+        self.from_current_check.setToolTip(
+            "Search from where the arm is standing now, instead of first "
+            "driving to the station's configured search reference.\n\n"
+            "The camera must be looking down. If it already is, nothing is "
+            "reoriented and the view does not shift; if it is not, the camera "
+            "is brought face-down first, which moves the arm. Use the Robot "
+            "panel's Camera to TCP button on the Experiment tab to get it "
+            "there yourself beforehand.")
+        opt_row.addWidget(self.from_current_check)
+        opt_row.addStretch(1)
+        rows.addLayout(opt_row)
+
+        box.setLayout(rows)
+        return box
+
+    def _sync_search_options(self, *_):
+        """The skip-roll / from-current options only mean anything for a search,
+        so grey them out for the other actions."""
+        is_search = self.action_combo.currentData() == self._SEARCH
+        self.skip_roll_check.setEnabled(is_search)
+        self.from_current_check.setEnabled(is_search)
+
+    def _on_go(self):
+        pos = self.position_combo.currentData()
+        action = self.action_combo.currentData()
+        is_transfer = (pos == self._TRANSFER_POINT)
+        label = "Transfer Point" if is_transfer else cmd.STATION_LABELS[pos]
+
+        if action == self._SEARCH:
+            if is_transfer or pos not in cmd.STATIONS:
+                QMessageBox.information(
+                    self, "Search AprilTag",
+                    "%s has no AprilTag to search for.\n\nUse Go To Position or "
+                    "Set Current Position for it instead." % label)
+                return
+            self._send_command(cmd.search_apriltag_command(
+                pos, skip_roll=self.skip_roll_check.isChecked(),
+                from_current=self.from_current_check.isChecked()))
+
+        elif action == self._GOTO:
+            self._send_command(cmd.goto_transfer_point_command() if is_transfer
+                               else cmd.goto_position_command(pos))
+
+        elif action == self._SET:
+            # Overwrites a taught pose every later move reads, and the arm's
+            # current pose is not something the dialog can show back, so confirm
+            # against the position name before sending.
+            if QMessageBox.question(
+                    self, "Set Current Position",
+                    "Record the robot's current pose as %s?\n\n"
+                    "This replaces the stored position every move to %s uses.\n\n"
+                    "The arm must be left where a search would leave it -- "
+                    "transports descend from the stored pose, so setting this "
+                    "with the gripper already down records a position too low."
+                    % (label, label),
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
+            self._send_command(cmd.set_transfer_point_here_command() if is_transfer
+                               else cmd.set_position_here_command(pos))
 
     def _on_toggle_venton_axes(self, checked):
         """Turn the frozen Venton axes overlay on or off. On failure to compute
@@ -119,115 +196,6 @@ class ConfigTab(QWidget):
             QMessageBox.warning(self, "Show Venton Axes",
                                 "Could not show the Venton axes:\n\n%s"
                                 % (message or "unknown error"))
-
-    # -- go to a taught position -----------------------------------------------
-    def _build_goto_group(self):
-        """Drive to what a station's taught position actually is -- the way to
-        check by eye what the search above, or the manual teach below, recorded.
-        The server refuses a station nobody has taught yet, with the same
-        message a transport gives."""
-        box = QGroupBox("Go To Position")
-        layout = QHBoxLayout()
-        self.goto_buttons = []
-        for station in cmd.TAUGHT_STATIONS:
-            btn = QPushButton(cmd.STATION_LABELS[station])
-            btn.setToolTip(
-                "Move the robot to the taught %s position and stop there, going "
-                "by way of the transfer point. Nothing is picked up or released, "
-                "and the arm stops at the pose a transport would start from -- "
-                "above the object, not down on it." % cmd.STATION_LABELS[station])
-            btn.clicked.connect(lambda _checked, s=station: self._on_goto(s))
-            layout.addWidget(btn)
-            self.goto_buttons.append(btn)
-
-        # The corridor waypoint, kept apart from the stations because it is not
-        # one: it falls back to a built-in default when untaught, so this button
-        # works on a fresh install where the others refuse.
-        layout.addSpacing(12)
-        self.transfer_point_btn = QPushButton("Transfer Point")
-        self.transfer_point_btn.setToolTip(
-            "Move the robot to the transfer point -- the corridor pose every "
-            "move between the sample table and the mixer side routes through.\n\n"
-            "Uses a built-in default until you teach one (Set Current Robot "
-            "Position As > Transfer Point), so this works before anything has "
-            "been configured. Useful to park the arm clear, or to start from a "
-            "known place: from here every station is one ordinary move away.")
-        self.transfer_point_btn.clicked.connect(
-            lambda: self._send_command(cmd.goto_transfer_point_command()))
-        layout.addWidget(self.transfer_point_btn)
-        self.goto_buttons.append(self.transfer_point_btn)
-
-        layout.addStretch(1)
-        box.setLayout(layout)
-        return box
-
-    def _on_goto(self, station):
-        self._send_command(cmd.goto_position_command(station))
-
-    # -- teach from the current pose -------------------------------------------
-    def _build_teach_group(self):
-        """The manual counterpart to the AprilTag search above: record where the
-        arm is standing as a station's position. For a station whose tag is
-        obscured, or one being nudged off a position that is already close."""
-        box = QGroupBox("Set Current Robot Position As")
-        layout = QHBoxLayout()
-        self.teach_buttons = []
-        for station in cmd.TAUGHT_STATIONS:
-            btn = QPushButton(cmd.STATION_LABELS[station])
-            btn.setToolTip(
-                "Record the robot's current pose as the %s position, replacing "
-                "whatever the AprilTag search last found.\n\nThe arm must be left "
-                "where a search would leave it: transports descend from the "
-                "stored pose to reach the object, so teaching this with the "
-                "gripper already down on the object records a position that is "
-                "too low." % cmd.STATION_LABELS[station])
-            btn.clicked.connect(lambda _checked, s=station: self._on_teach_here(s))
-            layout.addWidget(btn)
-            self.teach_buttons.append(btn)
-
-        # The transfer point, kept apart from the stations because it is not one
-        # (no AprilTag, its own waypoints.ini section). Teaches the corridor pose
-        # from where the arm is standing now; stored as the pose the arm goes to
-        # directly, so no descent offset applies -- what you jog to is what is
-        # used.
-        layout.addSpacing(12)
-        self.teach_transfer_point_btn = QPushButton("Transfer Point")
-        self.teach_transfer_point_btn.setToolTip(
-            "Record the robot's current pose as the transfer point -- the "
-            "corridor pose every move between the sample table and the mixer "
-            "side routes through.\n\nUnlike a station, this pose is used as-is "
-            "with no descent, so jog the arm exactly where you want the corridor "
-            "to be and press this.")
-        self.teach_transfer_point_btn.clicked.connect(self._on_teach_transfer_point)
-        layout.addWidget(self.teach_transfer_point_btn)
-        self.teach_buttons.append(self.teach_transfer_point_btn)
-
-        layout.addStretch(1)
-        box.setLayout(layout)
-        return box
-
-    def _on_teach_here(self, station):
-        # Overwrites a taught position every later move reads, and the arm's
-        # current pose is not something the dialog can show back, so confirm
-        # against the station name before sending.
-        if QMessageBox.question(
-                self, "Set Position",
-                "Record the robot's current position as %s?\n\n"
-                "This replaces the taught position that every move to %s uses."
-                % (cmd.STATION_LABELS[station], cmd.STATION_LABELS[station]),
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
-            return
-        self._send_command(cmd.set_position_here_command(station))
-
-    def _on_teach_transfer_point(self):
-        if QMessageBox.question(
-                self, "Set Transfer Point",
-                "Record the robot's current position as the transfer point?\n\n"
-                "This replaces the corridor pose that every cross-cell move "
-                "routes through.",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
-            return
-        self._send_command(cmd.set_transfer_point_here_command())
 
     # -- jog the pose by hand, then save it ------------------------------------
     def _build_jog_group(self):
@@ -351,12 +319,9 @@ class ConfigTab(QWidget):
     def _on_save_pose(self):
         """Save the whole pose, not the orientation alone.
 
-        This button used to send set_orientation_here, which keeps the taught
-        X/Y/Z and replaces only RX/RY/RZ -- it predates there being any way to
-        jog the position from the GUI, so position was never the operator's to
-        change here. Now that it is, saving half of what was just jogged would
-        silently throw the other half away. set_position_here records the full
-        pose (PAL12idb.record_current_position), so both survive.
+        set_position_here records the full pose
+        (PAL12idb.record_current_position), so both the jogged position and the
+        jogged orientation survive.
         """
         station = self.jog_station.currentData()
         label = cmd.STATION_LABELS[station]
@@ -369,38 +334,15 @@ class ConfigTab(QWidget):
             return
         self._send_command(cmd.set_position_here_command(station))
 
-    # -- EPICS waypoint sync ---------------------------------------------------
-    def _build_sync_group(self):
-        """Taught positions live in the server's waypoints.ini, which is what
-        every move reads; the 12idUR:WaypointL:* PVs are a separate copy for
-        the rest of the beamline. These two buttons are the only thing that
-        moves values between them, in either direction."""
-        box = QGroupBox("EPICS Waypoint PVs")
-        layout = QHBoxLayout()
-        self.sync_buttons = []
-        for label, command, tip in (
-            ("Push to EPICS PVs", cmd.push_positions_command(),
-             "Copy every taught position out to its 12idUR:WaypointL:* PVs."),
-            ("Pull from EPICS PVs", cmd.pull_positions_command(),
-             "Import positions from the 12idUR:WaypointL:* PVs, replacing the "
-             "taught positions this server uses."),
-        ):
-            btn = QPushButton(label)
-            btn.setToolTip(tip)
-            btn.clicked.connect(lambda _checked, c=command: self._send_command(c))
-            layout.addWidget(btn)
-            self.sync_buttons.append(btn)
-        layout.addStretch(1)
-        box.setLayout(layout)
-        return box
-
     @property
     def busy_widgets(self):
-        """Widgets to disable while the server reports BUSY."""
-        return (list(self.station_buttons) + list(self.goto_buttons)
-                + list(self.teach_buttons) + list(self.pos_buttons)
-                + list(self.rot_buttons) + [self.save_pose_btn]
-                + list(self.sync_buttons) + self.flowcell.busy_widgets)
+        """Widgets to disable while the server reports BUSY. Stop Search and the
+        search-option checkboxes stay live; everything that starts motion does
+        not."""
+        return ([self.position_combo, self.action_combo, self.go_btn]
+                + list(self.pos_buttons) + list(self.rot_buttons)
+                + [self.save_pose_btn, self.jog_station]
+                + self.flowcell.busy_widgets)
 
     def showEvent(self, event):
         super().showEvent(event)
