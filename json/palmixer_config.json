@@ -15,7 +15,8 @@
     "ur12idb_path": {
       "linux": "/home/beams15/S12STAFF/python_codes/UR_12idb",
       "windows": "C:/Users/s12idb/Documents/GitHub/UR_12idb"
-    }
+    },
+    "shoulder_min_deg": -150
   },
   "motor": {
     "type": "galil",
@@ -79,8 +80,12 @@
       "size_m": 0.0095
     },
     "mixer_head": {
-      "id": 25,
-      "size_m": 0.016
+      "ids": [
+        25,
+        26
+      ],
+      "size_m": 0.016,
+      "rz_offset_deg": 180
     },
     "carousel": {
       "id_range": [

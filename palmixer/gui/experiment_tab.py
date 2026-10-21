@@ -227,7 +227,7 @@ class ExperimentTab(QWidget):
         self.step_box = QDoubleSpinBox()
         self.step_box.setDecimals(4)
         self.step_box.setRange(0.0001, 100000.0)
-        self.step_box.setValue(1.0)
+        self.step_box.setValue(4500)          # one carousel slot step (config carousel.step)
         layout.addWidget(self.step_box)
 
         self.reverse_btn = QPushButton("<< Reverse")

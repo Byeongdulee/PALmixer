@@ -112,8 +112,15 @@ def test_the_carousel_tag_has_a_90_degree_mounting_offset():
         assert PAL12idb.apriltag_rz_offset(s) == pytest.approx(90.0)
 
 
+def test_the_mixer_head_tag_has_a_180_degree_mounting_offset():
+    # The mixer-head tag is mounted facing the opposite direction (turned 180 deg
+    # about its normal), so the search takes 180 deg back out before recording.
+    for s in ("mixer_station", "mixer_cleaning_station"):
+        assert PAL12idb.apriltag_rz_offset(s) == pytest.approx(180.0)
+
+
 def test_other_stations_have_no_mounting_offset():
-    for s in ("sample_table", "cleaning_station", "mixer_station"):
+    for s in ("sample_table", "cleaning_station"):
         assert PAL12idb.apriltag_rz_offset(s) == pytest.approx(0.0)
 
 

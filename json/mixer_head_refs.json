@@ -1,0 +1,87 @@
+{
+  "mixer_head_tag": 26,
+  "carousel_on_mixer_tag": 32,
+  "note": "Connected mixer-area reference model. Poses are base-frame [x,y,z,rx,ry,rz]. Measuring one tag yields all four points via the offsets.",
+  "mixing_station": {
+    "tag26_pose": [
+      0.4157,
+      -0.2673,
+      0.2828,
+      0.0016,
+      0.0017,
+      -1.5587
+    ]
+  },
+  "carousel_on_mixer": {
+    "tag_pose": [
+      0.3785,
+      -0.267,
+      0.2454,
+      0.0077,
+      -0.0242,
+      -1.5641
+    ],
+    "pos_offset_from_mixing_tag26": [
+      -0.0372,
+      0.0003,
+      -0.0374
+    ]
+  },
+  "sample_on_mixer_station": {
+    "pos_offset_from_carousel_tag": [
+      0.0,
+      0.062,
+      0.0
+    ]
+  },
+  "mixer_on_cleaning_station": {
+    "tag26_pose": null,
+    "pos_offset_from_mixing_tag26": null,
+    "orientation_vs_mixing": null,
+    "status": "PENDING -- put the mixer head on the cleaning station, then record tag26 there",
+    "taught_cleaning_gripper_pose": [
+      0.44912,
+      -0.2101,
+      0.35315,
+      -2.9833,
+      -0.98448,
+      0.0003
+    ]
+  },
+  "venton_frame_refs": {
+    "note": "Positions in the Venton-table frame (bench-fixed). base->venton: v = R^T (base-origin), R=[x_axis|y_axis|normal]. Used to classify a scanned tag by LOCATION (e.g. is a carousel on the mixing station?).",
+    "venton_origin": [
+      0.2161,
+      -0.1021,
+      0.0499
+    ],
+    "venton_x_axis": [
+      0.99996,
+      0.00839,
+      0.0
+    ],
+    "venton_y_axis": [
+      -0.00839,
+      0.99996,
+      0.0
+    ],
+    "venton_normal": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "mixing_station_mixerhead_venton_xyz": [
+      0.19771,
+      -0.16616,
+      0.2341
+    ],
+    "carousel_on_mixer_venton_xyz": [
+      0.15902,
+      -0.16514,
+      0.195
+    ],
+    "mixer_on_cleaning_station_venton_xyz": null,
+    "source": "raster scan locate2 (Venton tags 12,13; mixer-head 26; carousel 32)"
+  },
+  "mixer_head_tag_note": "either 25 or 26 may be the active mixer-head tag; the head jumps between the mixing and cleaning stations"
+}

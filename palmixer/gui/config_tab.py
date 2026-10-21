@@ -54,8 +54,23 @@ class ConfigTab(QWidget):
             "clear. Run a Venton calibration first.")
         self.venton_axes_btn.toggled.connect(self._on_toggle_venton_axes)
 
+        # Raster the bench, find the carousel on the mixer (the carousel tag
+        # ~65 mm -X / -Y from the mixer-head tag), store its tag centre, and
+        # report the sample position (+62 mm +Y). The result text appears in the
+        # status log. It drives the arm (a ~1 min scan), so it is busy-gated.
+        self.locate_carousel_btn = QPushButton("Scan && Locate Carousel")
+        self.locate_carousel_btn.setToolTip(
+            "Raster-scan the bench with the wrist camera, identify which carousel "
+            "is on the mixer (its tag sits ~65 mm -X and -Y from the mixer-head "
+            "tag), store that tag centre, and report the sample position "
+            "(+62 mm +Y). Result shows in the status log; no robot move beyond "
+            "the scan.")
+        self.locate_carousel_btn.clicked.connect(
+            lambda: self._send_command(cmd.locate_mixer_carousel_command()))
+
         overlay_row = QHBoxLayout()
         overlay_row.addWidget(self.venton_axes_btn)
+        overlay_row.addWidget(self.locate_carousel_btn)
         overlay_row.addStretch(1)
 
         layout = QVBoxLayout()

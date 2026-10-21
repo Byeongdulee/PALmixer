@@ -91,6 +91,57 @@ sample_on_mixer_station = []
 # 0.0004 rad, which is why the fallback keeps the mixer cleaning station's.
 sample_on_mixer_offset = (-0.039548, -0.090382, 0.020180)
 needle_clear_height = 0.16
+# Absolute base-frame Z (gripper TCP) to lift to before swinging the arm around
+# the cell -- a safe travel height clear of everything on the bench. Unlike the
+# relative *_clear_height / *_lift values, this is an absolute Z to move the arm
+# TO, not a relative lift. Per robot model: the UR3's shorter reach may want a
+# different value than the UR5 (adjust the UR3 entry when known).
+SAFE_SWING_Z_BY_MODEL = {'UR5': 0.45, 'UR3': 0.5}
+
+
+# Approximate UR5 reach model for estimating the max planar radius at a height.
+# Sphere about the shoulder: the wrist centre must lie within UR5_ARM_REACH
+# (|a2|+|a3|) of the shoulder, which sits UR5_SHOULDER_Z above the base.
+UR5_SHOULDER_Z = 0.16       # shoulder (joint-2) height above the base, m
+UR5_ARM_REACH = 0.817       # shoulder -> wrist reach |a2| + |a3|, m
+# raster_tag_scan step sizing: advance this fraction of the camera footprint per
+# step (so adjacent stops overlap), and assume the tags sit around this bench
+# height (for the camera->bench distance that sets the footprint). Both the
+# angular and radial steps scale with this, so halving it halves the step size
+# (denser scan, ~4x the stops) -- 0.35 after the 0.7 scan missed the mixer head.
+CAMERA_FOV_OVERLAP = 0.35
+CAMERA_SCAN_BENCH_Z = 0.10
+
+
+def max_rxy_at_z(z, tool_len=0.0, reach=UR5_ARM_REACH, shoulder_z=UR5_SHOULDER_Z,
+                 margin=0.0):
+    """Approximate the maximum planar radius Rxy the tool tip can reach at height
+    `z`, for a tool pointing straight down.
+
+    Sphere model: the wrist centre must lie within `reach` of the shoulder at
+    (0, 0, shoulder_z). With the tool pointing down the wrist is `tool_len` above
+    the tip and directly over it, so
+
+        Rxy_max = sqrt(reach^2 - (z + tool_len - shoulder_z)^2) - margin.
+
+    APPROXIMATE: it ignores the small wrist lateral offsets (d4/d5) and the
+    shoulder offset, so treat it as an upper bound to sanity-check scan radii, not
+    a hard limit -- verify against the robot and pull it in with `margin`. Returns
+    0 when the height is outside the reachable band."""
+    dz = (z + tool_len) - shoulder_z
+    inside = reach * reach - dz * dz
+    if inside <= 0.0:
+        return 0.0
+    return max(0.0, math.sqrt(inside) - margin)
+
+
+def safe_swing_z():
+    """The safe swing Z (absolute base Z) for the configured robot model.
+
+    Reads robot.name from the config and looks it up in SAFE_SWING_Z_BY_MODEL,
+    defaulting to the UR5 value for an unrecognised model."""
+    name = str(_config.get_section('robot').get('name') or 'UR5').strip().upper()
+    return SAFE_SWING_Z_BY_MODEL.get(name, SAFE_SWING_Z_BY_MODEL['UR5'])
 # Clearance held over the sample table on approach. Lower than
 # needle_clear_height: the full lift overshoots the table, and nothing at the
 # table needs that much room. Only the approach is shortened -- the lift at
@@ -106,10 +157,9 @@ grab_depth = 0.01
 cleaningstation_approach_lift = 0.05
 # How far to lift off the contact a bump found before opening the gripper, for
 # the stations that are set down by feel rather than at a computed Z (see
-# dropdown_by_bump and BUMP_RELEASE_STATIONS). Small on purpose: the point of
-# feeling for the seat is to release at the seat, and anything much larger
-# gives back the height the bump was there to find.
-bump_release_backoff = 0.002
+# dropdown_by_bump and BUMP_RELEASE_STATIONS). 0 means release right at the seat
+# the bump felt (no retreat before opening).
+bump_release_backoff = 0.0
 # Default release height above the grab point for a computed-Z drop
 # (dropdown_at). The flowcell cleaning station overrides it to 2 mm: it is set
 # down at a known Z rather than by feel, 2 mm above where the flowcell was
@@ -132,12 +182,17 @@ sampletable_release_above = 0.001
 # Open-loop, but no more so than dropdown_at, which drives blind all the way to
 # the release height; this stops 25 mm short of it.
 bump_approach_clearance = 0.03
+# How far above the tag surface an AprilTag search descends (using the measured,
+# calibrated tag distance) before the teach bump feels for the surface. Keeps the
+# bump travel short and consistent regardless of the camera standoff the search
+# left off at. See locate_apriltag.
+APRILTAG_BUMP_STANDOFF = 0.030
 # The stations set down that way. Documentation rather than a lookup -- each
 # transport passes drop_by_bump itself, since it already knows which end it is
 # releasing at -- but the two places that do have to agree with each other, so
 # the list of them lives here.
-BUMP_RELEASE_STATIONS = ('mixer_cleaning_station', 'sample_on_mixer_station',
-                         'cleaning_station')
+BUMP_RELEASE_STATIONS = ('mixer_station', 'mixer_cleaning_station',
+                         'sample_on_mixer_station', 'cleaning_station')
 # Physical edge length of the AprilTag each station shows the camera. The
 # camera measures distance as AT_physical_size / (tag edge in pixels) * focal
 # length (urcamera.getATdistance), so this scales every distance reading
@@ -424,6 +479,725 @@ def _read_tags_in_view(robot, tags):
     finally:
         robot.set_tcp(robot.tcp)        # always leave the gripper TCP active
     return found
+
+
+def _all_configured_tags():
+    """Every AprilTag the config knows about, as {id: {'size_m': ...}}.
+
+    Collapses each apriltags.<subject> entry's id / ids / id_range into individual
+    ids, each mapped to that subject's physical size -- so a scan can look for all
+    of them and scale each tag's pose by the right size."""
+    tags = {}
+    for subject, entry in (_config.get_section("apriltags") or {}).items():
+        size = entry.get("size_m")
+        if size is None:
+            continue
+        ids = set()
+        rng = entry.get("id_range")
+        if rng:
+            try:
+                ids |= set(range(int(rng[0]), int(rng[1]) + 1))
+            except (TypeError, ValueError, IndexError):
+                pass
+        for i in entry.get("ids", []) or []:
+            try:
+                ids.add(int(i))
+            except (TypeError, ValueError):
+                pass
+        if entry.get("id") is not None:
+            try:
+                ids.add(int(entry["id"]))
+            except (TypeError, ValueError):
+                pass
+        for tid in ids:
+            tags[tid] = {"size_m": float(size)}
+    return tags
+
+
+def scan_apriltags_during_base_swing(robot, start_deg=-45.0, end_deg=45.0,
+                                     speed_deg_s=10.0, step_deg=30.0,
+                                     settle_s=3.0):
+    """Sweep the base joint start->end deg (relative) and, across the sweep, find
+    every configured AprilTag and record its base-frame position.
+
+    Stepped rather than continuous: the base is moved in small CAROUSEL-free steps
+    (step_deg) and all tags in view are read at each stop. Stationary reads avoid
+    motion blur / frame-lag, so the positions are accurate. Each stop captures one
+    frame and decodes ALL tags in it (not a slow per-tag detection); each tag's
+    pose is scaled by its configured size and mapped base <- optical <- tag like
+    _read_tags_in_view. Returns {id: {'xyz': [x,y,z], 'n': sightings}} averaged.
+    """
+    tags = _all_configured_tags()
+    robot.set_tcp(robot.tcp)
+    j0 = robot.getj()
+    base = j0[0]
+    flange_T_optical = _flange_T_optical(robot)
+    step_vel = math.radians(max(speed_deg_s, 5.0))          # move between stops; scan is at the stop
+    sightings = {}                                          # id -> list of [x,y,z]
+
+    def scan_here():
+        try:
+            # Let the camera settle/refocus after the move, and flush a stale
+            # frame or two, before reading -- otherwise the first frame at a new
+            # stop is blurry and tags are missed.
+            if settle_s:
+                time.sleep(settle_s)
+            camera_tools._flush_frames(robot, 2)
+            base_T_optical = _flange_transform(robot) @ flange_T_optical
+            robot.camera.capture()
+            robot.camera.decodeAT(tag_id=None)             # all tags in this frame
+            dets = list(getattr(robot.camera, "AT_detections", []) or [])
+            img = robot.camera.image
+            if img is None or not dets:
+                return
+            K, dist = _camera_matrix_and_dist(robot, (img.shape[1], img.shape[0]))
+            for d in dets:
+                tid = getattr(d, "tag_id", None)
+                if tid not in tags:
+                    continue
+                cam_T_tag = _calibration.apriltag_pose_from_corners(
+                    d.corners, tags[tid]["size_m"], K, dist_coeffs=dist)
+                if cam_T_tag is None:
+                    continue
+                p = (base_T_optical @ cam_T_tag)[:3, 3]
+                sightings.setdefault(tid, []).append(
+                    [float(p[0]), float(p[1]), float(p[2])])
+        except Exception as e:                             # noqa: BLE001
+            print("scan: frame skipped (%s)" % e)
+
+    try:
+        nsteps = max(1, int(round(abs(end_deg - start_deg) / float(step_deg))))
+        for i in range(nsteps + 1):
+            ang = start_deg + (end_deg - start_deg) * i / nsteps
+            q = list(j0); q[0] = base + math.radians(ang)
+            robot.movej(q, acc=0.3, vel=step_vel, wait=True)
+            scan_here()
+    finally:
+        robot.set_tcp(robot.tcp)
+    result = {}
+    for tid, pts in sightings.items():
+        arr = _np.array(pts)
+        result[tid] = {"xyz": arr.mean(axis=0).tolist(), "n": len(pts)}
+    return result
+
+
+def raster_tag_scan(robot, base_from=-80.0, base_to=0.0,
+                    r_inner=0.30, reach_margin=0.10, z=None, settle_s=3.0):
+    """Cylindrical-coordinate raster scan for AprilTags -- the CAMERA MUST FACE
+    STRAIGHT DOWN. Moves over a (base-joint angle x radial Rxy) grid at a fixed Z
+    and records every configured tag's base-frame position.
+
+    The camera must be looking straight down: this is a cylindrical scan (base
+    angle + radius) of the bench below. If the camera already faces down, the scan
+    just uses the camera TCP and does NOT put_camera2tcp (which would disturb the
+    down orientation -- that movement is why repeat scans drifted); otherwise it
+    falls back to put_camera2tcp. Face the camera down first (face_camera_down)
+    for consistent results.
+
+    Base joint from base_from to base_to; the angular step AND the radial step are
+    derived from the camera's field of view so adjacent stops overlap (see
+    CAMERA_FOV_OVERLAP). Radius spans r_inner..(max reachable Rxy at this Z -
+    reach_margin), swept serpentine. Z defaults to the safe swing height.
+    Positioning is in the CAMERA TCP. Each stop settles, captures one frame,
+    decodes ALL tags and maps every tag from the CAMERA frame into BASE coordinates
+    (base <- optical <- tag). Returns {id: {'xyz', 'n', 'seen_at'}}.
+    """
+    tags = _all_configured_tags()
+    if z is None:
+        z = safe_swing_z()
+
+    # Face straight down: if it already does, just use the camera TCP -- do NOT
+    # put_camera2tcp (that move disturbs the down orientation, which is what made
+    # repeat scans drift). Otherwise fall back to put_camera2tcp.
+    if camera_tools.camera_faces_down(robot):
+        robot.set_tcp(robot.camtcp)
+        print("raster_tag_scan: camera already faces down; using the camera TCP "
+              "(skipping put_camera2tcp)")
+    else:
+        print("raster_tag_scan: camera not facing down; doing put_camera2tcp")
+        robot.put_camera2tcp()
+    flange_T_optical = _flange_T_optical(robot)
+
+    # Step sizes from the camera's field of view, so adjacent stops overlap and
+    # leave no gaps. Footprint on the bench at camera->bench distance d is
+    # (W/f_x, H/f_y) * d; use the smaller side (conservative, orientation-agnostic)
+    # and cover CAMERA_FOV_OVERLAP of it per step.
+    robot.camera.capture()
+    img = robot.camera.image
+    W, H = (img.shape[1], img.shape[0]) if img is not None else (1280, 720)
+    K, _dist = _camera_matrix_and_dist(robot, (W, H))
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    d = max(0.05, z - CAMERA_SCAN_BENCH_Z)                  # camera -> bench distance
+    foot = min(W / fx, H / fy) * d                         # smaller footprint side (m)
+    camera_tool = abs(float(robot.camtcp[2])) + 0.08       # camera tip + wrist, down
+    r_outer = max_rxy_at_z(z, tool_len=camera_tool) - reach_margin
+
+    def grid(a, b, step):
+        n = max(1, int(round(abs(b - a) / float(step))))
+        return [a + (b - a) * i / n for i in range(n + 1)]
+    # Radius-major, INNER first then outward. The angular step is per-radius: the
+    # arc at radius R must stay within the footprint, so Rxy * dtheta <= overlap *
+    # foot -> dtheta = overlap * foot / R. Small R -> large angular step; large R
+    # -> small step.
+    radial_step = max(0.01, CAMERA_FOV_OVERLAP * foot)
+    radii = (grid(r_inner, r_outer, radial_step) if r_outer > r_inner
+             else [r_inner])
+
+    def base_step_for(R):
+        return max(2.0, math.degrees(CAMERA_FOV_OVERLAP * foot / max(R, 1e-6)))
+    print("raster_tag_scan: Z=%.3f d=%.3f footprint=%.3f m, radial step=%.3f m, "
+          "Rxy=%s (inner-first), angular step %.1f->%.1f deg (inner->outer)"
+          % (z, d, foot, radial_step, ["%.3f" % r for r in radii],
+             base_step_for(radii[0]), base_step_for(radii[-1])))
+
+    sightings = {}
+
+    def scan_here(ang, R):
+        try:
+            if settle_s:
+                time.sleep(settle_s)
+            camera_tools._flush_frames(robot, 2)
+            base_T_optical = _flange_transform(robot) @ flange_T_optical  # resets to gripper TCP
+            robot.camera.capture()
+            robot.camera.decodeAT(tag_id=None)
+            dets = list(getattr(robot.camera, "AT_detections", []) or [])
+            img = robot.camera.image
+            if img is None or not dets:
+                return
+            K, dist = _camera_matrix_and_dist(robot, (img.shape[1], img.shape[0]))
+            for d in dets:
+                tid = getattr(d, "tag_id", None)
+                if tid not in tags:
+                    continue
+                cam_T_tag = _calibration.apriltag_pose_from_corners(
+                    d.corners, tags[tid]["size_m"], K, dist_coeffs=dist)
+                if cam_T_tag is None:
+                    continue
+                p = (base_T_optical @ cam_T_tag)[:3, 3]
+                sightings.setdefault(tid, []).append(
+                    {"xyz": [float(p[0]), float(p[1]), float(p[2])],
+                     "base": ang, "R": R})
+        except Exception as e:                           # noqa: BLE001
+            print("raster: frame skipped (%s)" % e)
+
+    try:
+        for i, R in enumerate(radii):
+            # Per-radius angular step (bigger at the inner radius), swept in the
+            # opposite direction each radius step (serpentine) as it moves outward.
+            angles = grid(base_from, base_to, base_step_for(R))
+            if i % 2 == 1:
+                angles = list(reversed(angles))
+            for ang in angles:
+                q = list(robot.getj())
+                q[0] = math.radians(ang)
+                robot.movej(q, acc=0.3, vel=0.3, wait=True)   # set the base joint, keep the wrist
+                # Position the CAMERA at (Rxy, Z) along its current azimuth.
+                # scan_here resets to the gripper TCP, so re-assert camtcp here.
+                robot.set_tcp(robot.camtcp)
+                cur = robot.get_pos()
+                phi = math.atan2(cur[1], cur[0])
+                robot.moveto([R * math.cos(phi), R * math.sin(phi), z])
+                scan_here(ang, R)
+    finally:
+        robot.set_tcp(robot.tcp)                          # leave the gripper TCP active
+    result = {}
+    for tid, lst in sightings.items():
+        arr = _np.array([s["xyz"] for s in lst])
+        seen_at = sorted({(round(s["base"], 1), round(s["R"], 3)) for s in lst})
+        result[tid] = {"xyz": arr.mean(axis=0).tolist(), "n": len(lst),
+                       "seen_at": seen_at}
+    return result
+
+
+def _tag_role(tid):
+    """Human label for an AprilTag id from the apriltags config -- 'flowcell 1',
+    'Venton table b', 'mixer head', 'carousel', ... -- or '' if the id is not
+    configured. Lets a scan report say what each tag is, not just its number."""
+    nice = {'flowcell_1': 'flowcell 1', 'flowcell_2': 'flowcell 2',
+            'venton_table_a': 'Venton table a', 'venton_table_b': 'Venton table b',
+            'venton_table_c': 'Venton table c', 'mixer_head': 'mixer head',
+            'carousel': 'carousel'}
+    try:
+        at = _config.get_section('apriltags') or {}
+    except Exception:
+        return ''
+    for key, entry in at.items():
+        if not isinstance(entry, dict):
+            continue
+        ids = set()
+        if entry.get('id') is not None:
+            try:
+                ids.add(int(entry['id']))
+            except (TypeError, ValueError):
+                pass
+        for i in (entry.get('ids') or []):
+            try:
+                ids.add(int(i))
+            except (TypeError, ValueError):
+                pass
+        rng = entry.get('id_range')
+        if rng:
+            try:
+                ids.update(range(int(rng[0]), int(rng[1]) + 1))
+            except (TypeError, ValueError, IndexError):
+                pass
+        if tid in ids:
+            return nice.get(key, key)
+    return ''
+
+
+def _rotvec_from_R(R):
+    """Axis-angle rotation vector (rx, ry, rz) from a 3x3 rotation matrix --
+    the UR convention, matching get_pose's orientation part."""
+    ang = math.acos(max(-1.0, min(1.0, (float(_np.trace(R)) - 1.0) / 2.0)))
+    if ang < 1e-9:
+        return [0.0, 0.0, 0.0]
+    v = _np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]]) \
+        / (2.0 * math.sin(ang))
+    return [float(x) for x in (v * ang)]
+
+
+def read_tag_in_view(robot, tag_id, settle=5):
+    """Detect one AprilTag in the CURRENT camera view (no motion) and return its
+    base-frame pose [x, y, z, rx, ry, rz] (position + axis-angle rotation vector),
+    or None if it is not seen. Uses the tag's configured size
+    (DEFAULT_APRILTAG_SIZE if the id is not configured). The camera must already
+    be pointing at the tag -- this does not move the arm."""
+    size = (_all_configured_tags().get(tag_id) or {}).get('size_m',
+                                                          DEFAULT_APRILTAG_SIZE)
+    poses, _ = _read_tag_poses_in_view(robot, {tag_id: {'size_m': size}})
+    if tag_id not in poses:
+        return None
+    T = poses[tag_id]
+    p = T[:3, 3]
+    rv = _rotvec_from_R(T[:3, :3])
+    return [float(p[0]), float(p[1]), float(p[2]), rv[0], rv[1], rv[2]]
+
+
+def read_tags_in_view(robot):
+    """Read ALL configured AprilTags in the CURRENT camera view (no motion) and
+    return {id: [x, y, z]} in base coordinates. One frame, decode every tag at
+    once (fast -- no per-tag settle), each scaled by its configured size. The
+    camera must already be pointing where you want to read; this does not move
+    the arm."""
+    cfg = _all_configured_tags()
+    robot.set_tcp(robot.tcp)
+    base_T_optical = _flange_transform(robot) @ _flange_T_optical(robot)
+    camera_tools._flush_frames(robot, 2)                # drop stale frames first
+    robot.camera.capture()
+    robot.camera.decodeAT(tag_id=None)                  # every tag in the frame
+    dets = list(getattr(robot.camera, "AT_detections", []) or [])
+    img = robot.camera.image
+    out = {}
+    if img is None or not dets:
+        return out
+    K, dist = _camera_matrix_and_dist(robot, (img.shape[1], img.shape[0]))
+    for d in dets:
+        tid = getattr(d, "tag_id", None)
+        if tid not in cfg:
+            continue
+        cam_T_tag = _calibration.apriltag_pose_from_corners(
+            d.corners, cfg[tid]["size_m"], K, dist_coeffs=dist)
+        if cam_T_tag is None:
+            continue
+        p = (base_T_optical @ cam_T_tag)[:3, 3]
+        out[tid] = [float(p[0]), float(p[1]), float(p[2])]
+    return out
+
+
+def _venton_axes_from_scan(tags):
+    """Fit the LEVEL Venton table frame from raster-scan tag positions.
+
+    Needs >=2 Venton-table fiducials (apriltags.venton_table_* -- ids with a
+    table_xy_mm) present in `tags`. With the surface level the only free rotation
+    is a yaw about base Z, so two or more tag positions pin the frame: a 2D rigid
+    fit of the known table (x, y) onto the measured base (x, y). Returns
+    {origin_m, x_axis, y_axis, normal, yaw_deg, rmse_mm, ids} in base coordinates,
+    or None if fewer than two are present (or they are coincident)."""
+    vt = venton_table_tags()
+    seen = [t for t in sorted(tags) if t in vt]
+    if len(seen) < 2:
+        return None
+    tc = _np.array([[vt[t]['table_xy_mm'][0] / 1000.0,
+                     vt[t]['table_xy_mm'][1] / 1000.0] for t in seen])
+    bc = _np.array([[tags[t]['xyz'][0], tags[t]['xyz'][1]] for t in seen])
+    tcm, bcm = tc.mean(axis=0), bc.mean(axis=0)
+    tcc, bcc = tc - tcm, bc - bcm
+    if _np.linalg.norm(tcc) < 1e-9 or _np.linalg.norm(bcc) < 1e-9:
+        return None
+    num = float(_np.sum(tcc[:, 0] * bcc[:, 1] - tcc[:, 1] * bcc[:, 0]))
+    den = float(_np.sum(tcc[:, 0] * bcc[:, 0] + tcc[:, 1] * bcc[:, 1]))
+    yaw = math.atan2(num, den)
+    c, s = math.cos(yaw), math.sin(yaw)
+    x_axis = [c, s, 0.0]
+    y_axis = [-s, c, 0.0]
+    ox = float(bcm[0] - (c * tcm[0] - s * tcm[1]))
+    oy = float(bcm[1] - (s * tcm[0] + c * tcm[1]))
+    oz = float(_np.mean([tags[t]['xyz'][2] for t in seen]))
+    res = []
+    for i in range(len(seen)):
+        px = ox + c * tc[i, 0] - s * tc[i, 1]
+        py = oy + s * tc[i, 0] + c * tc[i, 1]
+        res.append(math.hypot(px - bc[i, 0], py - bc[i, 1]))
+    rmse_mm = (sum(r * r for r in res) / len(res)) ** 0.5 * 1000.0
+    return {'origin_m': [ox, oy, oz], 'x_axis': x_axis, 'y_axis': y_axis,
+            'normal': [0.0, 0.0, 1.0], 'yaw_deg': math.degrees(yaw),
+            'rmse_mm': rmse_mm, 'ids': seen}
+
+
+def _to_venton_frame(xyz, vframe):
+    """Base-frame xyz -> Venton-table-frame xyz: v = R^T (base - origin), with
+    R = [x_axis | y_axis | normal]."""
+    o, x, y, n = (vframe['origin_m'], vframe['x_axis'], vframe['y_axis'],
+                  vframe['normal'])
+    d = [xyz[i] - o[i] for i in range(3)]
+    return [sum(x[i] * d[i] for i in range(3)),
+            sum(y[i] * d[i] for i in range(3)),
+            sum(n[i] * d[i] for i in range(3))]
+
+
+def _venton_classify(tags, vframe, tol_m=0.015):
+    """Classify scanned tags by LOCATION using the Venton-frame references stored
+    in mixer_head_refs.json (venton_frame_refs). Transforms each carousel / mixer-
+    head tag into the current scan's Venton frame and compares to the recorded
+    locations, so a carousel is identified as 'on the mixing station' by where it
+    is -- bench-anchored, independent of which mixer-head tag (25/26) is present.
+
+    Returns (lines, mixer_carousel_id, carousel_xyz, sample_xyz). Empty/None when
+    there is no Venton frame (fewer than two Venton tags) or no recorded refs."""
+    import json
+    if not vframe:
+        return [], None, None, None
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        'json', 'mixer_head_refs.json')
+    if not os.path.exists(path):
+        return [], None, None, None
+    try:
+        refs = (json.load(open(path, encoding='utf-8')).get('venton_frame_refs') or {})
+    except Exception:
+        return [], None, None, None
+    car_ref = refs.get('carousel_on_mixer_venton_xyz')
+    ms_ref = refs.get('mixing_station_mixerhead_venton_xyz')
+    cl_ref = refs.get('mixer_on_cleaning_station_venton_xyz')
+
+    def d2(a, b):
+        return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+    car_ids = apriltag_ids('carousel_on_mixer') or set()
+    head_ids = apriltag_ids('mixer_station') or set()
+    lines = ["Venton-frame classification (bench-anchored, tol %d mm):" % (tol_m * 1000)]
+    cid = cxyz = sxyz = None
+    best = None
+    for t in sorted(tags):
+        if t in car_ids and car_ref:
+            v = _to_venton_frame(tags[t]['xyz'], vframe)
+            dd = d2(v, car_ref)
+            on = dd <= tol_m
+            lines.append("  carousel %d: venton (%.3f, %.3f) -> %s mixing station "
+                         "(%.1f mm from ref)" % (t, v[0], v[1],
+                         "ON the" if on else "not on the", dd * 1000))
+            if on and (best is None or dd < best[0]):
+                best = (dd, t)
+    if best is not None:
+        cid = best[1]
+        cxyz = list(tags[cid]['xyz'])
+        sxyz = [cxyz[0], cxyz[1] + SAMPLE_OFFSET_Y, cxyz[2]]
+    for t in sorted(tags):
+        if t in head_ids:
+            v = _to_venton_frame(tags[t]['xyz'], vframe)
+            where = "position not recognized"
+            if ms_ref and d2(v, ms_ref) <= tol_m:
+                where = "MIXING station"
+            elif cl_ref and d2(v, cl_ref) <= tol_m:
+                where = "CLEANING station"
+            lines.append("  mixer-head tag %d: venton (%.3f, %.3f) -> %s"
+                         % (t, v[0], v[1], where))
+    return lines, cid, cxyz, sxyz
+
+
+def _mixer_model_summary(tags):
+    """Using the stored mixer-area model (json/mixer_head_refs.json), fill in all
+    four reference points from whatever model tag the scan saw -- mixing station
+    (mixer-head tag), carousel on mixer, sample on mixer station, and mixer on
+    cleaning station -- labelling each measured or derived. Returns summary lines
+    ([] if there is no model file). All offsets are relative to the mixer-head tag
+    on the mixing station (the model anchor)."""
+    import json
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        'json', 'mixer_head_refs.json')
+    if not os.path.exists(path):
+        return []
+    try:
+        m = json.load(open(path, encoding='utf-8'))
+    except Exception:
+        return []
+    head_tag = int(m.get('mixer_head_tag', 26))
+    car_off = (m.get('carousel_on_mixer') or {}).get('pos_offset_from_mixing_tag26')
+    car_abs = (m.get('carousel_on_mixer') or {}).get('tag_pose')
+    samp_off = (m.get('sample_on_mixer_station') or {}).get('pos_offset_from_carousel_tag')
+    clean_off = (m.get('mixer_on_cleaning_station') or {}).get('pos_offset_from_mixing_tag26')
+
+    def dist(a, b):
+        return (sum((a[i] - b[i]) ** 2 for i in range(3))) ** 0.5
+
+    # Anchor = the mixing-station mixer-head tag position. Measured directly if the
+    # head tag is in view; otherwise derived from a carousel seen at the model's
+    # carousel-on-mixer location (so any single visible model tag anchors it).
+    anchor, anchor_measured = None, False
+    if head_tag in tags:
+        anchor, anchor_measured = list(tags[head_tag]['xyz']), True
+    elif car_off and car_abs:
+        for t in sorted(tags):
+            if 31 <= t <= 40 and dist(tags[t]['xyz'], car_abs[:3]) < 0.025:
+                anchor = [tags[t]['xyz'][i] - car_off[i] for i in range(3)]
+                break
+
+    lines = ["mixer-area model (from mixer_head_refs.json) -- all four points:"]
+    if anchor is None:
+        lines.append("  no model anchor in view (need mixer-head tag %d or the "
+                     "carousel on the mixer)." % head_tag)
+        return lines
+    lines.append("  mixing station (tag %d): (%.4f, %.4f, %.4f) m  [%s]" % (
+        head_tag, anchor[0], anchor[1], anchor[2],
+        "measured" if anchor_measured else "derived"))
+    car = None
+    if car_off:
+        car = [anchor[i] + car_off[i] for i in range(3)]
+        meas = any(31 <= t <= 40 and dist(tags[t]['xyz'], car) < 0.025 for t in tags)
+        lines.append("  carousel on mixer: (%.4f, %.4f, %.4f) m  [%s]" % (
+            car[0], car[1], car[2], "measured" if meas else "derived"))
+    if car and samp_off:
+        s = [car[i] + samp_off[i] for i in range(3)]
+        lines.append("  sample on mixer station: (%.4f, %.4f, %.4f) m  [derived]"
+                     % (s[0], s[1], s[2]))
+    if clean_off:
+        cl = [anchor[i] + clean_off[i] for i in range(3)]
+        lines.append("  mixer on cleaning station: (%.4f, %.4f, %.4f) m  [derived]"
+                     % (cl[0], cl[1], cl[2]))
+    else:
+        lines.append("  mixer on cleaning station: not recorded yet (put the head "
+                     "there and read tag %d)." % head_tag)
+    return lines
+
+
+def locate_mixer_carousel(robot, base_from=-100.0, base_to=20.0):
+    """Raster-scan for tags, identify the carousel on the mixer, store its tag
+    centre, and compute the sample position.
+
+    The carousel on the mixer sits at MIXER_CAROUSEL_DX / _DY from the mixer-head
+    tag; a carousel tag (31-40) within MIXER_CAROUSEL_MATCH_TOL of (mixer head +
+    that offset) is taken as the one on the mixer. Its tag centre is stored
+    (state.set_carousel_mixer_seat) so sample calcs reuse it, and the sample is
+    SAMPLE_OFFSET_Y along base +Y from the centre. No robot move beyond the scan.
+
+    Returns {'tags', 'mixer_carousel_id', 'carousel_xyz', 'sample_xyz',
+    'summary'}. mixer_carousel_id is None (and nothing is stored) when no carousel
+    tag is within tolerance.
+    """
+    tags = raster_tag_scan(robot, base_from, base_to)
+    head_ids = apriltag_ids('mixer_station') or set()
+    car_ids = apriltag_ids('carousel_on_mixer') or set()
+    heads = {t: tags[t]['xyz'] for t in tags if t in head_ids}
+    cars = {t: tags[t]['xyz'] for t in tags if t in car_ids}
+
+    lines = ["locate_mixer_carousel: found %d tag(s):" % len(tags)]
+    for t in sorted(tags):
+        x, y, z = tags[t]['xyz']
+        role = _tag_role(t)
+        tag_label = "%2d%s" % (t, (" (%s)" % role) if role else "")
+        lines.append("  tag %s at (%.4f, %.4f, %.4f) m" % (tag_label, x, y, z))
+
+    result = {'tags': tags, 'mixer_carousel_id': None,
+              'carousel_xyz': None, 'sample_xyz': None, 'venton_frame': None}
+
+    # Venton table axes, when its fiducials are in the scan (level fit).
+    vframe = _venton_axes_from_scan(tags)
+    if vframe:
+        result['venton_frame'] = vframe
+        lines.append("Venton table axes (level fit, tags %s): origin "
+                     "(%.4f, %.4f, %.4f) m, yaw %.3f deg, x_axis [%.5f, %.5f, "
+                     "%.5f], y_axis [%.5f, %.5f, %.5f] (rmse %.1f mm)" % (
+                         vframe['ids'], vframe['origin_m'][0],
+                         vframe['origin_m'][1], vframe['origin_m'][2],
+                         vframe['yaw_deg'],
+                         vframe['x_axis'][0], vframe['x_axis'][1], vframe['x_axis'][2],
+                         vframe['y_axis'][0], vframe['y_axis'][1], vframe['y_axis'][2],
+                         vframe['rmse_mm']))
+
+    # Fill in all four mixer-area points from whatever model tag was seen.
+    lines += _mixer_model_summary(tags)
+
+    # Primary identification: Venton-frame classification (bench-anchored) -- it
+    # places the carousel on the mixing station by LOCATION in the fixed Venton
+    # frame, so it works regardless of which mixer-head tag (25/26) is present and
+    # does not rely on the -65/-65 estimate. The -65/-65 block below is the
+    # fallback when no Venton frame / refs are available.
+    vclass_lines, vcid, vcxyz, vsxyz = _venton_classify(tags, vframe)
+    if vclass_lines:
+        lines += vclass_lines
+    if vcid is not None:
+        state.set_carousel_mixer_seat(vcxyz)
+        result.update(mixer_carousel_id=vcid, carousel_xyz=vcxyz, sample_xyz=vsxyz)
+        lines.append("carousel %d is ON THE MIXING STATION (Venton-frame match) -- "
+                     "stored as the carousel seat; sample at (%.4f, %.4f, %.4f) m."
+                     % (vcid, vsxyz[0], vsxyz[1], vsxyz[2]))
+        result['summary'] = "\n".join(lines)
+        return result
+
+    if not heads:
+        lines.append("no mixer-head tag (%s) in view -- cannot locate the mixer "
+                     "carousel." % sorted(head_ids))
+        result['summary'] = "\n".join(lines)
+        return result
+    if not cars:
+        lines.append("no carousel tag (%s) in view." % sorted(car_ids))
+        result['summary'] = "\n".join(lines)
+        return result
+
+    # Nearest carousel to any mixer-head expected point (head + offset). Checking
+    # both 25 and 26 is robust to which mixer-head tag the raster happened to see.
+    best = None   # (dist, car_id, head_id)
+    for ht, (hx, hy, _hz) in heads.items():
+        ex, ey = hx + MIXER_CAROUSEL_DX, hy + MIXER_CAROUSEL_DY
+        for ct, (cx, cy, _cz) in cars.items():
+            d = math.hypot(cx - ex, cy - ey)
+            if best is None or d < best[0]:
+                best = (d, ct, ht)
+    dist, cid, hid = best
+    if dist <= MIXER_CAROUSEL_MATCH_TOL:
+        cx, cy, cz = tags[cid]['xyz']
+        state.set_carousel_mixer_seat([cx, cy, cz])
+        sx, sy, sz = cx, cy + SAMPLE_OFFSET_Y, cz
+        result.update(mixer_carousel_id=cid, carousel_xyz=[cx, cy, cz],
+                      sample_xyz=[sx, sy, sz])
+        lines.append("carousel ON THE MIXER: tag %d at (%.4f, %.4f, %.4f) m "
+                     "(%.1f mm from mixer-head %d + offset) -- stored as the "
+                     "carousel seat." % (cid, cx, cy, cz, dist * 1000, hid))
+        lines.append("sample position (tag + %.0f mm +Y): (%.4f, %.4f, %.4f) m"
+                     % (SAMPLE_OFFSET_Y * 1000, sx, sy, sz))
+    else:
+        lines.append("no carousel within %.0f mm of the expected mixer offset "
+                     "(nearest: tag %d, %.1f mm off vs mixer-head %d). Nothing "
+                     "stored." % (MIXER_CAROUSEL_MATCH_TOL * 1000, cid,
+                                  dist * 1000, hid))
+    result['summary'] = "\n".join(lines)
+    return result
+
+
+def measure_tag_heights(robot, tags_xyz, z=None, only_ids=None, put_tcp2cam=True):
+    """Bump the gripper straight down at each tag's X,Y to measure the actual
+    surface Z, and return {id: measured_surface_z} (base frame).
+
+    `tags_xyz` is {id: [x, y, z]} (e.g. from raster_tag_scan). `only_ids` limits it
+    to those ids (e.g. to finish a subset after a stop). Operator recipe: with
+    put_tcp2cam, put the TCP to the camera first; then ALWAYS rise to the safe
+    swing Z before any lateral move, go over each tag at that Z, and bump down
+    (gripper fully shut) to feel the real surface. Pass put_tcp2cam=False when
+    continuing after a protective stop so it does not re-descend onto a fixture.
+    """
+    if z is None:
+        z = safe_swing_z()
+    # Tap with the GRIPPER tip pointing straight down: make the gripper TCP active,
+    # rise to the safe swing Z, then Zalign so the tool Z axis is level-down. Only
+    # then is a straight-down bump safe -- a tilted tip catches fixture edges and
+    # trips a protective stop (put_tcp2cam is accepted for back-compat but unused;
+    # the camera TCP is wrong for a bump).
+    robot.set_tcp(robot.tcp)                      # gripper frame for the bump/height
+    cur = robot.get_pos()
+    robot.moveto([cur[0], cur[1], z])             # lift straight up before any lateral move
+    robot.Zalign()                                # gripper tip straight down (keeps xy, yaw)
+    measured = {}
+    ids = [t for t in sorted(tags_xyz) if (only_ids is None or t in only_ids)]
+    for tid in ids:
+        x, y = float(tags_xyz[tid][0]), float(tags_xyz[tid][1])
+        robot.moveto([x, y, z])                   # over the tag at the safe swing Z (stays down)
+        close_gripper_fully(robot)                # clean fingertip contact
+        robot.bump(z=-1, backoff=0.0)             # feel the real surface, straight down
+        measured[tid] = float(robot.get_pos()[2])
+        print("measure_tag_heights: tag %d surface z = %.4f m" % (tid, measured[tid]))
+        robot.moveto([x, y, z])                   # back up to the safe swing Z
+    return measured
+
+
+def _survey_targets(scan_tags):
+    """Pick the survey targets from a raster scan, each as (id, role): the mixer
+    head (whichever of 25/26 is present), the carousel on the mixing station
+    (Venton-classified, else the carousel nearest the mixer head), and flowcells
+    1 and 2. Only ids actually in the scan are returned."""
+    targets = []
+    head_ids = apriltag_ids('mixer_station') or set()
+    head = None
+    for t in sorted(scan_tags):
+        if t in head_ids:
+            targets.append((t, 'mixer head'))
+            head = scan_tags[t]['xyz']
+            break
+    # carousel on the mixer: Venton classification first, else nearest to the head
+    _, cid, _, _ = _venton_classify(scan_tags, _venton_axes_from_scan(scan_tags))
+    if cid is None and head is not None:
+        car_ids = apriltag_ids('carousel_on_mixer') or set()
+        cars = [t for t in scan_tags if t in car_ids]
+        if cars:
+            cid = min(cars, key=lambda t: (scan_tags[t]['xyz'][0] - head[0]) ** 2
+                      + (scan_tags[t]['xyz'][1] - head[1]) ** 2)
+    if cid is not None:
+        targets.append((cid, 'carousel on mixer'))
+    for fid, role in ((1, 'flowcell 1'), (2, 'flowcell 2')):
+        if fid in scan_tags:
+            targets.append((fid, role))
+    return targets
+
+
+def survey_key_tags(robot, scan_tags, z=None):
+    """After a raster scan, visit the mixer head, the carousel on the mixing
+    station, and flowcells 1 & 2; for each, center the camera on the tag (the
+    search/centre procedure) and bump the gripper straight down to measure the
+    true surface Z. Returns {id: {'role', 'centered_xyz', 'bumped_z'}}. Rises to
+    the safe swing Z before every lateral move; reports, stores nothing.
+
+    `scan_tags` is {id: {'xyz': [...]}} from raster_tag_scan -- the coarse
+    positions used as the go-to hint for each tag."""
+    if z is None:
+        z = safe_swing_z()
+    sizes = _all_configured_tags()
+    results = {}
+    for tid, role in _survey_targets(scan_tags):
+        hint = scan_tags[tid]['xyz']
+        # 1. Safe: rise straight up, bring the camera face-down, go over the hint.
+        robot.set_tcp(robot.tcp)
+        cur = robot.get_pos()
+        robot.moveto([cur[0], cur[1], z])
+        if not camera_tools.camera_faces_down(robot):
+            robot.put_camera2tcp()
+        robot.set_tcp(robot.camtcp)
+        robot.moveto([hint[0], hint[1], z])          # camera over the tag at safe Z
+        # 2. Search/centre on this tag.
+        robot.camera.AT_physical_size = (sizes.get(tid) or {}).get('size_m',
+                                                                   DEFAULT_APRILTAG_SIZE)
+        robot.camera.AT_preferred_id = tid
+        robot.center_camera2apriltag(tag_id=tid, tol_m=CAROUSEL_CENTER_TOL_M,
+                                     settle=CAROUSEL_CENTER_SETTLE,
+                                     max_iter=CAROUSEL_CENTER_ITERS)
+        # 3. Accurate centred position (base frame) from the current view.
+        pose = read_tag_in_view(robot, tid)
+        centered = pose[:3] if pose else list(hint[:3])
+        # 4. Gripper straight down at the centred X,Y, bump to feel the surface.
+        robot.set_tcp(robot.tcp)
+        cur = robot.get_pos()
+        robot.moveto([cur[0], cur[1], z])            # rise before the frame-shift lateral move
+        robot.moveto([centered[0], centered[1], z])  # gripper over the tag at safe Z
+        robot.Zalign()                               # tip straight down
+        close_gripper_fully(robot)
+        robot.bump(z=-1, backoff=0.0)
+        bz = float(robot.get_pos()[2])
+        robot.moveto([centered[0], centered[1], z])  # rise clear
+        results[tid] = {'role': role,
+                        'centered_xyz': [round(centered[0], 5), round(centered[1], 5),
+                                         round(centered[2], 5)],
+                        'bumped_z': round(bz, 5)}
+        print("survey: %s (tag %d) centred (%.4f, %.4f), bump Z %.4f m"
+              % (role, tid, centered[0], centered[1], bz))
+    return results
 
 
 def _read_tag_poses_in_view(robot, tags):
@@ -2717,8 +3491,10 @@ def mixer2cleaningstation(robot):
 # mixer head to the mixer station. The robot is assumed to be empty.
 @_tracks(lambda: state.set_mixer_head, state.MIXER_AT_MIXER)
 def mixer2mixingstation(robot):
+    # Set down by feel here too: the mixer station is a deep socket like the
+    # cleaning station, so bump for the seat rather than a computed release Z.
     transport(robot, get_mixer_cleaningstation_position(), get_mixerstation_position(),
-              height=mixer_height,
+              height=mixer_height, drop_by_bump=True,
               p1_station='mixer_cleaning_station', p2_station='mixer_station',
               open_extra_m=mixer_head_open_extra())
 
@@ -2922,12 +3698,36 @@ def raise_to_sampletable_height(robot):
 # Camera-guided pick-and-place of a whole carousel between the mixer, the stock
 # position, and the used-carousel stack. All relative moves are BASE frame.
 CAROUSEL_CLEAR_LIFT = 0.120          # straight-up clearance for carrying (m)
-CAROUSEL_SNAP_LIFT = 0.005           # straight up right after grabbing, before the diagonal (m)
+CAROUSEL_SNAP_LIFT = 0.003           # straight up right after grabbing, before the diagonal (m)
 CAROUSEL_LOOK_LIFT = 0.100           # lift above the mixer seat to look (m)
 CAROUSEL_STACK_ABOVE = 0.100         # unload: stand this far above a found used-stack tag before bumping (m)
+# Identify which carousel is on the mixer from a raster scan: the carousel-on-
+# mixer tag sits this far from the mixer-head tag, and a carousel tag must land
+# within MIXER_CAROUSEL_MATCH_TOL of that expected point to count. The sample on
+# that carousel is SAMPLE_OFFSET_Y along base +Y from the carousel tag centre.
+MIXER_CAROUSEL_DX = -0.065           # carousel-on-mixer tag X offset from the mixer head (m)
+MIXER_CAROUSEL_DY = -0.065           # carousel-on-mixer tag Y offset from the mixer head (m)
+MIXER_CAROUSEL_MATCH_TOL = 0.010     # max distance from (mixer head + offset) to count (m)
+SAMPLE_OFFSET_Y = 0.062              # sample is this far along base +Y from the carousel tag centre (m)
 # The 45 deg seat-clearance move after grab: 10 mm total, so cos45 along each of
 # -X and +Z. Sliding the carousel out from under its retainer while lifting.
-CAROUSEL_DIAG = 0.020 * math.cos(math.radians(45))   # ~0.014142 m per axis (20 mm total)
+# Two-segment slide that clears the carousel retainer after the snap-lift: a
+# short STEEP segment to lift the carousel clear of the surface first (a single
+# shallow slide was glancing the surface), then a long SHALLOW segment to travel
+# out from under the retainer. Each is (travel_m, angle_deg_above_horizontal) and
+# runs out-and-up (-X / +Z). Place retraces the SAME segments in reverse
+# (reversed order, each +X / -Z) so a new carousel seats along the same path.
+CAROUSEL_SLIDE_SEGMENTS = (
+    (0.002, 60.0),   # steep: 2 mm at 60 deg -- lift clear of the surface first
+    (0.020, 30.0),   # shallow: 20 mm at 30 deg -- travel out from under the retainer
+)
+# Per-segment (dx, dz) components, and the totals used to offset the place start.
+CAROUSEL_SLIDE_STEPS = [
+    (t * math.cos(math.radians(a)), t * math.sin(math.radians(a)))
+    for (t, a) in CAROUSEL_SLIDE_SEGMENTS
+]
+CAROUSEL_SLIDE_TOTAL_DX = sum(dx for dx, _dz in CAROUSEL_SLIDE_STEPS)   # total horizontal (m)
+CAROUSEL_SLIDE_TOTAL_DZ = sum(dz for _dx, dz in CAROUSEL_SLIDE_STEPS)   # total vertical (m)
 # A carousel position is taught bump-to-surface then backed off by this, so the
 # taught Z sits this far ABOVE the grab surface -- a safe height to move to before
 # the grab bumps down to find the real surface.
@@ -3032,14 +3832,13 @@ def _acquire_carousel(robot, station, approach_distance_m=None):
     return robot.camera.AT_id, robot.camera.QRdistance
 
 
-def _grab_carousel(robot, station):
+def _grab_carousel(robot, station, tag_distance):
     """Grab the carousel the camera is centred on, at `station`.
 
-    Move down to the taught carousel height (Z_carousel, a safe height above the
-    surface), then close the gripper and bump to feel the actual surface -- the
-    bump stops on contact, so it is robust to the taught height being off. Then
-    back up 1 mm, open wide, descend 8 mm to reach under the rim, and close to
-    grip.
+    Using the measured (calibrated) `tag_distance`, come straight down to
+    APRILTAG_BUMP_STANDOFF (30 mm) above the tag surface, then close the gripper
+    and bump to feel the actual surface -- same approach as every AprilTag search
+    now. Then back up 1 mm, open wide, descend under the rim, and close to grip.
 
     Switches to the gripper TCP first and stays there: put_tcp2camera leaves the
     CAMERA TCP active, so every height read / move after this must be in the
@@ -3048,14 +3847,10 @@ def _grab_carousel(robot, station):
     """
     robot.put_tcp2camera()                              # gripper over the tag centre
     robot.set_tcp(robot.tcp)                            # gripper frame for all height work
-    cur = robot.get_pos()
-    try:
-        z_carousel = get_station_position(station)[2]   # the taught carousel height
-    except (RuntimeError, ValueError):
-        z_carousel = None
-    if z_carousel is not None:
-        robot.moveto([cur[0], cur[1], z_carousel])      # down to the taught height
-    # else: stay at the camera standoff and let the bump below find the surface.
+    if tag_distance is not None:
+        # Down to 30 mm above the tag surface using the measured distance, then the
+        # bump below feels the real surface for the last 30 mm.
+        robot.mvr2z(-max(0.0, tag_distance - APRILTAG_BUMP_STANDOFF))
     close_gripper_fully(robot)                          # fully shut for a clean bump contact
     robot.bump(z=-1, backoff=0.0)                       # feel the real surface
     if station == 'carousel_on_mixer':
@@ -3067,18 +3862,20 @@ def _grab_carousel(robot, station):
         state.set_carousel_mixer_seat(robot.get_pos()[:3])
     robot.mvr2z(CAROUSEL_BUMP_LIFT)                     # up 1 mm
     open_gripper(robot, carousel_open_extra())          # open wide
-    robot.mvr2z(-CAROUSEL_GRAB_UNDER)                   # down 8 mm, under the rim
+    robot.mvr2z(-CAROUSEL_GRAB_UNDER)                   # down under the rim
     robot.grab()                                        # close to grip
 
 
 def _carousel_lift(robot):
-    """The seat-clearance lift after grabbing on the mixer: up SNAP_LIFT, a 45 deg
-    move (-X / +Z) to slide out from under the retainer, then up CLEAR_LIFT. Prints
-    the pose after each step for debugging."""
+    """The seat-clearance lift after grabbing on the mixer: up SNAP_LIFT, then a
+    two-segment slide (steep to lift clear of the surface, then shallow to travel
+    out from under the retainer -- CAROUSEL_SLIDE_STEPS, each -X / +Z), then up
+    CLEAR_LIFT. Prints the pose after each step for debugging."""
     robot.mvr2z(CAROUSEL_SNAP_LIFT)
     print("unload lift: after snap-lift   %s" % _pose_str(robot))
-    robot.translate([-CAROUSEL_DIAG, 0.0, CAROUSEL_DIAG])
-    print("unload lift: after 45 deg      %s" % _pose_str(robot))
+    for dx, dz in CAROUSEL_SLIDE_STEPS:          # steep clear-off, then shallow travel-out
+        robot.translate([-dx, 0.0, dz])
+    print("unload lift: after slide-out   %s" % _pose_str(robot))
     robot.mvr2z(CAROUSEL_CLEAR_LIFT)
     print("unload lift: after clear-lift  %s" % _pose_str(robot))
 
@@ -3151,8 +3948,8 @@ def unload_current_carousel(robot):
     # that pose. Levelling the camera where it stands would leave it the camtcp
     # offset away from the centre, and the tag would fall outside the view.
     robot.put_camera2tcp()
-    _tag, _dist = _acquire_carousel(robot, 'carousel_on_mixer')
-    _grab_carousel(robot, 'carousel_on_mixer')
+    _tag, dist = _acquire_carousel(robot, 'carousel_on_mixer')
+    _grab_carousel(robot, 'carousel_on_mixer', dist)
     _carousel_lift(robot)
     robot.set_tcp(robot.tcp)                 # gripper frame: the carousel is carried, not the camera
     clear_z = robot.get_pos()[2]
@@ -3215,43 +4012,45 @@ def place_new_carousel(robot):
     stock_over[2] = clear_z
     robot.moveto(stock_over)                            # gripper over stock centre, facing down
     robot.put_camera2tcp()                              # camera onto that pose
-    tag, _dist = _acquire_carousel(robot, 'carousel_in_stock',
-                                   approach_distance_m=CAROUSEL_LOAD_APPROACH_M)
-    _grab_carousel(robot, 'carousel_in_stock')
+    tag, dist = _acquire_carousel(robot, 'carousel_in_stock',
+                                  approach_distance_m=CAROUSEL_LOAD_APPROACH_M)
+    _grab_carousel(robot, 'carousel_in_stock', dist)
     robot.set_tcp(robot.tcp)                 # gripper frame: the carousel is carried, not the camera
     robot.mvr2z(CAROUSEL_CLEAR_LIFT)                     # lift clear of the stock seat
     # Reuse the REAL mixer seat measured by unload's grab (gripper frame): the
     # camera-centred X,Y and the bumped surface Z. Fall back to the taught pose
     # only if no unload has measured it. Using the measured X,Y (not the taught
     # X,Y, which is a mm or two off) lets the landing be the exact reverse of the
-    # lift -- same 45 deg travel (CAROUSEL_DIAG), landing right on the seat.
+    # lift -- same two-segment slide travel (SLIDE_STEPS), landing right on the seat.
     seat = state.get_carousel_mixer_seat()
     if seat is not None:
         seat_x, seat_y, surface_z = seat
     else:
         seat_x, seat_y = mixer[0], mixer[1]
         surface_z = mixer[2] - CAROUSEL_TEACH_BACKOFF
-    # Work back from where the carousel should end after the reverse 45 deg
-    # landing: CAROUSEL_PLACE_STANDOFF above the surface (the bump seats the rest).
-    # The carousel hangs net_under below the gripper, so the gripper there sits at
-    # (surface + STANDOFF - net_under); the 45 deg landing (+X / -Z by CAROUSEL_DIAG,
-    # the lift reversed) drops Z by CAROUSEL_DIAG and raises X by it, so the start
-    # before it is offset back along -X by CAROUSEL_DIAG and up by it.
+    # Make the place start coincide EXACTLY with the unload lift's "after slide-out"
+    # point, so place reverses the lift step for step: straight down to this start,
+    # slide in 30 deg then 60 deg (the lift's segments reversed), then straight down
+    # (the bump) through the snap-lift to seat. The lift ends CAROUSEL_SNAP_LIFT +
+    # TOTAL_DZ above the grab point (net_under below the measured surface), offset
+    # back by TOTAL_DX in X -- so the start is that same point.
     net_under = CAROUSEL_GRAB_UNDER - CAROUSEL_BUMP_LIFT   # carousel hangs this far below the gripper
     start = list(mixer)                                   # taught orientation (3:6)
-    start[0] = seat_x - CAROUSEL_DIAG                    # back along -X so the reverse diagonal reaches the seat X
+    start[0] = seat_x - CAROUSEL_SLIDE_TOTAL_DX          # back along -X so the reverse slide reaches the seat X
     start[1] = seat_y
-    start[2] = surface_z + CAROUSEL_DIAG + CAROUSEL_PLACE_STANDOFF - net_under
+    start[2] = surface_z + CAROUSEL_SLIDE_TOTAL_DZ + CAROUSEL_SNAP_LIFT - net_under
     carry = list(start)
     carry[2] = clear_z
     robot.moveto(carry)                                  # carry above the landing start, seat heading
     print("place seating: after carry-above %s" % _pose_str(robot))
     robot.moveto(start)                                  # down to the stand-off, offset back along -X
     print("place seating: after down-to-start %s" % _pose_str(robot))
-    # Reverse 45 deg landing: the exact reverse of the unload lift's diagonal
-    # (+X / -Z by CAROUSEL_DIAG), landing on the measured seat X,Y.
-    robot.translate([CAROUSEL_DIAG, 0.0, -CAROUSEL_DIAG])
-    print("place seating: after 45 deg landing %s" % _pose_str(robot))
+    # Reverse slide-in landing: retrace the unload lift's two-segment slide in
+    # reverse (segments reversed, each +X / -Z), landing on the measured seat X,Y
+    # along the same trajectory.
+    for dx, dz in reversed(CAROUSEL_SLIDE_STEPS):
+        robot.translate([dx, 0.0, -dz])
+    print("place seating: after slide-in landing %s" % _pose_str(robot))
     robot.bump(z=-1, backoff=0.0)                        # bump down to seat at the real surface
     print("place seating: after bump %s" % _pose_str(robot))
     robot.release()
@@ -3730,6 +4529,11 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
     # reach a pose the arm is already on would be the whole point of the mode
     # thrown away, and already_at() cannot be relied on to notice: the operator
     # may well have jogged to within its radius of some *other* station.
+    #
+    # Fully shut the gripper before the search: open fingers can clip the
+    # camera's view of the tag and are more likely to catch on the bench or a
+    # fixture as the arm tilts and descends over the station.
+    close_gripper_fully(robot)
     if from_current:
         pass
     elif via_transferpoint:
@@ -3795,7 +4599,15 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
     # The search already squared the camera to the seat frame, applying the
     # tag's mounting offset (apriltag_rz_offset) itself -- see
     # camera_tools.search_apriltag_by_tilt -- so nothing to undo here.
+    #
+    # Remember the (calibrated) camera-to-tag distance now, while it is fresh from
+    # centring; then put the gripper over the tag and come straight down to
+    # APRILTAG_BUMP_STANDOFF (30 mm) above the tag surface before bumping, so the
+    # bump travels a short, consistent distance instead of the whole standoff.
+    tag_distance = robot.camera.QRdistance
     robot.put_tcp2camera()
+    if tag_distance is not None:
+        robot.mvr2z(-max(0.0, tag_distance - APRILTAG_BUMP_STANDOFF))
 
     # Bump to measure the distance down to the surface, then back off -- so the
     # recorded Z is anchored to the real surface, not the camera standoff. A

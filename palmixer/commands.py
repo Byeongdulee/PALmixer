@@ -152,6 +152,10 @@ PUT_TCP_TO_CAMERA = "put_tcp_to_camera"
 # Report the current TCP pose (gripper frame): x y z rx ry rz, metres and
 # radians. A read -- no motion -- but refused while the arm is moving.
 GET_POSE = "get_pose"
+# Report the active tool TCP vector and whether it is the gripper or camera frame.
+GET_TCP = "get_tcp"
+# Report the six joint angles in degrees (base joint first).
+GET_JOINTS = "get_joints"
 
 # Report the camera-to-tag distance for the AprilTag currently in view. An
 # optional station scales the measurement for that station's tag size (the
@@ -187,6 +191,51 @@ ORIENTATION_AXES = ("x", "y", "z")
 # "set_position_here for one axis": position is taught whole.
 TWEAK_POSITION = "tweak_position"
 POSITION_AXES = ("x", "y", "z")
+
+# Swing the base joint (joint 0) from current+start_deg to current+end_deg, the
+# swing itself at speed_deg_s deg/s. A worker motion (a real, large move).
+SWING_BASE = "swing_base"
+# Swing the base joint and, while it moves, find every configured AprilTag and
+# record its base-frame position. Args (all optional): start_deg end_deg speed_deg_s.
+SCAN_TAGS = "scan_tags"
+# Move the base joint (joint 0) to an ABSOLUTE angle (deg). Optional speed_deg_s.
+SET_BASE_JOINT = "set_base_joint"
+# Move one joint (index 0-5) to an ABSOLUTE angle (deg), holding the others.
+# Optional speed_deg_s.
+SET_JOINT = "set_joint"
+# Reconfigure to an alternate IK branch: movej to the 6 given joint angles
+# (deg), then movel back to the pre-move TCP so the tool pose is preserved.
+RECONFIGURE = "reconfigure"
+# Move a tool (gripper|camera) to an absolute base-frame X Y Z, keeping the current
+# orientation. Goes over the X,Y at the current height first, then to Z.
+MOVE_TO_XYZ = "move_to_xyz"
+# Approach a tag: face the camera down and put it `standoff` m above a tag at base
+# X Y Z (camera-to-tag distance, since the camera is down). Refuses if the gripper
+# -- which hangs below the camera -- would reach the tag surface.
+APPROACH_TAG = "approach_tag"
+# Cylindrical-coordinate raster tag scan (camera must face straight down): raster
+# the camera over a (base-joint angle x radial Rxy) grid at the safe swing Z and
+# record every AprilTag found in BASE coordinates. The angular/radial steps come
+# from the camera FOV. Args (optional): base_from base_to.
+RASTER_TAG_SCAN = "raster_tag_scan"
+# After a raster_tag_scan, bump the gripper down at each found tag to measure its
+# actual surface Z (always rising to the safe swing Z between tags) and merge the
+# measured Z into the scan table.
+MEASURE_TAG_HEIGHTS = "measure_tag_heights"
+# Raster-scan, then identify the carousel on the mixer (the carousel tag ~65 mm
+# -X / -Y from the mixer-head tag), store its tag centre, and report the sample
+# position (+62 mm +Y). Args (optional): base_from base_to.
+LOCATE_MIXER_CAROUSEL = "locate_mixer_carousel"
+# Read one AprilTag's base-frame (x, y, z) from the CURRENT camera view (no
+# motion). Arg: tag id. Reports "not in view" if the camera does not see it.
+READ_TAG = "read_tag"
+# Read ALL AprilTags in the CURRENT camera view (no motion); report each id's
+# base-frame (x, y, z) and role. No args.
+READ_TAGS = "read_tags"
+# After a raster scan, visit the mixer head, the carousel on the mixing station,
+# and flowcells 1 & 2; center the camera on each and bump the gripper down to
+# measure the true surface Z. Reports centered X,Y + bumped Z. No args.
+SURVEY_TAGS = "survey_tags"
 
 # Drive to a station's taught position and stop there, without picking
 # anything up -- the way to check by eye what a search or a manual teach
@@ -307,6 +356,10 @@ TRANSPORT_LABELS = {
 # tilt search, a manual jog on the pendant -- makes the next transport's
 # vertical moves go off at an angle, and this puts it back.
 ZALIGN = "zalign"
+# Level the CAMERA to point straight down (Zalign on the camera TCP), keeping its
+# position and heading -- the gripper swings, the camera does not. For looking
+# with the camera level before a search / by-eye inspection.
+FACE_CAMERA_DOWN = "face_camera_down"
 
 # Manual robot recovery, both on the Experiment tab's Robot panel.
 #
@@ -546,6 +599,16 @@ def get_pose_command():
     return GET_POSE
 
 
+def get_tcp_command():
+    """Build the wire command to read the active tool TCP."""
+    return GET_TCP
+
+
+def get_joints_command():
+    """Build the wire command to read the joint angles (degrees)."""
+    return GET_JOINTS
+
+
 def tag_distance_command(station=None):
     """Build the wire command to read the camera-to-tag distance.
 
@@ -578,6 +641,88 @@ def set_orientation_here_command(station):
 def tweak_orientation_command(axis, degrees):
     """Build the wire command to rotate the tool about its own ``axis``."""
     return "%s %s %s" % (TWEAK_ORIENTATION, axis, degrees)
+
+
+def measure_tag_heights_command():
+    """Build the wire command to bump-measure each tag's surface Z after a raster
+    scan and merge it into the table."""
+    return MEASURE_TAG_HEIGHTS
+
+
+def raster_tag_scan_command(base_from=-80, base_to=0):
+    """Build the wire command for a cylindrical raster AprilTag scan.
+
+    The angular and radial steps are chosen from the camera FOV; radius spans
+    0.3 m to (reachable max at Z - margin). Camera must face straight down (see
+    PAL12idb.raster_tag_scan)."""
+    return "%s %s %s" % (RASTER_TAG_SCAN, base_from, base_to)
+
+
+def locate_mixer_carousel_command(base_from=-100, base_to=20):
+    """Build the wire command to raster-scan and locate the carousel on the mixer.
+
+    Runs a raster scan, finds the carousel tag ~65 mm -X/-Y from the mixer-head
+    tag, stores its tag centre, and reports the sample position (see
+    PAL12idb.locate_mixer_carousel). Camera must face straight down."""
+    return "%s %s %s" % (LOCATE_MIXER_CAROUSEL, base_from, base_to)
+
+
+def read_tag_command(tag_id):
+    """Build the wire command to read one AprilTag's base (x, y, z) from the
+    current camera view (no motion)."""
+    return "%s %s" % (READ_TAG, tag_id)
+
+
+def read_tags_command():
+    """Build the wire command to read ALL AprilTags in the current camera view
+    (no motion)."""
+    return READ_TAGS
+
+
+def survey_tags_command():
+    """Build the wire command to survey the key tags (mixer head, carousel on the
+    mixing station, flowcells 1 & 2) after a raster scan: center the camera on
+    each and bump Z. Uses the most recent raster scan's positions."""
+    return SURVEY_TAGS
+
+
+def move_to_xyz_command(x, y, z, frame="gripper"):
+    """Build the wire command to move `frame` (gripper|camera) to base X Y Z."""
+    return "%s %s %s %s %s" % (MOVE_TO_XYZ, x, y, z, frame)
+
+
+def set_base_joint_command(deg, speed_deg_s=None):
+    """Build the wire command to move the base joint to an absolute angle (deg)."""
+    if speed_deg_s is None:
+        return "%s %s" % (SET_BASE_JOINT, deg)
+    return "%s %s %s" % (SET_BASE_JOINT, deg, speed_deg_s)
+
+
+def set_joint_command(index, deg, speed_deg_s=None):
+    """Build the wire command to move one joint (index 0-5) to an absolute angle."""
+    if speed_deg_s is None:
+        return "%s %s %s" % (SET_JOINT, index, deg)
+    return "%s %s %s %s" % (SET_JOINT, index, deg, speed_deg_s)
+
+
+def reconfigure_command(joints_deg, speed_deg_s=None):
+    """Build the wire command to reconfigure to an alternate IK branch (6 joint
+    angles in deg), preserving the TCP via a final straight-line move."""
+    js=" ".join(str(v) for v in joints_deg)
+    if speed_deg_s is None:
+        return "%s %s" % (RECONFIGURE, js)
+    return "%s %s %s" % (RECONFIGURE, js, speed_deg_s)
+
+
+def scan_tags_command(start_deg=-45, end_deg=45, speed_deg_s=1):
+    """Build the wire command to swing the base and scan for all AprilTags."""
+    return "%s %s %s %s" % (SCAN_TAGS, start_deg, end_deg, speed_deg_s)
+
+
+def swing_base_command(start_deg, end_deg, speed_deg_s):
+    """Build the wire command to swing the base joint start->end deg (relative to
+    the current angle), the swing at speed_deg_s deg/s."""
+    return "%s %s %s %s" % (SWING_BASE, start_deg, end_deg, speed_deg_s)
 
 
 def tweak_position_command(axis, millimetres):
@@ -690,6 +835,11 @@ def pull_positions_command():
     return PULL_POSITIONS
 
 
+def face_camera_down_command():
+    """Build the wire command to level the camera to point straight down."""
+    return FACE_CAMERA_DOWN
+
+
 def zalign_command():
     """Build the wire command to level the tool Z axis straight down."""
     return ZALIGN
@@ -705,9 +855,9 @@ def grab_gripper_command():
     return GRAB_GRIPPER
 
 
-def bump_z_command():
-    """Build the wire command to bump straight down and report the surface Z."""
-    return BUMP_Z
+def bump_z_command(backoff_mm=0.0):
+    """Build the wire command to bump straight down (and back off backoff_mm)."""
+    return BUMP_Z if not backoff_mm else "%s %s" % (BUMP_Z, backoff_mm)
 
 
 def unlock_stop_command():

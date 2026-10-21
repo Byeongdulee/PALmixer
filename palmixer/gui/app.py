@@ -151,6 +151,10 @@ class MainWindow(QMainWindow):
         self.result_label.setWordWrap(False)
         self.result_label.setStyleSheet("padding: 3px;")
         self._last_result_stamp = None
+        # action_id (or stamp) of the last completion already written to the
+        # command-history list, so the get_state poll and the MQTT motion topic
+        # do not both log the same result. See _on_tracking_updated / _on_mqtt_motion.
+        self._logged_result_key = None
         # Which failure has already been shown in a dialog, and whether one is
         # up right now -- see _maybe_alert.
         self._alerted_key = None
@@ -160,7 +164,7 @@ class MainWindow(QMainWindow):
         self.log_list = QListWidget()
         # Fixed, not a maximum: a maximum still lets the widget shrink below
         # it, which a QListWidget with few or no items does.
-        self.log_list.setFixedHeight(200)
+        self.log_list.setFixedHeight(100)
         layout.addWidget(self.log_list)
 
         box.setLayout(layout)
@@ -241,9 +245,22 @@ class MainWindow(QMainWindow):
             if stamp != self._last_result_stamp:
                 self._last_result_stamp = stamp
                 detail = last_result.get("detail", "")
-                self._show_result(bool(last_result.get("ok")),
-                                  "%s%s" % (last_result.get("action", "?"),
-                                            (" -- %s" % detail) if detail else ""))
+                ok = bool(last_result.get("ok"))
+                action = last_result.get("action", "?")
+                self._show_result(ok, "%s%s" % (action,
+                                                (" -- %s" % detail) if detail else ""))
+                # Also write the FULL (multi-line) result into the command-history
+                # list as soon as the action finishes -- the result_label above is
+                # single-line and elided, so a multi-line scan report (tag list,
+                # Venton axes, carousel + sample) is only fully readable here. This
+                # is the no-broker route; de-dup against the MQTT motion topic by
+                # action_id so the two do not both log it.
+                key = last_result.get("action_id") or stamp
+                if key != self._logged_result_key:
+                    self._logged_result_key = key
+                    head = ("OK: " if ok else "FAILED: ") + action
+                    self._log(head + ((":\n" + detail) if detail else ""),
+                              QColor("darkgreen") if ok else QColor("darkred"))
                 # The no-broker route to the same dialog (see _maybe_alert).
                 if (not last_result.get("ok")
                         and cmd.is_protective_stop_failure(detail)):
@@ -289,6 +306,9 @@ class MainWindow(QMainWindow):
         if detail:
             text += " -- %s" % detail
         self._log(text, color)
+        # This action's motion is already in the history via the topic, so the
+        # get_state poll must not log its completion again (see _on_tracking_updated).
+        self._logged_result_key = payload.get("trace") or self._logged_result_key
         # An action that failed after it was ACCEPTED -- an AprilTag search
         # that could not square up to the tag, a transport that raised. The
         # ZMQ reply for these was "ACCEPTED" long ago, so this topic is the

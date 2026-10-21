@@ -215,6 +215,19 @@ class PALmixerServer:
                       % (scale, offset))
             except Exception as e:
                 print("PALmixerServer: could not set AT distance correction: %s" % e)
+            # Software joint guard: refuse joint moves that drive the shoulder
+            # (joint 1) below this angle. Lives on robUR.movej; set it from
+            # config here (robot.shoulder_min_deg; default -150). None disables.
+            try:
+                rob_cfg = cfg.get("robot", {}) or {}
+                if "shoulder_min_deg" in rob_cfg:
+                    lim = rob_cfg.get("shoulder_min_deg")
+                    self.rob.shoulder_min_deg = (None if lim is None else float(lim))
+                lim_now = getattr(self.rob, "shoulder_min_deg", None)
+                print("PALmixerServer: shoulder joint guard = %s"
+                      % ("off" if lim_now is None else ("%.1f deg" % lim_now)))
+            except Exception as e:
+                print("PALmixerServer: could not set shoulder guard: %s" % e)
             # Activate the gripper now so the first grab does not pay the slow
             # activation handshake mid-move. Non-fatal: a gripper that will not
             # activate at startup must not stop the server from coming up.
@@ -301,9 +314,22 @@ class PALmixerServer:
             return self._venton_axes(args)
 
         if name == cmd.GET_POSE:
+            frame = "gripper"
             if args:
-                return "ERROR: %s takes no arguments" % cmd.GET_POSE
-            return self._get_pose()
+                if len(args) != 1 or args[0].lower() not in ("gripper", "camera"):
+                    return "ERROR: usage: %s [gripper|camera]" % cmd.GET_POSE
+                frame = args[0].lower()
+            return self._get_pose(frame)
+
+        if name == cmd.GET_TCP:
+            if args:
+                return "ERROR: %s takes no arguments" % cmd.GET_TCP
+            return self._get_tcp()
+
+        if name == cmd.GET_JOINTS:
+            if args:
+                return "ERROR: %s takes no arguments" % cmd.GET_JOINTS
+            return self._get_joints()
 
         if name == cmd.TAG_DISTANCE:
             return self._tag_distance(args)
@@ -791,6 +817,11 @@ class PALmixerServer:
                 raise ValueError("%s takes no arguments" % cmd.ZALIGN)
             return self._zalign, cmd.ZALIGN
 
+        if name == cmd.FACE_CAMERA_DOWN:
+            if args:
+                raise ValueError("%s takes no arguments" % cmd.FACE_CAMERA_DOWN)
+            return self._face_camera_down, cmd.FACE_CAMERA_DOWN
+
         if name == cmd.RELEASE_GRIPPER:
             if args:
                 raise ValueError("%s takes no arguments" % cmd.RELEASE_GRIPPER)
@@ -802,9 +833,148 @@ class PALmixerServer:
             return self._grab_gripper, cmd.GRAB_GRIPPER
 
         if name == cmd.BUMP_Z:
+            if len(args) > 1:
+                raise ValueError("usage: %s [backoff_mm]" % cmd.BUMP_Z)
+            try:
+                backoff_mm = float(args[0]) if args else 0.0
+            except ValueError:
+                raise ValueError("backoff_mm must be numeric, got %r" % args[0])
+            return (lambda: self._bump_z(backoff_mm)), "%s %g mm" % (cmd.BUMP_Z, backoff_mm)
+
+        if name == cmd.SCAN_TAGS:
+            if len(args) not in (0, 3):
+                raise ValueError("usage: %s [<start_deg> <end_deg> <speed_deg_s>]"
+                                 % cmd.SCAN_TAGS)
+            try:
+                sweep = ([float(a) for a in args] if args else [-45.0, 45.0, 1.0])
+            except ValueError:
+                raise ValueError("scan_tags args must be numeric, got %r" % (args,))
+            label = "%s %g %g %g deg/s" % (cmd.SCAN_TAGS, sweep[0], sweep[1], sweep[2])
+            return (lambda: self._scan_tags(*sweep)), label
+
+        if name == cmd.MEASURE_TAG_HEIGHTS:
+            try:
+                only_ids = [int(a) for a in args] if args else None
+            except ValueError:
+                raise ValueError("%s ids must be integers, got %r"
+                                 % (cmd.MEASURE_TAG_HEIGHTS, args))
+            label = (cmd.MEASURE_TAG_HEIGHTS if not only_ids
+                     else "%s %s" % (cmd.MEASURE_TAG_HEIGHTS, only_ids))
+            return (lambda: self._measure_tag_heights(only_ids)), label
+
+        if name == cmd.RASTER_TAG_SCAN:
+            if len(args) not in (0, 2):
+                raise ValueError("usage: %s [base_from base_to]"
+                                 % cmd.RASTER_TAG_SCAN)
+            try:
+                g = ([float(a) for a in args] if args else [-80.0, 0.0])
+            except ValueError:
+                raise ValueError("raster_tag_scan args must be numeric, got %r" % (args,))
+            label = "%s base %g..%g" % (cmd.RASTER_TAG_SCAN, g[0], g[1])
+            return (lambda: self._raster_tag_scan(*g)), label
+
+        if name == cmd.LOCATE_MIXER_CAROUSEL:
+            if len(args) not in (0, 2):
+                raise ValueError("usage: %s [base_from base_to]"
+                                 % cmd.LOCATE_MIXER_CAROUSEL)
+            try:
+                g = ([float(a) for a in args] if args else [-100.0, 20.0])
+            except ValueError:
+                raise ValueError("locate_mixer_carousel args must be numeric, got %r"
+                                 % (args,))
+            label = "%s base %g..%g" % (cmd.LOCATE_MIXER_CAROUSEL, g[0], g[1])
+            return (lambda: self._locate_mixer_carousel(*g)), label
+
+        if name == cmd.READ_TAG:
+            if len(args) != 1:
+                raise ValueError("usage: %s <tag_id>" % cmd.READ_TAG)
+            try:
+                tag_id = int(args[0])
+            except ValueError:
+                raise ValueError("read_tag tag id must be an integer, got %r" % (args,))
+            label = "%s %d" % (cmd.READ_TAG, tag_id)
+            return (lambda: self._read_tag(tag_id)), label
+
+        if name == cmd.READ_TAGS:
             if args:
-                raise ValueError("%s takes no arguments" % cmd.BUMP_Z)
-            return self._bump_z, cmd.BUMP_Z
+                raise ValueError("usage: %s (no args)" % cmd.READ_TAGS)
+            return (lambda: self._read_tags()), cmd.READ_TAGS
+
+        if name == cmd.SURVEY_TAGS:
+            if args:
+                raise ValueError("usage: %s (no args)" % cmd.SURVEY_TAGS)
+            return (lambda: self._survey_tags()), cmd.SURVEY_TAGS
+
+        if name == cmd.MOVE_TO_XYZ:
+            if len(args) not in (3, 4):
+                raise ValueError("usage: %s <x> <y> <z> [gripper|camera]"
+                                 % cmd.MOVE_TO_XYZ)
+            try:
+                x, y, zc = float(args[0]), float(args[1]), float(args[2])
+            except ValueError:
+                raise ValueError("move_to_xyz x/y/z must be numeric, got %r" % (args,))
+            frame = args[3].lower() if len(args) == 4 else "gripper"
+            if frame not in ("gripper", "camera"):
+                raise ValueError("frame must be gripper or camera, got %r" % frame)
+            label = "%s %.4f %.4f %.4f %s" % (cmd.MOVE_TO_XYZ, x, y, zc, frame)
+            return (lambda: self._move_to_xyz(x, y, zc, frame)), label
+
+        if name == cmd.SET_BASE_JOINT:
+            if len(args) not in (1, 2):
+                raise ValueError("usage: %s <deg> [speed_deg_s]" % cmd.SET_BASE_JOINT)
+            try:
+                deg = float(args[0])
+                speed = float(args[1]) if len(args) == 2 else None
+            except ValueError:
+                raise ValueError("set_base_joint args must be numeric, got %r" % (args,))
+            if speed is not None and speed <= 0:
+                raise ValueError("speed_deg_s must be positive, got %g" % speed)
+            label = "%s %g deg" % (cmd.SET_BASE_JOINT, deg)
+            return (lambda: self._set_base_joint(deg, speed)), label
+
+        if name == cmd.SET_JOINT:
+            if len(args) not in (2, 3):
+                raise ValueError("usage: %s <index 0-5> <deg> [speed_deg_s]"
+                                 % cmd.SET_JOINT)
+            try:
+                index = int(args[0])
+                deg = float(args[1])
+                speed = float(args[2]) if len(args) == 3 else None
+            except ValueError:
+                raise ValueError("set_joint args must be numeric, got %r" % (args,))
+            if index not in range(6):
+                raise ValueError("joint index must be 0-5, got %d" % index)
+            if speed is not None and speed <= 0:
+                raise ValueError("speed_deg_s must be positive, got %g" % speed)
+            label = "%s %d -> %g deg" % (cmd.SET_JOINT, index, deg)
+            return (lambda: self._set_joint(index, deg, speed)), label
+
+        if name == cmd.RECONFIGURE:
+            if len(args) not in (6, 7):
+                raise ValueError("usage: %s <j0..j5 deg> [speed_deg_s]" % cmd.RECONFIGURE)
+            try:
+                joints = [float(v) for v in args[:6]]
+                speed = float(args[6]) if len(args) == 7 else None
+            except ValueError:
+                raise ValueError("reconfigure args must be numeric, got %r" % (args,))
+            if speed is not None and speed <= 0:
+                raise ValueError("speed_deg_s must be positive, got %g" % speed)
+            label = "%s %s deg" % (cmd.RECONFIGURE, joints)
+            return (lambda: self._reconfigure(joints, speed)), label
+
+        if name == cmd.SWING_BASE:
+            if len(args) != 3:
+                raise ValueError("usage: %s <start_deg> <end_deg> <speed_deg_s>"
+                                 % cmd.SWING_BASE)
+            try:
+                start_deg, end_deg, speed = (float(args[0]), float(args[1]),
+                                             float(args[2]))
+            except ValueError:
+                raise ValueError("swing_base args must be numeric, got %r" % (args,))
+            if speed <= 0:
+                raise ValueError("speed_deg_s must be positive, got %g" % speed)
+            label = "%s %g %g %g deg/s" % (cmd.SWING_BASE, start_deg, end_deg, speed)
+            return (lambda: self._swing_base(start_deg, end_deg, speed)), label
 
         if name == cmd.MOTOR_TWEAK:
             if len(args) != 2 or args[0] not in (cmd.MOTOR_FORWARD, cmd.MOTOR_REVERSE):
@@ -1318,24 +1488,59 @@ class PALmixerServer:
             return frame
         return self.PAL12idb.load_venton_frame() if self.PAL12idb else None
 
-    def _get_pose(self):
-        """Report the current TCP pose in the gripper frame.
+    def _get_joints(self):
+        """Report the six joint angles in degrees (base joint first). A fast read
+        -- refused while the robot is moving."""
+        import math
+        if self.simulate:
+            return "joints (deg): [0.00, 0.00, 0.00, 0.00, 0.00, 0.00] [simulated]"
+        if self.rob is None:
+            return "ERROR: no robot connection"
+        if self._busy:
+            return ("ERROR: busy -- cannot read the joints while the robot is "
+                    "moving; try again when it is idle")
+        j = [math.degrees(a) for a in self.rob.getj()]
+        return ("joints (deg): [%s]  (base = %.2f deg)"
+                % (", ".join("%.2f" % a for a in j), j[0]))
+
+    def _get_tcp(self):
+        """Report the active tool TCP vector and whether it is the gripper or
+        camera frame. A fast read -- refused while the robot is moving."""
+        if self.simulate:
+            return "tcp gripper: [0.0000, 0.0000, 0.1950, 0.0000, 0.0000, 0.0000] [simulated]"
+        if self.rob is None:
+            return "ERROR: no robot connection"
+        if self._busy:
+            return ("ERROR: busy -- cannot read the TCP while the robot is "
+                    "moving; try again when it is idle")
+        tcp = list(self.rob.get_tcp())
+        def _close(a, b):
+            return all(abs(float(x) - float(y)) < 1e-4 for x, y in zip(a, b))
+        which = ("gripper" if _close(tcp, self.rob.tcp)
+                 else "camera" if _close(tcp, self.rob.camtcp) else "other")
+        return "tcp %s: [%s]" % (which, ", ".join("%.4f" % x for x in tcp))
+
+    def _get_pose(self, frame="gripper"):
+        """Report the current TCP pose, in the gripper frame (default) or the
+        camera frame (frame="camera").
 
         A fast read -- refused while the robot is moving, since a pose read
-        mid-move is a moving target. The gripper TCP is made active so the
-        numbers match the frame taught positions and the bump height use.
-        See cmd.GET_POSE.
+        mid-move is a moving target. Reads with the requested TCP active, then
+        restores the gripper TCP (set_tcp changes only the reference frame, not
+        the arm). See cmd.GET_POSE.
         """
         if self.simulate:
-            return "pose (m, rad): [0.0000, 0.0000, 0.3000, 0.0000, 0.0000, 0.0000] [simulated]"
+            return ("pose %s (m, rad): [0.0000, 0.0000, 0.3000, 0.0000, 0.0000, 0.0000] [simulated]"
+                    % frame)
         if self.rob is None:
             return "ERROR: no robot connection"
         if self._busy:
             return ("ERROR: busy -- cannot read the pose while the robot is "
                     "moving; try again when it is idle")
-        self.rob.set_tcp(self.rob.tcp)
+        self.rob.set_tcp(self.rob.camtcp if frame == "camera" else self.rob.tcp)
         v = self.rob.get_pose().get_pose_vector().tolist()
-        return "pose (m, rad): [%s]" % ", ".join("%.4f" % x for x in v)
+        self.rob.set_tcp(self.rob.tcp)                    # leave the gripper TCP active
+        return "pose %s (m, rad): [%s]" % (frame, ", ".join("%.4f" % x for x in v))
 
     def _tag_distance(self, args):
         """Report the camera-to-tag distance for the AprilTag currently in view.
@@ -1558,28 +1763,33 @@ class PALmixerServer:
                     "unknown -- reconcile it with set_location" % (what, dropped))
         return what
 
-    def _bump_z(self):
-        """Bump straight down until the tool touches, and report the height.
+    def _bump_z(self, backoff_mm=0.0):
+        """Bump straight down until the tool touches, then back off `backoff_mm`.
 
         A worker action (a real force-sensed descent). The gripper TCP is made
-        active so the Z it stops at is in the frame the taught positions use;
-        backoff=0 leaves it right at contact. The returned height is also stored
-        as last_result, so a client can read it back from get_state.
+        active so the Z it stops at is in the frame the taught positions use. With
+        backoff_mm the tool retreats that far above the contact (ending there);
+        the measured surface, travel and final height are stored as last_result.
         """
         if self.simulate:
             time.sleep(0.3)
-            return "simulated bump; surface z = 0.0000 m"
+            return "simulated bump; surface z = 0.0000 m (backoff %g mm)" % backoff_mm
+        backoff = backoff_mm / 1000.0
         self.rob.set_tcp(self.rob.tcp)
         # Fully shut the gripper first so the fingertips make a clean, defined
         # contact -- a surface measured with an open/part-open gripper is not the
         # same height.
         self.PAL12idb.close_gripper_fully(self.rob)
-        z0 = self.rob.get_pos()[2]           # before the descent
-        self.rob.bump(z=-1, backoff=0.0)
-        z1 = self.rob.get_pos()[2]           # at contact
-        travel = z0 - z1                     # how far it descended to touch
+        z0 = self.rob.get_pos()[2]               # before the descent
+        self.rob.bump(z=-1, backoff=backoff)
+        z_final = self.rob.get_pos()[2]          # after the backoff
+        surface = z_final - backoff               # the contact point
+        travel = z0 - surface                    # how far it descended to touch
+        if backoff_mm:
+            return ("bumped; traveled %.4f m down to surface z = %.4f m, backed "
+                    "off %g mm to z = %.4f m" % (travel, surface, backoff_mm, z_final))
         return ("bumped; traveled %.4f m down to contact (surface z = %.4f m)"
-                % (travel, z1))
+                % (travel, surface))
 
     def _grab_gripper(self):
         """Close the gripper where the arm is standing.
@@ -1708,6 +1918,253 @@ class PALmixerServer:
         except Exception as e:                           # noqa: BLE001
             return "ERROR: could not turn freedrive %s: %s" % (args[0], e)
         return "OK freedrive %s" % args[0]
+
+    def _face_camera_down(self):
+        """Level the camera to point straight down, keeping its position/heading.
+
+        Zalign on the camera TCP, so the camera (not the gripper) is held in place
+        and the wrist swings to bring the camera's Z straight down; the gripper TCP
+        is restored afterwards. A worker move.
+        """
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated face camera down"
+        self.rob.set_tcp(self.rob.camtcp)
+        pose = self.rob.Zalign()
+        self.rob.set_tcp(self.rob.tcp)
+        return "camera faced down at %s" % (pose,)
+
+    def _measure_tag_heights(self, only_ids=None):
+        """Bump-measure tags from the last raster scan and report the table with
+        the measured surface Z added. `only_ids` limits it to a subset (and skips
+        the initial put_tcp2camera, for continuing after a stop). A worker motion.
+        """
+        scan = getattr(self, "_last_scan", None)
+        if not scan:
+            return ("ERROR: no raster scan to measure -- run raster_tag_scan first")
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated tag-height measurement"
+        tags_xyz = {tid: scan[tid]["xyz"] for tid in scan}
+        measured = self.PAL12idb.measure_tag_heights(
+            self.rob, tags_xyz, only_ids=only_ids,
+            put_tcp2cam=(not only_ids))
+        lines = ["tag-heights: scan xyz + bump-measured surface Z:"]
+        for tid in sorted(scan):
+            x, y, zc = scan[tid]["xyz"]
+            mz = measured.get(tid)
+            mz_s = "%.4f" % mz if mz is not None else "?"
+            dz = ("%+.4f" % (mz - zc)) if mz is not None else "?"
+            lines.append("  tag %2d  scan (%.4f, %.4f, %.4f)  bump Z %s  (dz %s)"
+                         % (tid, x, y, zc, mz_s, dz))
+        report = "\n".join(lines)
+        print(report)
+        return report
+
+    def _raster_tag_scan(self, base_from, base_to):
+        """Cylindrical raster scan for AprilTags (camera must face down); report
+        every tag found as id -> base-frame (x, y, z). A worker motion."""
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated raster tag scan (no tags)"
+        found = self.PAL12idb.raster_tag_scan(
+            self.rob, base_from=base_from, base_to=base_to)
+        self._last_scan = found                    # kept for measure_tag_heights
+        if not found:
+            print("raster_tag_scan: no AprilTags found")
+            return "raster_tag_scan: no AprilTags found"
+        lines = ["raster_tag_scan: found %d tag(s):" % len(found)]
+        for tid in sorted(found):
+            x, y, z = found[tid]["xyz"]
+            lines.append("  tag %2d at (%.4f, %.4f, %.4f) m  [%d sightings, seen at %s]"
+                         % (tid, x, y, z, found[tid]["n"], found[tid]["seen_at"]))
+        report = "\n".join(lines)
+        print(report)
+        return report
+
+    def _locate_mixer_carousel(self, base_from, base_to):
+        """Raster-scan, identify the carousel on the mixer (tag ~65 mm -X/-Y from
+        the mixer-head tag), store its tag centre, and report the sample position.
+        A worker motion. Keeps self._last_scan so measure_tag_heights still works."""
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated locate_mixer_carousel (no tags)"
+        res = self.PAL12idb.locate_mixer_carousel(
+            self.rob, base_from=base_from, base_to=base_to)
+        self._last_scan = res.get("tags") or {}    # kept for measure_tag_heights
+        report = res.get("summary") or "locate_mixer_carousel: no result"
+        print(report)
+        return report
+
+    def _read_tag(self, tag_id):
+        """Read one AprilTag's base (x, y, z) from the current camera view (no
+        motion); report it or say it is not in view. A worker call (it touches
+        the camera/TCP), but it does not move the arm."""
+        if self.simulate:
+            time.sleep(0.2)
+            return "simulated read_tag %d (none)" % tag_id
+        pose = self.PAL12idb.read_tag_in_view(self.rob, tag_id)
+        if pose is None:
+            return ("tag %d not in the current camera view -- aim the camera at it "
+                    "first (face_camera_down / move over it)." % tag_id)
+        return ("tag %d at (%.4f, %.4f, %.4f) m, rotvec (%.4f, %.4f, %.4f) (base)"
+                % (tag_id, pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]))
+
+    def _read_tags(self):
+        """Read every AprilTag in the current camera view (no motion); report each
+        id's base (x, y, z) and role. A worker call; it does not move the arm."""
+        if self.simulate:
+            time.sleep(0.2)
+            return "simulated read_tags (none)"
+        found = self.PAL12idb.read_tags_in_view(self.rob)
+        if not found:
+            return ("no AprilTags in the current camera view -- aim the camera "
+                    "(face_camera_down / move over them) first.")
+        lines = ["tags in the current view (%d):" % len(found)]
+        for tid in sorted(found):
+            x, y, z = found[tid]
+            role = self.PAL12idb._tag_role(tid)
+            lines.append("  tag %2d%s at (%.4f, %.4f, %.4f) m"
+                         % (tid, (" (%s)" % role) if role else "", x, y, z))
+        report = "\n".join(lines)
+        print(report)
+        return report
+
+    def _survey_tags(self):
+        """After a raster scan, center the camera on the mixer head, the carousel
+        on the mixing station, and flowcells 1 & 2, and bump the gripper down to
+        measure each one's surface Z. Uses the most recent raster scan's positions
+        (self._last_scan). A worker motion; reports centered X,Y + bumped Z."""
+        scan = getattr(self, "_last_scan", None)
+        if not scan:
+            return ("no raster scan to survey -- run raster_tag_scan or "
+                    "locate_mixer_carousel first.")
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated survey_tags (no motion)"
+        res = self.PAL12idb.survey_key_tags(self.rob, scan)
+        if not res:
+            return "survey_tags: none of the target tags were in the last scan."
+        lines = ["survey (centered X,Y + bumped Z):"]
+        for tid in sorted(res):
+            r = res[tid]
+            cx, cy, _cz = r["centered_xyz"]
+            lines.append("  %-20s tag %2d: centered (%.4f, %.4f), bump Z %.4f m"
+                         % (r["role"], tid, cx, cy, r["bumped_z"]))
+        report = "\n".join(lines)
+        print(report)
+        return report
+
+    def _scan_tags(self, start_deg=-45.0, end_deg=45.0, speed_deg_s=1.0):
+        """Swing the base and record every AprilTag's base-frame position.
+
+        A worker motion. Returns (and prints) the found tags as id -> (x, y, z).
+        """
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated tag scan (no tags)"
+        found = self.PAL12idb.scan_apriltags_during_base_swing(
+            self.rob, start_deg=start_deg, end_deg=end_deg, speed_deg_s=speed_deg_s)
+        if not found:
+            print("scan_tags: no AprilTags found during the swing")
+            return "scan_tags: no AprilTags found"
+        lines = ["scan_tags: found %d tag(s):" % len(found)]
+        for tid in sorted(found):
+            x, y, z = found[tid]["xyz"]
+            lines.append("  tag %2d at (%.4f, %.4f, %.4f) m  [%d sightings]"
+                         % (tid, x, y, z, found[tid]["n"]))
+        report = "\n".join(lines)
+        print(report)
+        return report
+
+    def _move_to_xyz(self, x, y, z, frame="gripper"):
+        """Move the chosen tool (gripper|camera) to base-frame X,Y,Z keeping the
+        current orientation. Goes over the X,Y at the current height first, then to
+        Z, so it does not sweep a diagonal into anything. A worker motion."""
+        if self.simulate:
+            time.sleep(0.3)
+            return "simulated %s move to (%.4f, %.4f, %.4f)" % (frame, x, y, z)
+        self.rob.set_tcp(self.rob.camtcp if frame == "camera" else self.rob.tcp)
+        cur = self.rob.get_pos()
+        self.rob.moveto([x, y, cur[2]])          # over the X,Y at the current height
+        self.rob.moveto([x, y, z])               # then to the target Z
+        self.rob.set_tcp(self.rob.tcp)           # leave the gripper TCP active
+        return "%s at (%.4f, %.4f, %.4f)" % (frame, x, y, z)
+
+    def _set_base_joint(self, deg, speed_deg_s=None):
+        """Move the base joint (joint 0) to an ABSOLUTE angle (deg), holding the
+        other joints. A worker motion. Default speed is moderate."""
+        import math
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated base joint -> %g deg" % deg
+        j = list(self.rob.getj())
+        j[0] = math.radians(deg)
+        vel = math.radians(speed_deg_s) if speed_deg_s else 0.2
+        self.rob.movej(j, acc=0.3, vel=vel, wait=True)
+        return "base joint set to %g deg" % deg
+
+    def _set_joint(self, index, deg, speed_deg_s=None):
+        """Move one joint (index 0-5) to an ABSOLUTE angle (deg), holding the
+        others. A worker motion. Default speed is moderate."""
+        import math
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated joint %d -> %g deg" % (index, deg)
+        j = list(self.rob.getj())
+        j[index] = math.radians(deg)
+        lim = getattr(self.rob, "shoulder_min_deg", None)
+        if index == 1 and lim is not None and deg < lim - 1e-6:
+            raise ValueError("shoulder target %g deg is below the safety limit "
+                             "%g deg; refused" % (deg, lim))
+        vel = math.radians(speed_deg_s) if speed_deg_s else 0.2
+        self.rob.movej(j, acc=0.3, vel=vel, wait=True)
+        return "joint %d set to %g deg" % (index, deg)
+
+    def _reconfigure(self, joints_deg, speed_deg_s=None):
+        """Move to an alternate IK branch: record the current TCP pose, movej to
+        the six given joint angles (deg), then movel back to the recorded TCP so
+        the actual tool pose is preserved (absorbs controller calibration). A
+        worker motion."""
+        import math
+        if self.simulate:
+            time.sleep(0.5)
+            return "simulated reconfigure -> %s deg" % (joints_deg,)
+        lim = getattr(self.rob, "shoulder_min_deg", None)
+        if lim is not None and joints_deg[1] < lim - 1e-6:
+            raise ValueError("shoulder target %g deg is below the safety limit "
+                             "%g deg; refused" % (joints_deg[1], lim))
+        pose = list(self.rob.get_pose().get_pose_vector())   # exact current TCP (base)
+        q = [math.radians(v) for v in joints_deg]
+        vel = math.radians(speed_deg_s) if speed_deg_s else 0.3
+        self.rob.movej(q, acc=0.3, vel=vel, wait=True)        # alternate branch (nominal)
+        self.rob.movel(pose, acc=0.3, vel=0.1, wait=True)     # refine to exact TCP, same branch
+        now = [round(math.degrees(v), 3) for v in self.rob.getj()]
+        return ("reconfigured to joints %s deg; TCP restored to %s" %
+                (now, [round(v, 5) for v in pose]))
+
+    def _swing_base(self, start_deg, end_deg, speed_deg_s):
+        """Swing the base joint (joint 0) from current+start_deg to current+end_deg.
+
+        Only joint 0 moves (the other joints are held at their current angles).
+        It first positions to the start angle at a moderate speed, then swings to
+        the end angle at speed_deg_s deg/s. A worker motion -- a real, large move.
+        """
+        import math
+        if self.simulate:
+            time.sleep(0.5)
+            return ("simulated base swing %+g -> %+g deg at %g deg/s"
+                    % (start_deg, end_deg, speed_deg_s))
+        j0 = self.rob.getj()
+        base = j0[0]
+        start = list(j0); start[0] = base + math.radians(start_deg)
+        end = list(j0);   end[0] = base + math.radians(end_deg)
+        swing_vel = math.radians(speed_deg_s)
+        # Position to the start angle at a moderate speed, then swing at the asked speed.
+        self.rob.movej(start, acc=0.3, vel=0.2, wait=True)
+        self.rob.movej(end, acc=0.3, vel=swing_vel, wait=True)
+        return ("swung base %+g -> %+g deg at %g deg/s"
+                % (start_deg, end_deg, speed_deg_s))
 
     def _motor_tweak(self, direction, step):
         if self.simulate:
