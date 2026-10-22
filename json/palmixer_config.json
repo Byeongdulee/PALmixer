@@ -43,6 +43,7 @@
     "size": 16,
     "step": 4500,
     "draw_offset_steps": 4,
+    "preparation_offset_steps": -4,
     "radius_mm": 50.0,
     "tube_diameter_mm": 10.0
   },

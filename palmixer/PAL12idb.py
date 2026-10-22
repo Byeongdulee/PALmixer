@@ -3579,13 +3579,22 @@ def ready_flowcell_to_draw(robot):
 
 # after drawing, the robot is holding the flowcell. Move it to the beam and drop it.
 @_tracks(_flowcell_setter, state.FC_AT_BEAM)
-def load_sample_to_beam(robot):
+def load_sample_to_beam(robot, on_lift_complete=None):
     # Align the DAQ stage on the sample-table position and capture the measuring
     # position it was at, so _restore_stage() can return it there once the
     # flowcell is down. Skipped entirely when sample-table motor positioning is
     # off -- see _align_sample_table_if_enabled().
     restore_to = _align_sample_table_if_enabled()
     robot.mvr2z(needle_clear_height)
+    if on_lift_complete is not None:
+        # The scheduler hook is nonthrowing and only wakes its own worker.
+        # Preserve the existing movement's normal-return/exception behavior.
+        try:
+            on_lift_complete()
+        except Exception:
+            # Notification failures must not interrupt the established UR route.
+            import logging
+            logging.getLogger(__name__).exception("Preparation lift notification failed")
     p2 = list(get_sampletable_position())
     p2[2] = p2[2]-distance_gripper_tag+sampletable_clear_height
     # mixer station -> sample table: crosses between the two regions.

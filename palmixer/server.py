@@ -242,6 +242,8 @@ class PALmixerServer:
 
         self.workflows = Workflows(self.PAL12idb, self.rob, self.pump, self.motor,
                                     on_step=self._publish_step, simulate=self.simulate)
+        from .preparation_api import PreparationAPI
+        self.preparation_api = PreparationAPI(self)
         state.add_listener(self._publish_tracking)
 
         self.zmq_server = ZMQCommandServer(
@@ -261,6 +263,16 @@ class PALmixerServer:
             return None
         name, args = parts[0], parts[1:]
 
+        api = getattr(self, "preparation_api", None)
+        if name == "preparation_control":
+            try:
+                return json.dumps({"ok": True, "result": api.request(json.loads(msg.split(None, 1)[1]))})
+            except Exception as error:
+                return json.dumps({"ok": False, "error": str(error)})
+        if api and api.active and name not in {
+                cmd.STATUS, cmd.GET_STATE, "get_sample_id", "get_pose", "get_tcp", "get_joints", "stop_search"}:
+            return "ERROR: coordinated preparation owns the equipment"
+
         if name == cmd.STATUS:
             return STATE_BUSY if self._busy else STATE_IDLE
 
@@ -270,6 +282,7 @@ class PALmixerServer:
             # on the same snapshot, because a client polling for "what is the machine
             # set to" should not need a second round trip for it.
             return json.dumps(dict(state.snapshot(),
+                                   preparation=(api.snapshot() if api else {}),
                                    action_result_version=1,
                                    simulated=self.simulate,
                                    busy=bool(self._busy),
@@ -583,6 +596,9 @@ class PALmixerServer:
         if not parts:
             return "ERROR: empty command"
         name, args = parts[0], parts[1:]
+
+        if getattr(self, "preparation_api", None) and self.preparation_api.active:
+            return "ERROR: coordinated preparation owns the equipment"
 
         try:
             action_fn, action_label = self._resolve(name, args)
@@ -1201,7 +1217,7 @@ class PALmixerServer:
                                        else pump_record["status"])
             self._save_mixing_record(record)
 
-    def _make_sample_recorded(self, slot, sample_id):
+    def _make_sample_recorded(self, slot, sample_id, *, sample_uid=None):
         # A PALsystem-prepared vial already has an identity. Keep it when the
         # GUI leaves its optional sample-ID box blank.
         sample_id = sample_id or state.get_sample_id(slot)
@@ -1214,7 +1230,8 @@ class PALmixerServer:
         self._mix_record_thread = threading.get_ident()
         self._save_mixing_record(record)
         try:
-            detail = self.workflows.make_sample(slot, sample_id)
+            detail = self.workflows.make_sample(slot, sample_id, **(
+                {"sample_uid": sample_uid, "action_id": self._current_trace} if sample_uid else {}))
             record.update(workflow_status="completed", detail=detail)
             return detail
         except Exception as exc:

@@ -156,13 +156,14 @@ class WorkflowError(Exception):
 
 
 class Workflows:
-    def __init__(self, pal, robot, pump, motor, on_step=None, simulate=False):
+    def __init__(self, pal, robot, pump, motor, on_step=None, simulate=False, preparation=None):
         self.pal = pal
         self.robot = robot
         self.pump = pump
         self.motor = motor
         self.on_step = on_step or (lambda step, phase, detail="": None)
         self.simulate = simulate
+        self.preparation = preparation
         from uuid import uuid4
         self._cleanup_session = uuid4().hex
         self._cleanup_lock = threading.Lock()
@@ -591,7 +592,69 @@ class Workflows:
             # quotes; take the message itself so the reply reads cleanly.
             raise WorkflowError(e.args[0])
 
-    def make_sample(self, slot, sample_id=None):
+    def make_sample(self, slot, sample_id=None, *, sample_uid=None, action_id=None):
+        if self.preparation is None:
+            return self._make_sample(slot, sample_id)
+        # Only the later PAL robot adapter opts in and supplies these identities.
+        self._check_make_sample(slot, sample_id)
+        self.preparation.begin_sample(sample_uid, slot, action_id, carousel_id=state.get_carousel_id())
+        try:
+            result = self._make_sample(slot, sample_id, on_lift_complete=lambda:
+                self.preparation.lift_complete(sample_uid, action_id))
+        except Exception as error:
+            try:
+                self.preparation.finish_sample(sample_uid, action_id, error)
+            except Exception:
+                pass  # Preserve the original hardware exception.
+            raise
+        self.preparation.finish_sample(sample_uid, action_id)
+        return result
+
+    def prepare_initial(self, placement_id):
+        """Reuse initial clearance; positioning itself belongs to the coordinator."""
+        if self.preparation is None:
+            raise WorkflowError("Preparation coordination is not enabled")
+        record = self.preparation.get(placement_id)
+        if record["phase"] != "pending" or record["binding"]["release_after_sample_uid"] is not None:
+            raise WorkflowError("Not an initial pending preparation")
+        self._check_make_sample(record["binding"]["slot"])
+        try:
+            if state.get_mixer_head() == state.MIXER_AT_MIXER:
+                if self.simulate:
+                    self._simulated_step("mixer2cleaningstation",
+                                         on_success=lambda: state.set_mixer_head(state.MIXER_AT_CLEANING))
+                else:
+                    self._move_mixer_head("mixer2cleaningstation",
+                                         lambda: self.pal.mixer2cleaningstation(self.robot))
+            self.preparation.open_initial(placement_id)
+        except Exception as error:
+            try:
+                self.preparation.invalidate(error)
+            except Exception:
+                pass
+            raise
+
+    def position_for_preparation(self, binding, *, offset_steps):
+        """Motor callback for the opt-in scheduler; never sends a UR command."""
+        if self.preparation is None:
+            raise WorkflowError("Preparation coordination is not enabled")
+        record = self.preparation.get(binding["placement_id"])
+        if record["binding"] != binding or record["phase"] != "positioning":
+            raise WorkflowError("The placement does not own preparation positioning")
+        if type(offset_steps) is not int:
+            raise WorkflowError("Configure the preparation station offset explicitly")
+        state.validate_slot(binding["slot"])
+        if state.get_carousel_id() != binding["carousel_id"] or state.carousel_reference_stale():
+            raise WorkflowError("Mounted carousel/reference does not match the placement")
+        if state.get_mixer_head() != state.MIXER_AT_CLEANING:
+            raise WorkflowError("The existing mixer-head removal has not completed")
+        target = state.slot_position(binding["slot"]) + offset_steps * state.require_carousel_step()
+        self.motor.check_in_range(target)
+        self.motor.move_to(target)
+        state.set_carousel_slot((binding["slot"] - 1 + offset_steps) % state.get_carousel_size() + 1)
+        return target
+
+    def _make_sample(self, slot, sample_id=None, on_lift_complete=None):
         """Mix a fresh sample and load it at the beam. See the module plan
         for the full step list; each PAL12idb call updates `state`.
 
@@ -623,6 +686,8 @@ class Workflows:
                 ("shake_sample", None),
             )
             for step, on_success in steps:
+                if step == "load_sample_to_beam" and on_lift_complete is not None:
+                    on_lift_complete()
                 self._simulated_step(step, on_success=on_success)
             self._park()
             return self._make_sample_detail("simulated make_sample", slot,
@@ -664,7 +729,11 @@ class Workflows:
         # preceding unload_sample -- is waited for here.
         self._await_background_pump("draw_to_flowcell")
         self._step("draw_to_flowcell", lambda: self._pump_op("draw_to_flowcell"))
-        self._step("load_sample_to_beam", lambda: self.pal.load_sample_to_beam(self.robot))
+        if on_lift_complete is None:
+            self._step("load_sample_to_beam", lambda: self.pal.load_sample_to_beam(self.robot))
+        else:
+            self._step("load_sample_to_beam", lambda: self.pal.load_sample_to_beam(
+                self.robot, on_lift_complete=on_lift_complete))
         self._start_auto_shake()
         self._park()
 
@@ -762,6 +831,8 @@ class Workflows:
     # -- draw_and_load ------------------------------------------------------------
     def _check_draw_and_load(self):
         """Validate preconditions without moving anything. Raises WorkflowError."""
+        if self.preparation is not None:
+            self.preparation.require_idle()
         fc = state.get_flowcell_in_use()
         fc_loc = state.get_flowcell_location(fc)
         what = "flowcell_%d" % fc
@@ -830,6 +901,8 @@ class Workflows:
     # invented; a supplied ID binds the operator's preloaded vial to its slot.
     def _check_draw_load_sample(self, slot, sample_id=None):
         """Validate a preloaded slot without running the mixer."""
+        if self.preparation is not None:
+            self.preparation.require_idle()
         try:
             state.validate_slot(slot)
             if sample_id is not None:
@@ -928,6 +1001,8 @@ class Workflows:
         that still holds the sequence open for the wash. The default path
         backgrounds that wash either way, so there is nothing there to skip.
         """
+        if aspirate and self.preparation is not None:
+            raise WorkflowError("Early preparation does not support return-to-vial recovery")
         self._check_unload_sample(aspirate)
         # The flowcell is coming off the beam either way, so any shake --
         # auto-started after a load, or a one-off Shake Sample press -- has
