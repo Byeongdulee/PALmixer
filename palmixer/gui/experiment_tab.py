@@ -20,6 +20,7 @@ class ExperimentTab(QWidget):
         super().__init__(parent)
         self._send_command = send_command
         self._all_buttons = []
+        self._prep_run_id = None
 
         self.flowcell = FlowcellSelector(send_command)
         self.pump_status = PumpStatusPanel()
@@ -46,6 +47,7 @@ class ExperimentTab(QWidget):
         layout.addWidget(self.position_motors_check)
         layout.addWidget(self._build_transport_group())
         layout.addWidget(self._build_carousel_group())
+        layout.addWidget(self._build_preparation_group())
         layout.addWidget(self._build_robot_group())
         layout.addWidget(self._build_motor_group())
         layout.addWidget(self._build_pump_group())
@@ -218,6 +220,46 @@ class ExperimentTab(QWidget):
             return
         self._send_command(cmd.release_gripper_command())
 
+    # -- coordinated preparation ------------------------------------------------
+    def _build_preparation_group(self):
+        """Clear a coordinated preparation session that an inhibited or restarted
+        PALsystem run left open. The normal `end` is blocked once the session is
+        marked for reconciliation, so this is the only local way out; it is enabled
+        only while such a session is open and the mixer is idle."""
+        box = QGroupBox("Coordinated preparation")
+        layout = QVBoxLayout()
+        self.prep_status_label = QLabel("No coordinated preparation session.")
+        self.prep_status_label.setWordWrap(True)
+        layout.addWidget(self.prep_status_label)
+        self.clear_prep_btn = QPushButton("Clear Preparation Session")
+        self.clear_prep_btn.setToolTip(
+            "Force-clear a coordinated preparation session PALsystem left open "
+            "after an inhibited or restarted run.\n\nOnly after PAL has cleared "
+            "the carousel and you have inspected the holders. Refused while the "
+            "mixer or its cleanup is busy. Not needed in normal operation -- a "
+            "clean run ends its own session.")
+        self.clear_prep_btn.setEnabled(False)
+        self.clear_prep_btn.clicked.connect(self._on_clear_preparation)
+        layout.addWidget(self.clear_prep_btn)
+        box.setLayout(layout)
+        return box
+
+    def _on_clear_preparation(self):
+        import json
+        run_id = self._prep_run_id
+        if not run_id:
+            return
+        if QMessageBox.question(
+                self, "Clear Preparation Session",
+                "Force-clear the coordinated preparation session?\n\n"
+                "Confirm PAL has cleared the carousel and the holders have been "
+                "inspected. This releases the session so a new coordinated run "
+                "can start.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._send_command("preparation_control " + json.dumps(
+            {"version": 1, "run_id": run_id, "op": "discard", "acknowledged": True}))
+
     # -- motor ------------------------------------------------------------------
     def _build_motor_group(self):
         box = QGroupBox("Carousel Motor (Galil ch A)")
@@ -283,6 +325,18 @@ class ExperimentTab(QWidget):
         is enabled and disabled by this alone.
         """
         self.pump_status.update_state(snapshot)
+        # A coordinated preparation session an inhibited/restarted run left open:
+        # offer the force-clear only while one is open and the mixer is idle.
+        prep = snapshot.get("preparation") or {}
+        active = bool(prep.get("active"))
+        self._prep_run_id = prep.get("run_id") if active else None
+        self.clear_prep_btn.setEnabled(active and not bool(snapshot.get("busy")))
+        if active:
+            self.prep_status_label.setText(
+                "Session open (run %s). %s" % (str(prep.get("run_id"))[:8],
+                prep.get("error") or "A coordinated preparation session is active."))
+        else:
+            self.prep_status_label.setText("No coordinated preparation session.")
         # Reflect the server's persisted setting without re-sending it: a
         # programmatic setChecked would otherwise fire _on_toggle_position_motors
         # and bounce the command straight back on every 3 s poll.

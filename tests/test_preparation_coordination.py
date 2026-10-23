@@ -346,6 +346,43 @@ def test_real_transport_overlaps_next_positioning(tmp_path):
     assert locations == ["at_beam"]
 
 
+def test_discard_force_clears_a_restarted_or_inhibited_session(tmp_path):
+    import json as _json
+    from palmixer.preparation_api import PreparationAPI
+    run_id = "752e4fc0-fa3d-47ac-ab9e-68624b0763a4"
+    path = tmp_path / "session.json"
+    path.write_text(_json.dumps({"active": True, "run_id": run_id, "actions": {}, "error": ""}))
+    server = SimpleNamespace(_busy=False, simulate=False,
+        workflows=SimpleNamespace(cleanup_snapshot=lambda: {"active": False}, preparation=object()))
+    api = PreparationAPI(server, path)
+    # Restart stamps a reconcile error and leaves the session active; end() is blocked.
+    assert api.active and api.snapshot()["error"]
+    with pytest.raises(ValueError, match="reconcile"):
+        api.request({"version": 1, "run_id": run_id, "op": "end"})
+    # Discard needs an explicit acknowledgement, then force-clears the session.
+    with pytest.raises(ValueError, match="acknowledge|Confirm"):
+        api.request({"version": 1, "run_id": run_id, "op": "discard"})
+    result = api.request({"version": 1, "run_id": run_id, "op": "discard", "acknowledged": True})
+    assert result["active"] is False
+    assert not api.active
+    assert server.workflows.preparation is None
+    assert not PreparationAPI(server, path).active  # Durable across restart.
+
+
+def test_discard_refused_while_mixer_or_cleanup_is_busy(tmp_path):
+    import json as _json
+    from palmixer.preparation_api import PreparationAPI
+    run_id = "752e4fc0-fa3d-47ac-ab9e-68624b0763a4"
+    path = tmp_path / "session.json"
+    path.write_text(_json.dumps({"active": True, "run_id": run_id, "actions": {}, "error": ""}))
+    server = SimpleNamespace(_busy=True, simulate=False,
+        workflows=SimpleNamespace(cleanup_snapshot=lambda: {"active": False}, preparation=object()))
+    api = PreparationAPI(server, path)
+    with pytest.raises(ValueError, match="motion and cleanup"):
+        api.request({"version": 1, "run_id": run_id, "op": "discard", "acknowledged": True})
+    assert api.active  # Session preserved until the mixer is idle.
+
+
 @pytest.mark.parametrize("step", [4500, -4500])
 def test_preparation_target_is_absolute_and_updates_slot_at_mixer(tmp_path, monkeypatch, step):
     from palmixer import state

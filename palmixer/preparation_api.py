@@ -82,6 +82,22 @@ class PreparationAPI:
                 if self.coordinator:
                     self.coordinator.invalidate(self.record['error'])
                 return self.snapshot()
+            if op == 'discard':
+                # Operator force-clear for a session an inhibited or restarted run left
+                # open: `end` is blocked once there is an error or no coordinator, so this
+                # is the only way out. Requires an explicit acknowledgement that PAL has
+                # cleared the carousel and holders have been inspected.
+                if message.get('acknowledged') is not True:
+                    raise ValueError('Confirm PAL cleared the carousel and holders before discarding the session')
+                if self.server._busy or self.server.workflows.cleanup_snapshot().get('active'):
+                    raise ValueError('Wait for motion and cleanup to finish before discarding the session')
+                if self.coordinator:
+                    self.coordinator.invalidate('Preparation session discarded by operator')
+                    self.coordinator.close()
+                self.server.workflows.preparation = None
+                self.record = dict(active=False, run_id=run_id, error='')
+                self._save()
+                return self.snapshot()
             if self.record.get('error') or self.coordinator is None:
                 raise ValueError(self.record.get('error') or 'No preparation coordinator')
             if op == 'queue':
