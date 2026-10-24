@@ -992,6 +992,27 @@ class PALmixerServer:
             label = "%s %g %g %g deg/s" % (cmd.SWING_BASE, start_deg, end_deg, speed)
             return (lambda: self._swing_base(start_deg, end_deg, speed)), label
 
+        if name in (cmd.MOVE_TO_PAL_LOADING, cmd.MOVE_TO_MIXING):
+            if len(args) != 1:
+                raise ValueError("usage: %s <target_sample_slot>" % name)
+            try:
+                target_slot = int(args[0])
+            except ValueError:
+                raise ValueError("Target sample slot must be an integer")
+            loading = name == cmd.MOVE_TO_PAL_LOADING
+            check = self.workflows._check_pal_loading if loading else self.workflows._check_mixing_position
+            move = self.workflows.move_to_pal_loading if loading else self.workflows.move_to_mixing
+            try:
+                check(target_slot)
+            except WorkflowError as e:
+                raise ValueError(str(e))
+            def position_carousel():
+                target = move(target_slot)
+                return "%s ready for sample slot %d (carousel slot %d, motor %g)" % (
+                    "PAL loading" if loading else "Mixing position",
+                    target_slot, state.get_carousel_slot(), target)
+            return position_carousel, "%s %d" % (name, target_slot)
+
         if name == cmd.MOTOR_TWEAK:
             if len(args) != 2 or args[0] not in (cmd.MOTOR_FORWARD, cmd.MOTOR_REVERSE):
                 raise ValueError("usage: %s <forward|reverse> <step>" % cmd.MOTOR_TWEAK)
@@ -1934,6 +1955,14 @@ class PALmixerServer:
             self.rob.set_freedrive(on)
         except Exception as e:                           # noqa: BLE001
             return "ERROR: could not turn freedrive %s: %s" % (args[0], e)
+        if not on:
+            # Freedrive can leave wrist 3 wound past its +/-360 limit (hand-
+            # rotating the wrist); unwind it now so the next commanded move does
+            # not protective-stop. Orientation is preserved. Best-effort.
+            try:
+                self.rob.unwind_wrist3_safe()
+            except Exception as e:                       # noqa: BLE001
+                print("PALmixerServer: wrist-3 unwind after freedrive failed: %s" % e)
         return "OK freedrive %s" % args[0]
 
     def _face_camera_down(self):
@@ -2187,7 +2216,14 @@ class PALmixerServer:
         if self.simulate:
             time.sleep(0.5)
             return "simulated motor tweak %s by %s" % (direction, step)
-        new_pos = self.motor.tweak(direction, step)
+        try:
+            new_pos = self.motor.tweak(direction, step)
+        except Exception:
+            # A rejected/failed jog may have moved partway. Do not retain an
+            # earlier slot as if it still described the current position.
+            state.update_carousel_slot_from_position(None)
+            raise
+        state.update_carousel_slot_from_position(new_pos)
         return "motor now at %s" % new_pos
 
     def _run_pump(self, op):

@@ -90,6 +90,11 @@ sample_on_mixer_station = []
 # these are the differences. The two poses' orientations agree to under
 # 0.0004 rad, which is why the fallback keeps the mixer cleaning station's.
 sample_on_mixer_offset = (-0.039548, -0.090382, 0.020180)
+# Seating the flowcell on the sample-on-mixer vial: approach from the +Y
+# (opposite) side at clearance height, slide -Y to directly over the seat, then
+# descend straight down. Never a sideways move at depth -- that drove the needle
+# into the vial wall. This is the +Y offset of the opposite-side approach point.
+SAMPLE_ON_MIXER_APPROACH_DY = 0.03
 needle_clear_height = 0.16
 # Absolute base-frame Z (gripper TCP) to lift to before swinging the arm around
 # the cell -- a safe travel height clear of everything on the bench. Unlike the
@@ -187,6 +192,14 @@ bump_approach_clearance = 0.03
 # bump travel short and consistent regardless of the camera standoff the search
 # left off at. See locate_apriltag.
 APRILTAG_BUMP_STANDOFF = 0.030
+# Stations where the camera is brought CLOSER before the bump, so put_tcp2camera
+# does not first lift the gripper to the full view standoff (apriltag_view_distance,
+# 0.2 m above the tag). Lifting that high at the sample table / cleaning station
+# over-reaches the UR3 (shorter reach) and protective-stops. After centring at the
+# normal standoff, the camera descends straight down to this smaller distance
+# (still centred), so the gripper's pre-bump high point is this low instead.
+LOW_REACH_STATIONS = ('sample_table', 'cleaning_station')
+APRILTAG_LOW_VIEW_DISTANCE = 0.10    # m above the tag for the stations above
 # The stations set down that way. Documentation rather than a lookup -- each
 # transport passes drop_by_bump itself, since it already knows which end it is
 # releasing at -- but the two places that do have to agree with each other, so
@@ -1966,10 +1979,43 @@ def measure_venton_tag(robot, tag_id):
     return _measure_tag_in_base(robot, tag_id, tags[tag_id]['size_m'])
 
 
+def _level_fit_from_points(source_mm, target_m):
+    """LEVEL fit from >=2 measured points: table normal = base +Z, the one free
+    rotation (yaw about Z) from the tag POSITIONS (a 2D rigid fit of the known
+    table (x,y) onto the measured base (x,y)). Returns a fit dict shaped like
+    table_frame_in_base's (origin_m, x_axis, y_axis, normal, scale, rmse_mm,
+    max_error_mm) plus method/yaw_deg. Two tags are enough once level."""
+    tc = _np.array([[s[0] / 1000.0, s[1] / 1000.0] for s in source_mm])
+    bc = _np.array([[t[0], t[1]] for t in target_m])
+    tcm, bcm = tc.mean(axis=0), bc.mean(axis=0)
+    tcc, bcc = tc - tcm, bc - bcm
+    if _np.linalg.norm(tcc) < 1e-9 or _np.linalg.norm(bcc) < 1e-9:
+        raise RuntimeError("the measured tags are coincident; cannot fit a yaw")
+    num = float(_np.sum(tcc[:, 0] * bcc[:, 1] - tcc[:, 1] * bcc[:, 0]))
+    den = float(_np.sum(tcc[:, 0] * bcc[:, 0] + tcc[:, 1] * bcc[:, 1]))
+    yaw = math.atan2(num, den)
+    c, s = math.cos(yaw), math.sin(yaw)
+    ox = float(bcm[0] - (c * tcm[0] - s * tcm[1]))
+    oy = float(bcm[1] - (s * tcm[0] + c * tcm[1]))
+    oz = float(_np.mean([t[2] for t in target_m]))
+    res = []
+    for i in range(len(source_mm)):
+        tx, ty = source_mm[i][0] / 1000.0, source_mm[i][1] / 1000.0
+        px, py = ox + c * tx - s * ty, oy + s * tx + c * ty
+        res.append(((px - target_m[i][0]) ** 2 + (py - target_m[i][1]) ** 2) ** 0.5)
+    rmse_mm = (sum(r * r for r in res) / len(res)) ** 0.5 * 1000.0
+    return {'origin_m': [ox, oy, oz], 'x_axis': [c, s, 0.0], 'y_axis': [-s, c, 0.0],
+            'normal': [0.0, 0.0, 1.0], 'scale': 1.0, 'rmse_mm': rmse_mm,
+            'max_error_mm': max(res) * 1000.0, 'method': 'level',
+            'yaw_deg': math.degrees(yaw)}
+
+
 def venton_fit_from_measurements(measurements, with_scale=True):
-    """Fit the table frame from {id: base_xyz} points collected one at a time
-    by measure_venton_tag. Needs >= 3 non-collinear tags. No residual guard:
-    the operator is iterating and sees rmse_mm in the reply to judge it."""
+    """Fit the table frame from {id: base_xyz} points collected one at a time by
+    measure_venton_tag. With >=3 non-collinear tags a full 6-DOF fit; with exactly
+    2 a LEVEL fit (normal = base +Z, yaw from the two positions) -- for the common
+    case where only two fiducials can be reached / seen (e.g. ID 12 and ID 13).
+    No residual guard: the operator is iterating and sees rmse_mm in the reply."""
     tags = venton_table_tags()
     source_mm, target_m, used = [], [], []
     for tid in sorted(measurements):
@@ -1981,10 +2027,14 @@ def venton_fit_from_measurements(measurements, with_scale=True):
         used.append({'id': tid, 'name': info['name'],
                      'table_xy_mm': info['table_xy_mm'],
                      'base_m': [round(float(v), 6) for v in measurements[tid]]})
-    if len(used) < 3:
-        raise RuntimeError("have %d measured tags; need 3 non-collinear "
-                           "(measure each with measure_venton_tag <id>)" % len(used))
-    fit = _calibration.table_frame_in_base(source_mm, target_m, with_scale=with_scale)
+    if len(used) >= 3:
+        fit = _calibration.table_frame_in_base(source_mm, target_m, with_scale=with_scale)
+    elif len(used) == 2:
+        fit = _level_fit_from_points(source_mm, target_m)   # 2-tag level fit
+    else:
+        raise RuntimeError("have %d measured tags; need 2 (level fit) or 3 "
+                           "(full fit) -- measure each with measure_venton_tag <id>"
+                           % len(used))
     fit['tags'] = used
     return fit
 
@@ -2739,10 +2789,24 @@ def activate_gripper(robot):
     transport routine calls this instead of robot.activate_gripper() directly.
     Call reset_gripper_activation() to force the next call to run it again.
     """
+    # Guard every transport against a wound wrist 3 (e.g. left wound by freedrive):
+    # unwind it into range before any move so it does not hit the +/-360 limit.
+    # Runs on every call (before the activation gate), only moves if wound.
+    try:
+        unwinder = getattr(robot, 'unwind_wrist3_safe', None)
+        if unwinder is not None:
+            unwinder()
+    except Exception as e:                               # noqa: BLE001
+        print("PAL12idb: wrist-3 unwind guard failed: %s" % e)
     global _gripper_activated_on
     if _gripper_activated_on is robot:
         return
     robot.activate_gripper()
+    # Set the grip force for ALL grabs (grab/close/carousel/full-close) from the
+    # config -- the Robotiq force persists on the controller once set.
+    force = _grab_force('grab_force', 150)
+    _set_gripper_force(robot, force)
+    print("PAL12idb: gripper grip force set to %d" % force)
     _gripper_activated_on = robot
 
 
@@ -2849,6 +2913,29 @@ def close_gripper_fully(robot):
     action(GRIPPER_CLOSE_COUNT)
 
 
+def _grab_force(name, default):
+    """A gripper force count (0-255) from the gripper config, or `default`."""
+    try:
+        v = _config.get_section('gripper').get(name)
+        return default if v is None else int(v)
+    except (TypeError, ValueError):
+        print("PAL12idb: ignoring non-integer gripper.%s" % name)
+        return default
+
+
+def _set_gripper_force(robot, force):
+    """Set the Robotiq grip force (count 0-255) for subsequent grabs. No-op on a
+    gripper that exposes no force setting (simulated / older)."""
+    gripper = getattr(robot, 'gripper', None)
+    setter = getattr(gripper, 'set_gripper_force', None)
+    if setter is None:
+        return
+    try:
+        setter(int(force))
+    except Exception as e:                              # noqa: BLE001
+        print("PAL12idb: could not set gripper force to %s: %s" % (force, e))
+
+
 def pickup(robot, height = needle_clear_height, open_extra_m = 0.0):
     """Descend, close on the piece, and lift clear.
 
@@ -2857,6 +2944,9 @@ def pickup(robot, height = needle_clear_height, open_extra_m = 0.0):
     where the fingers pass down either side of a flowcell standing in a deep
     seat and a wider gap is the difference between clearing it and nudging it.
     Zero everywhere else, which is the original release()-and-descend.
+
+    The grip force is the global one applied at activation (gripper.grab_force);
+    see activate_gripper.
     """
     open_gripper(robot, open_extra_m)
     # cm go deeper from the standard height
@@ -3684,13 +3774,22 @@ def flowcell_to_sample_on_mixer(robot):
     move_to_cleaningstation(robot, cleaning_station)
     _pickup_recovering(robot, 'cleaning_station', height=needle_clear_height,
                        open_extra_m=cleaning_station_open_extra())
-    approach = list(target)
-    approach[2] = target[2]-distance_gripper_tag+needle_clear_height
-    _move_leg(robot, approach, True)
-    # Half speed for the descent, as at the sample table: on the first press
-    # the target is a computed guess rather than a taught pose, and this is the
-    # leg that closes on it.
-    robot.moveto(target, acc=placement_accel, vel=placement_speed)
+    # Seat the flowcell WITHOUT sweeping the needle sideways at depth: approach
+    # from the +Y (opposite) side at clearance height, slide -Y to directly over
+    # the taught seat (still high), then descend straight down. A single approach
+    # directly above + descent could arrive at an angle and drag the needle in +Y
+    # into the vial wall.
+    clearance = needle_clear_height - distance_gripper_tag
+    opposite = list(target)
+    opposite[1] = target[1] + SAMPLE_ON_MIXER_APPROACH_DY   # +Y, opposite side
+    opposite[2] = target[2] + clearance                    # high
+    _move_leg(robot, opposite, True)                       # routed via the transfer point
+    over = list(target)
+    over[2] = target[2] + clearance                        # high, directly over the seat
+    # Half speed for the slide-in and descent, as at the sample table: on the
+    # first press the target is a computed guess rather than a taught pose.
+    robot.moveto(over, acc=placement_accel, vel=placement_speed)    # slide -Y over the seat
+    robot.moveto(target, acc=placement_accel, vel=placement_speed)  # straight down to the seat
 
 # after washing, raise the robot to the sample table's height so it is clear
 # of the cleaning station before the next command moves it elsewhere. Uses the
@@ -3889,6 +3988,32 @@ def _carousel_lift(robot):
     print("unload lift: after clear-lift  %s" % _pose_str(robot))
 
 
+def _carousel_goto(robot, target):
+    """Move to a carousel seat DIRECTLY, never via the transfer point.
+
+    The transfer point sits on the -Y (mixer) side of the cell. Routing the
+    carousel stock / used-stack legs (which are on +Y) through it sends the TCP
+    on a straight (movel) line across the base -- the line dips to Rxy ~0.20 m,
+    close enough to the shoulder that the arm folds in and protective-stops (seen
+    on the unload: it stopped at Rxy 0.17 m, elbow 153 deg). The three carousel
+    seats all sit at Rxy ~0.3-0.45 m, so a straight line *between* them stays at
+    Rxy >~0.32 m, well clear of the base -- going direct is both what the bench
+    needs and the safer path.
+
+    Lift straight up to the carry height first (straight up never approaches the
+    base, and it avoids the blind diagonal descent into a seat the old routing
+    guarded against), cross to directly over the target at that height and at the
+    target's heading, then come straight down onto it.
+    """
+    tgt = list(target)
+    now = robot.get_pos()
+    lift_z = max(now[2], tgt[2])
+    robot.moveto([now[0], now[1], lift_z])              # straight up at the current XY
+    above = [tgt[0], tgt[1], lift_z] + tgt[3:]          # over the seat, at height, target heading
+    robot.moveto(above)                                 # cross at height (Rxy stays clear of the base)
+    robot.moveto(tgt)                                   # straight down onto the seat
+
+
 def _look_for_used_stack_tag(robot):
     """Look over the used-carousel stack for a tag before unloading.
 
@@ -3907,11 +4032,10 @@ def _look_for_used_stack_tag(robot):
     clear_z = used[2] + CAROUSEL_CLEAR_LIFT
     used_over = list(used)
     used_over[2] = clear_z
-    # Route OVER the used stack via the transfer point -- never a blind descent at
-    # wherever the arm happens to be (that drove straight down into the mixer
-    # carousel and protective-stopped). The transfer point keeps it clear until it
-    # is above the stack, then it comes down to the look height.
-    move_via_transferpoint(robot, used_over)           # safely over the used-stack centre
+    # Go OVER the used stack directly (NOT via the transfer point): the
+    # transfer->used-stack leg crosses the base and protective-stops. _carousel_goto
+    # lifts clear first, so this is not a blind descent at wherever the arm is.
+    _carousel_goto(robot, used_over)                   # safely over the used-stack centre
     robot.put_camera2tcp()                             # camera onto that pose
     robot.camera.AT_physical_size = apriltag_size('carousel_used_stack')
     robot.camera.AT_preferred_id = apriltag_ids('carousel_used_stack')
@@ -3950,7 +4074,10 @@ def unload_current_carousel(robot):
     robot.set_tcp(robot.tcp)
     # Look over the used stack before grabbing: is there already a carousel there?
     stack_tag = _look_for_used_stack_tag(robot)
-    move_via_transferpoint(robot, list(get_station_position('carousel_on_mixer')))
+    # Go to the mixer carousel directly (NOT via the transfer point): from over the
+    # used stack, the transfer-point route swings the TCP across the base and
+    # protective-stops. Direct, the two +X seats stay clear of the base.
+    _carousel_goto(robot, list(get_station_position('carousel_on_mixer')))
     robot.mvr2z(CAROUSEL_LOOK_LIFT)
     # Put the CAMERA over the carousel centre (not just face it down in place):
     # the gripper is over the centre now, so put_camera2tcp moves the camera onto
@@ -4068,6 +4195,12 @@ def place_new_carousel(robot):
     print("place seating: after retract %s" % _pose_str(robot))
     # Record which carousel is now on the mixer (overrides the @_tracks default).
     state.set_carousel_on_mixer(tag)
+    # Park the arm at the transport (transfer) position so the swap ends at a
+    # neutral pose. From the mixer seat this is a same-side (-Y) move, so it stays
+    # clear of the base -- unlike the transfer<->used-stack leg that is kept out of
+    # the carousel paths.
+    robot.moveto(get_transfer_point())
+    print("place: parked at transport position %s" % _pose_str(robot))
     return list(robot.get_pos())
 
 
@@ -4238,27 +4371,32 @@ def put_camera_to_tcp(robot):
 
     The arm translates by the camera offset; it does not reorient. Since the
     tool is normally face-down, the camera ends up face-down too, which is why
-    this is also how a search makes the camera level. Leaves the gripper TCP
-    active (robUR.put_camera2tcp), so a pose read afterwards is the tool's.
+    this is also how a search makes the camera level.
 
-    Exposed as a button because "start from the current position" needs the
-    camera already looking down before it will search without reorienting:
-    this is how the operator gets it there.
+    After the move, the CAMERA TCP is left active (set_tcp(camtcp)): the button
+    is for lining the camera up on something, so a pose read afterwards should
+    be the camera's, and "start from the current position" searches through the
+    camera TCP. The move itself (robUR.put_camera2tcp) leaves the gripper TCP
+    active, so we switch to the camera TCP once the default procedure is done.
     """
     robot.put_camera2tcp()
+    robot.set_tcp(robot.camtcp)                         # leave the camera TCP active
     return list(robot.get_pos())
 
 def put_tcp_to_camera(robot):
     """Move the gripper tip onto the pose the camera occupies now.
 
     The inverse of put_camera_to_tcp, and the way back after one: having lined
-    the camera up on something, this brings the tool to that same spot. Leaves
-    the camera TCP active (robUR.put_tcp2camera), which is what the caller
-    wants while still looking through it -- every PALmixer transport asserts
-    robot.tcp before it moves, so a camera TCP left live here cannot leak into
-    one.
+    the camera up on something, this brings the tool to that same spot.
+
+    After the move, the GRIPPER TCP is left active (set_tcp(robot.tcp)): the
+    button hands control back to the tool, so a pose read afterwards is the
+    tool's and the next transport starts from the gripper frame. The move
+    itself (robUR.put_tcp2camera) leaves the camera TCP active, so we switch
+    back to the gripper TCP once the default procedure is done.
     """
     robot.put_tcp2camera()
+    robot.set_tcp(robot.tcp)                            # leave the gripper TCP active
     return list(robot.get_pos())
 
 def goto_station(robot, pos):
@@ -4609,6 +4747,17 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
     # tag's mounting offset (apriltag_rz_offset) itself -- see
     # camera_tools.search_apriltag_by_tilt -- so nothing to undo here.
     #
+    # Low-reach stations (UR3): bring the camera closer now, while it is still
+    # centred, so put_tcp2camera below does not first lift the gripper to the full
+    # view standoff (0.2 m above the tag) -- lifting that high at the sample table /
+    # cleaning station protective-stops the UR3. The descent is straight down, so
+    # the tag stays centred; the bump still feels the real surface, so the recorded
+    # Z is unchanged (only the approach height is lower).
+    if pos in LOW_REACH_STATIONS:
+        print("Bringing the camera closer (%.0f mm) before the bump for %s "
+              "(low-reach)...." % (APRILTAG_LOW_VIEW_DISTANCE * 1000, pos))
+        descend_to_apriltag(robot, distance=APRILTAG_LOW_VIEW_DISTANCE,
+                            stop_event=stop_event)
     # Remember the (calibrated) camera-to-tag distance now, while it is fresh from
     # centring; then put the gripper over the tag and come straight down to
     # APRILTAG_BUMP_STANDOFF (30 mm) above the tag surface before bumping, so the

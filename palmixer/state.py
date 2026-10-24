@@ -263,6 +263,29 @@ def set_carousel_slot(slot):
     _set(_TRACKING, "carousel_slot", int(slot))
 
 
+def update_carousel_slot_from_position(position):
+    """Track an aligned slot from motor readback, including reverse numbering.
+
+    Fractional-slot jogs, missing calibration, and failed position reads cannot
+    identify a holder at the mixing position, so clear the previous slot label.
+    """
+    slot = UNKNOWN
+    reference = carousel_reference()
+    step = get_carousel_step()
+    size = get_carousel_size()
+    if reference is not None and step != UNKNOWN and size != UNKNOWN and not carousel_reference_stale():
+        try:
+            offset = (float(position) - reference[1]) / step
+            whole_slots = round(offset)
+            # Allow floating-point readback noise, not partial-slot alignment.
+            if abs(offset - whole_slots) <= 1e-6:
+                slot = (reference[0] - 1 + whole_slots) % size + 1
+        except (TypeError, ValueError, OverflowError):
+            pass
+    _set(_TRACKING, "carousel_slot", slot)
+    return slot
+
+
 # -- carousel geometry (configuration, not state) ---------------------------
 # Read from json/palmixer_config.json on every call rather than cached, so
 # editing the file and restarting only the *server* is enough -- and so a test
@@ -366,7 +389,7 @@ def carousel_reference():
 
 def teach_carousel_slot(slot, position):
     """Record ``position`` (motor engineering units) as carousel slot ``slot``,
-    and with it the position of every other slot.
+    and with it the position of every other slot and the current slot.
 
     Teaching a second slot does not add to a table -- it replaces the
     reference, re-locating the whole carousel from the slot just taught."""
@@ -382,6 +405,9 @@ def teach_carousel_slot(slot, position):
         parser.set(_CAROUSEL, "ref_slot", str(ref_slot))
         parser.set(_CAROUSEL, "ref_position", repr(float(position)))
         parser.set(_CAROUSEL, "ref_carousel_id", "" if mounted == UNKNOWN else mounted)
+        if not parser.has_section(_TRACKING):
+            parser.add_section(_TRACKING)
+        parser.set(_TRACKING, "carousel_slot", str(ref_slot))
     _mutate(apply)
 
 

@@ -384,10 +384,16 @@ def test_discard_refused_while_mixer_or_cleanup_is_busy(tmp_path):
 
 
 @pytest.mark.parametrize("step", [4500, -4500])
-def test_preparation_target_is_absolute_and_updates_slot_at_mixer(tmp_path, monkeypatch, step):
+@pytest.mark.parametrize("load_slot,position_slot", [
+    (1, 13), (2, 14), (3, 15), (4, 16), (5, 1), (8, 4), (16, 12),
+])
+def test_preparation_positions_offset_slot_on_ring(tmp_path, monkeypatch, step, load_slot, position_slot):
     from palmixer import state
     moved, tracked = [], []
-    wf = Workflows(None, None, None, SimpleNamespace(check_in_range=lambda p: None, move_to=moved.append))
+    def move_to(position):
+        assert tracked == []  # Do not claim the target slot before motion completes.
+        moved.append(position)
+    wf = Workflows(None, None, None, SimpleNamespace(check_in_range=lambda p: None, move_to=move_to))
     c = PreparationCoordinator(tmp_path / "state.json",
                                lambda p: wf.position_for_preparation(p, offset_steps=-4), lambda p: None)
     wf.preparation = c
@@ -399,10 +405,11 @@ def test_preparation_target_is_absolute_and_updates_slot_at_mixer(tmp_path, monk
     monkeypatch.setattr(state, "require_carousel_step", lambda: step)
     monkeypatch.setattr(state, "get_carousel_size", lambda: 16)
     monkeypatch.setattr(state, "set_carousel_slot", tracked.append)
-    a = binding(2)
+    a = binding(load_slot)
     c.queue(a)
     c.open_initial(a["placement_id"])
     c.wait()
-    assert moved == [100 - 3 * step]
-    assert tracked == [14]
+    assert moved == [100 + (position_slot - 1) * step]
+    assert tracked == [position_slot]
+    assert c.get(a["placement_id"])["phase"] == "slot_ready"
     c.close()

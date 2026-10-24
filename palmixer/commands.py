@@ -397,6 +397,8 @@ FREEDRIVE_OFF = "off"
 MOTOR_TWEAK = "motor_tweak"
 MOTOR_FORWARD = "forward"
 MOTOR_REVERSE = "reverse"
+MOVE_TO_PAL_LOADING = "move_to_pal_loading"
+MOVE_TO_MIXING = "move_to_mixing"
 
 PUMP = "pump"
 
@@ -873,6 +875,16 @@ def freedrive_command(on):
 def motor_tweak_command(direction, step):
     """Build the wire command for a motor tweak in ``direction`` by ``step``."""
     return "%s %s %s" % (MOTOR_TWEAK, direction, step)
+
+
+def move_to_pal_loading_command(target_slot):
+    """Position the target sample slot for PAL loading, applying its offset."""
+    return "%s %s" % (MOVE_TO_PAL_LOADING, target_slot)
+
+
+def move_to_mixing_command(target_slot):
+    """Position the sample's own slot at the mixer without an offset."""
+    return "%s %s" % (MOVE_TO_MIXING, target_slot)
 
 
 def pump_command(op):

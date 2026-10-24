@@ -147,8 +147,11 @@ def test_unload_sequence(stations, quiet_camera, tmp_state, monkeypatch):
     kinds = _kinds(rob.log)
     # look-lift, grab, lift(up/diag/up), carry over used stack, bump, release, back up.
     # The drop opens as soon as it bumps -- no forcing further down onto the stack.
+    # The three leading moveto are _carousel_goto to the mixer carousel: lift
+    # straight up, across at height, straight down -- DIRECT, not via the transfer
+    # point (that route crosses the base and protective-stops).
     n = len(PAL12idb.CAROUSEL_SLIDE_STEPS)
-    assert kinds == ["moveto", "mvr2z", "put_camera2tcp", "grab", "mvr2z"] +                     ["translate"] * n + ["mvr2z", "moveto", "bump", "release", "moveto"]
+    assert kinds == ["moveto", "moveto", "moveto", "mvr2z", "put_camera2tcp", "grab", "mvr2z"] +                     ["translate"] * n + ["mvr2z", "moveto", "bump", "release", "moveto"]
     assert kinds.index("release") == kinds.index("bump") + 1   # open right after the bump
     # the two carries are planar over the used stack at the clear height
     moves = [e for e in rob.log if e[0] == "moveto"]
@@ -173,7 +176,10 @@ def test_unload_stacks_on_an_existing_used_carousel(stations, quiet_camera, tmp_
     PAL12idb.unload_current_carousel(rob)
     kinds = _kinds(rob.log)
     n = len(PAL12idb.CAROUSEL_SLIDE_STEPS)
-    assert kinds == ["moveto", "mvr2z", "put_camera2tcp", "grab", "mvr2z"] +                     ["translate"] * n + ["mvr2z", "moveto", "moveto", "bump", "release", "moveto"]
+    # Three leading moveto: _carousel_goto to the mixer carousel (direct, not via
+    # the transfer point). _look_for_used_stack_tag is mocked, so its own direct
+    # goto does not appear here.
+    assert kinds == ["moveto", "moveto", "moveto", "mvr2z", "put_camera2tcp", "grab", "mvr2z"] +                     ["translate"] * n + ["mvr2z", "moveto", "moveto", "bump", "release", "moveto"]
     assert kinds.index("release") == kinds.index("bump") + 1   # open right after the bump
     moves = [e for e in rob.log if e[0] == "moveto"]
     # over the found tag's X,Y (the two seating moves and the back-up)
@@ -210,8 +216,9 @@ def test_place_sequence_and_reverse_diagonal(stations, quiet_camera, tmp_state, 
     PAL12idb.place_new_carousel(rob)
     kinds = _kinds(rob.log)
     n = len(PAL12idb.CAROUSEL_SLIDE_STEPS)
+    # Trailing "moveto" is the park at the transport (transfer) position.
     assert kinds == ["moveto", "moveto", "put_camera2tcp", "grab", "mvr2z",
-                     "moveto", "moveto"] + ["translate"] * n + ["bump", "release", "mvr2z"]
+                     "moveto", "moveto"] + ["translate"] * n + ["bump", "release", "mvr2z", "moveto"]
     # the landing retraces the unload lift's segments in reverse (reversed order,
     # each +X / -Z) -- so it mirrors the lift trajectory.
     steps = PAL12idb.CAROUSEL_SLIDE_STEPS
@@ -227,7 +234,8 @@ def test_place_sequence_and_reverse_diagonal(stations, quiet_camera, tmp_state, 
     surface = mixer[2] - PAL12idb.CAROUSEL_TEACH_BACKOFF
     net_under = PAL12idb.CAROUSEL_GRAB_UNDER - PAL12idb.CAROUSEL_BUMP_LIFT
     start_z = surface + tdz + PAL12idb.CAROUSEL_SNAP_LIFT - net_under
-    start = [e for e in rob.log if e[0] == "moveto"][-1]
+    # [-1] is now the transport-position park; the down-to-start is [-2].
+    start = [e for e in rob.log if e[0] == "moveto"][-2]
     assert start[1][0] == pytest.approx(mixer[0] - tdx, abs=1e-6)  # back along -X for the slide
     assert start[1][1] == pytest.approx(mixer[1])
     assert start[1][2] == pytest.approx(start_z, abs=1e-6)  # the stand-off start before the landing
@@ -249,7 +257,8 @@ def test_place_reuses_the_measured_mixer_seat(stations, quiet_camera, tmp_state,
     tdx = PAL12idb.CAROUSEL_SLIDE_TOTAL_DX
     tdz = PAL12idb.CAROUSEL_SLIDE_TOTAL_DZ
     net_under = PAL12idb.CAROUSEL_GRAB_UNDER - PAL12idb.CAROUSEL_BUMP_LIFT
-    start = [e for e in rob.log if e[0] == "moveto"][-1]
+    # [-1] is now the transport-position park; the down-to-start is [-2].
+    start = [e for e in rob.log if e[0] == "moveto"][-2]
     assert start[1][0] == pytest.approx(seat[0] - tdx, abs=1e-6)  # start X back along -X from the MEASURED seat X
     assert start[1][1] == pytest.approx(seat[1])           # measured seat Y
     assert start[1][2] == pytest.approx(                   # anchored on the measured surface Z

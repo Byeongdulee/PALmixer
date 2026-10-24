@@ -182,6 +182,8 @@ that call. See the docstring in `_winenv.py`.
 | `push_positions` / `pull_positions` | worker | Sync taught positions with the EPICS waypoint PVs (see below) |
 | `mixer2cleaningstation` etc. (8 names) | worker | Run the matching `PAL12idb` transport function |
 | `motor_tweak forward\|reverse <step>` | worker | Tweak `12idb:m6` by `step` |
+| `move_to_pal_loading <target_sample_slot>` | worker | Position a sample slot for PAL loading using the configured preparation offset. Requires the mixer head and selected flowcell at their cleaning stations; refused during coordinated preparation |
+| `move_to_mixing <target_sample_slot>` | worker | After PAL clears the carousel, position the sample's own slot at the mixer with no offset. Rotates only; does not mix. Has the same standalone clearance and coordination checks as `move_to_pal_loading` |
 | `pump mix\|clean_mixer\|draw_to_flowcell\|aspirate_from_flowcell\|wash_flowcell\|shake_sample` | worker | Run a pump operation (ZMQ to apssector12_pump_control). `shake_sample` cycles the sample inside the flowcell in use -- `flow2_sample` for flowcell 1, `flow3_sample` for flowcell 2, since that server names the device in the command rather than as an argument. The Automation tab's **Shake Sample** button; the other five are the Experiment tab's Pump row |
 | `stop_pump` | fast | End an active `shake_sample` cycle now (sends the flowcell server's `stop_shaking`, not its plainer `stop` -- see [Pump concurrency](#pump-concurrency)). Fast and ungated by the busy flag, because the point is to reach a pump operation that is running -- exactly when a worker command would be refused; `Pump` sends it on a socket the running op is not holding. Does nothing to an unrelated draw/wash/aspirate. The Automation tab's **Stop Shake** button, which stays enabled while the server is BUSY |
 | `set_mixing_speed <rpm>` | fast | The speed the next `mix` runs at. Bounds-checked against `pump.min_rpm`/`max_rpm`; refused while an action is running |
@@ -767,6 +769,39 @@ is the quickest way to catch a wrong `step`.
 
 A reference for a slot outside the configured size (a differently-sized
 carousel was configured since) reads as untaught rather than being trusted.
+
+The Forward/Reverse jog buttons update the current slot from the returned motor
+position and the taught reference. The signed `carousel.step` determines slot
+numbering, with wraparound from 1 to `size`. A jog ending between slots shows
+`unknown` until the motor reaches an aligned slot or you use Set Current Position.
+Failed jogs also clear the old slot label because the motor may have moved partway.
+
+**PAL preparation position.** Coordinated loading uses
+`carousel.preparation_offset_steps` to select the slot to position at the mixer
+reference, wrapping within `1..size` before looking up its taught motor position.
+For the 16-slot carousel and offset `-4`, loading sample slot 8 positions slot 4;
+loading slot 16 positions slot 12; loading slots 1 through 4 positions slots 13
+through 16. The motor moves to that slot's absolute position from wherever it
+currently stands. The tracked carousel slot is updated after motion completes;
+the sample remains assigned to its original loading slot.
+
+Call `workflows.move_to_pal_loading(target_slot)` or send the ZMQ command
+`move_to_pal_loading 8` (positions slot 4 with the configured `-4` offset).
+The argument is the sample's slot number, not a motor count or the offset slot.
+The function waits for rotation to finish and returns the absolute motor target.
+The coordinated preparation scheduler uses the same motor operation after its
+own clearance and holder-reservation checks. Standalone calls require the mixer
+head and selected flowcell at their cleaning stations; this command only rotates
+the carousel and does not move either robot or dispense liquid.
+
+After PAL finishes loading and clears the carousel, call
+`workflows.move_to_mixing(target_slot)` or send `move_to_mixing 8`. This moves
+sample slot 8 to its own mixing position and records current slot 8, with no
+preparation or drawing offset. For example: `move_to_pal_loading(8)` positions
+slot 4, PAL dispenses and withdraws, then `move_to_mixing(8)` positions slot 8.
+The automatic coordinated `make_sample` workflow already performs this zero-offset
+rotation before bringing the mixer head down; it starts only after PALsystem has
+accepted ChemLab's matching carousel-clear milestone.
 
 **Soft limits.** Every slot position, and the post-mix advance, must be inside
 the motor's `.LLM`/`.HLM`. The EPICS motor record does **not** report a refusal

@@ -10,8 +10,8 @@
     "beamline": "12idb"
   },
   "robot": {
-    "name": "UR5",
-    "ip": "UR5-12idc.xray.aps.anl.gov",
+    "name": "UR3",
+    "ip": "UR3-12idb.xray.aps.anl.gov",
     "ur12idb_path": {
       "linux": "/home/beams15/S12STAFF/python_codes/UR_12idb",
       "windows": "C:/Users/s12idb/Documents/GitHub/UR_12idb"
@@ -29,7 +29,8 @@
     "release_count": 120,
     "cleaning_station_open_extra_m": 0.0,
     "mixer_head_open_extra_m": 0.01,
-    "carousel_open_extra_m": 0.05
+    "carousel_open_extra_m": 0.05,
+    "grab_force": 200
   },
   "charuco": {
     "dictionary": "DICT_4X4_100",
@@ -41,7 +42,7 @@
   },
   "carousel": {
     "size": 16,
-    "step": 4500,
+    "step": -4500,
     "draw_offset_steps": 4,
     "preparation_offset_steps": -4,
     "radius_mm": 50.0,

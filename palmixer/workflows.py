@@ -119,7 +119,7 @@ the robot.
 import threading
 import time
 
-from . import state
+from . import config, state
 # Imported as a bare name rather than through the module, because `pump` is
 # also the name of a constructor argument and an attribute here.
 from .pump import server_for as _pump_server_for
@@ -641,17 +641,74 @@ class Workflows:
         record = self.preparation.get(binding["placement_id"])
         if record["binding"] != binding or record["phase"] != "positioning":
             raise WorkflowError("The placement does not own preparation positioning")
-        if type(offset_steps) is not int:
-            raise WorkflowError("Configure the preparation station offset explicitly")
         state.validate_slot(binding["slot"])
         if state.get_carousel_id() != binding["carousel_id"] or state.carousel_reference_stale():
             raise WorkflowError("Mounted carousel/reference does not match the placement")
+        return self._move_to_pal_loading(binding["slot"], offset_steps)
+
+    def _check_pal_loading(self, target_slot):
+        return self._check_carousel_position(
+            target_slot, config.get_section("carousel").get("preparation_offset_steps"))
+
+    def _check_mixing_position(self, target_slot):
+        return self._check_carousel_position(target_slot, 0)
+
+    def _check_carousel_position(self, target_slot, offset_steps):
+        if self.preparation is not None:
+            raise WorkflowError("Coordinated preparation owns carousel positioning")
+        self._check_make_sample(target_slot)
+        return self._pal_loading_target(target_slot, offset_steps)
+
+    def _pal_loading_target(self, target_slot, offset_steps):
+        if type(target_slot) is not int:
+            raise WorkflowError("Target sample slot must be an integer")
+        state.validate_slot(target_slot)
+        if type(offset_steps) is not int:
+            raise WorkflowError("Configure the preparation station offset explicitly")
+        if state.carousel_reference_stale():
+            raise WorkflowError("Mounted carousel/reference does not match the placement")
         if state.get_mixer_head() != state.MIXER_AT_CLEANING:
             raise WorkflowError("The existing mixer-head removal has not completed")
-        target = state.slot_position(binding["slot"]) + offset_steps * state.require_carousel_step()
-        self.motor.check_in_range(target)
-        self.motor.move_to(target)
-        state.set_carousel_slot((binding["slot"] - 1 + offset_steps) % state.get_carousel_size() + 1)
+        # Position the offset holder on the carousel's numbered ring. For 16
+        # holders and offset -4: load 8 -> position 4, load 16 -> position 12,
+        # and load 1 -> position 13. Resolve the wrapped slot through the same
+        # taught reference used for ordinary carousel positioning.
+        position_slot = (target_slot - 1 + offset_steps) % state.get_carousel_size() + 1
+        target = state.slot_position(position_slot)
+        return position_slot, target
+
+    def move_to_pal_loading(self, target_slot):
+        """Position a sample slot for PAL loading using the configured offset.
+
+        For a 16-slot carousel with offset -4, target_slot=8 positions slot 4
+        at the mixer reference. Requires the mixer head and selected flowcell
+        at their cleaning stations. Returns the absolute motor target.
+        """
+        self._check_pal_loading(target_slot)
+        return self._move_to_pal_loading(
+            target_slot, config.get_section("carousel").get("preparation_offset_steps"))
+
+    def move_to_mixing(self, target_slot):
+        """After PAL clears the carousel, position the sample slot without offset.
+
+        This rotates only: it does not start mixing. For sample slot 8, the
+        carousel moves from its PAL loading position (slot 4) to slot 8.
+        """
+        self._check_mixing_position(target_slot)
+        position_slot, target = self._pal_loading_target(target_slot, 0)
+        return self._move_carousel_to(position_slot, target)
+
+    def _move_to_pal_loading(self, target_slot, offset_steps):
+        """Shared motor operation for standalone and coordinated loading."""
+        position_slot, target = self._pal_loading_target(target_slot, offset_steps)
+        return self._move_carousel_to(position_slot, target)
+
+    def _move_carousel_to(self, position_slot, target):
+        """Wait for the requested position before updating the tracked slot."""
+        if not self.simulate:
+            self.motor.check_in_range(target)
+            self.motor.move_to(target)
+        state.set_carousel_slot(position_slot)
         return target
 
     def _make_sample(self, slot, sample_id=None, on_lift_complete=None):
@@ -777,8 +834,9 @@ class Workflows:
         # otherwise notice going wrong -- see Motor.check_in_range.
         self.motor.check_in_range(
             target_position + _draw_offset_steps() * state.require_carousel_step())
-        self.motor.move_to(target_position)
-        state.set_carousel_slot(slot)
+        # make_sample returns the prepared sample to its own mixing slot:
+        # target_position is slot_position(slot), with no PAL loading offset.
+        self._move_carousel_to(slot, target_position)
         return "carousel at slot %s (%.4f)" % (slot, target_position)
 
     def _advance_carousel(self, slot, mixed_position):
