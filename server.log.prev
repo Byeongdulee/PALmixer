@@ -1,0 +1,48 @@
+PALmixerServer: UR3 at UR3-12idb.xray.aps.anl.gov, tool TCP [0.0, 0.0, 0.15, 0.0, 0.0, 0.0]
+PAL12idb: applied calibrated focal length 671.5 px (was assumed ~810) to the camera; distance measurements now use it.
+PALmixerServer: AT distance correction scale=1.0529 offset=-0.0287 m
+PALmixerServer: shoulder joint guard = -150.0 deg
+PAL12idb: gripper grip force set to 200
+PALmixerServer: gripper activated
+WARNING: MQTT connect failed ([WinError 10061] No connection could be made because the target machine actively refused it); telemetry disabled
+ZMQ command server listening on tcp://*:9880
+PALmixer server running. Press Ctrl+C to stop.
+unload: found a carousel on the used stack, tag distance 0.1796 m -- will stack on top
+unload lift: after snap-lift   [0.4611, -0.1182, -0.2797, 3.1404, 0.0078, -0.0000]
+unload lift: after slide-out   [0.4612, -0.1364, -0.2681, 3.1406, 0.0078, -0.0002]
+unload lift: after clear-lift  [0.4613, -0.1365, -0.1480, 3.1404, 0.0078, 0.0002]
+unload stack: over the tag [0.1902, 0.3823, -0.0176, 2.6631, 1.6660, 0.0001]
+unload stack: 100 mm above the tag [0.1902, 0.3823, -0.1516, 2.6631, 1.6660, -0.0004]
+unload stack: after bump [0.1902, 0.3823, -0.2089, 2.6629, 1.6662, -0.0002]
+AprilTag is 0.1596 m from the camera (target 0.2000 m).
+AprilTag is 0.2084 m from the camera (target 0.2000 m).
+AprilTag is 0.1963 m from the camera (target 0.2000 m).
+AprilTag is 0.2017 m from the camera (target 0.2000 m).
+PAL12idb: carousel load approach to carousel_in_stock -- tag distance was 0.1627 m, reached 0.2017 m, 0.1997 m after re-centre
+place seating: after carry-above [0.4611, -0.1364, -0.0178, 3.1410, 0.0051, -0.0003]
+place seating: after down-to-start [0.4611, -0.1364, -0.2681, 3.1410, 0.0049, -0.0003]
+place seating: after slide-in landing [0.4610, -0.1182, -0.2798, 3.1410, 0.0048, -0.0003]
+place seating: after bump [0.4612, -0.1182, -0.2828, 3.1408, 0.0049, 0.0006]
+place seating: after release [0.4612, -0.1183, -0.2829, 3.1407, 0.0049, 0.0007]
+place seating: after retract [0.4612, -0.1183, -0.1628, 3.1406, 0.0050, 0.0010]
+place: parked at transport position [0.2069, -0.1876, 0.0816, -2.5992, 1.7644, 0.0005]
+PALmixerServer: action 'tweak_position x 50.0 mm' failed: Protective stopped
+taught sample_on_mixer_station at [0.5401183045487835, -0.13294895585661323, -0.12785086577692717, 2.192415009997169, -2.2495588322288533, -1.6373271858226022e-06]
+PALmixerServer: action 'flowcell_to_sample_on_mixer' failed: SafetyStatus.SAFETY_STATUS_PROTECTIVE_STOP
+PALmixerServer: action 'goto_transfer_point' failed: Protective stopped
+PALmixerServer: action 'tweak_position y -50.0 mm' failed: Protective stopped
+PALmixerServer: action 'tweak_position x -50.0 mm' failed: SafetyStatus.SAFETY_STATUS_PROTECTIVE_STOP
+taught sample_on_mixer_station at [0.4200583213516693, -0.13292583731824023, -0.12772012669673036, 2.1926245365855688, -2.2498194422113973, -4.4993574866681846e-05]
+taught sample_on_mixer_station at [0.43998652772901703, -0.1228916025209907, -0.20775074226308854, 2.192417764923798, -2.249814241478713, -0.00045443244203455875]
+taught sample_on_mixer_station at [0.43999003004469933, -0.1228026152740428, -0.13780087273776093, -2.1926472036993263, 2.249807678169176, 0.0007334678114439176]
+taught sample_on_mixer_station at [0.43599395359790816, -0.11784682796396005, -0.13279989052667926, -2.1923136259166522, 2.2500115716940883, 0.0007443828034150828]
+PAL12idb: sample-table motor positioning is off; not moving sth/sav/stv.
+PAL12idb: sample-table motor positioning is off; not moving sth/sav/stv.
+PALmixerServer: action 'return_sample' failed: object of type 'PositionVector' has no len()
+PAL12idb: sample-table motor positioning is off; not moving sth/sav/stv.
+PAL12idb: sample-table motor positioning is off; not moving sth/sav/stv.
+PAL12idb: sample-table motor positioning is off; not moving sth/sav/stv.
+Realtime monitor lost the 30003 stream (timed out); reconnecting.
+Error the controller failed to send us a packet: time since last packet 3.0740000000223517 s 
+Realtime monitor lost the 30003 stream (timed out); reconnecting.
+Error the controller failed to send us a packet: time since last packet 3.2380000001285225 s 
