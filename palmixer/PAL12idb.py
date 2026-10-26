@@ -914,7 +914,8 @@ def _venton_classify(tags, vframe, tol_m=0.015):
     if best is not None:
         cid = best[1]
         cxyz = list(tags[cid]['xyz'])
-        sxyz = [cxyz[0], cxyz[1] + SAMPLE_OFFSET_Y, cxyz[2]]
+        sdx, sdy = _table_to_base_xy(0.0, SAMPLE_OFFSET_Y)
+        sxyz = [cxyz[0] + sdx, cxyz[1] + sdy, cxyz[2]]
     for t in sorted(tags):
         if t in head_ids:
             v = _to_venton_frame(tags[t]['xyz'], vframe)
@@ -1001,7 +1002,7 @@ def locate_mixer_carousel(robot, base_from=-100.0, base_to=20.0):
     tag; a carousel tag (31-40) within MIXER_CAROUSEL_MATCH_TOL of (mixer head +
     that offset) is taken as the one on the mixer. Its tag centre is stored
     (state.set_carousel_mixer_seat) so sample calcs reuse it, and the sample is
-    SAMPLE_OFFSET_Y along base +Y from the centre. No robot move beyond the scan.
+    SAMPLE_OFFSET_Y along table +Y from the centre. No robot move beyond the scan.
 
     Returns {'tags', 'mixer_carousel_id', 'carousel_xyz', 'sample_xyz',
     'summary'}. mixer_carousel_id is None (and nothing is stored) when no carousel
@@ -1070,8 +1071,9 @@ def locate_mixer_carousel(robot, base_from=-100.0, base_to=20.0):
     # Nearest carousel to any mixer-head expected point (head + offset). Checking
     # both 25 and 26 is robust to which mixer-head tag the raster happened to see.
     best = None   # (dist, car_id, head_id)
+    odx, ody = _table_to_base_xy(MIXER_CAROUSEL_DX, MIXER_CAROUSEL_DY)
     for ht, (hx, hy, _hz) in heads.items():
-        ex, ey = hx + MIXER_CAROUSEL_DX, hy + MIXER_CAROUSEL_DY
+        ex, ey = hx + odx, hy + ody
         for ct, (cx, cy, _cz) in cars.items():
             d = math.hypot(cx - ex, cy - ey)
             if best is None or d < best[0]:
@@ -1080,13 +1082,14 @@ def locate_mixer_carousel(robot, base_from=-100.0, base_to=20.0):
     if dist <= MIXER_CAROUSEL_MATCH_TOL:
         cx, cy, cz = tags[cid]['xyz']
         state.set_carousel_mixer_seat([cx, cy, cz])
-        sx, sy, sz = cx, cy + SAMPLE_OFFSET_Y, cz
+        sdx, sdy = _table_to_base_xy(0.0, SAMPLE_OFFSET_Y)
+        sx, sy, sz = cx + sdx, cy + sdy, cz
         result.update(mixer_carousel_id=cid, carousel_xyz=[cx, cy, cz],
                       sample_xyz=[sx, sy, sz])
         lines.append("carousel ON THE MIXER: tag %d at (%.4f, %.4f, %.4f) m "
                      "(%.1f mm from mixer-head %d + offset) -- stored as the "
                      "carousel seat." % (cid, cx, cy, cz, dist * 1000, hid))
-        lines.append("sample position (tag + %.0f mm +Y): (%.4f, %.4f, %.4f) m"
+        lines.append("sample position (tag + %.0f mm table +Y): (%.4f, %.4f, %.4f) m"
                      % (SAMPLE_OFFSET_Y * 1000, sx, sy, sz))
     else:
         lines.append("no carousel within %.0f mm of the expected mixer offset "
@@ -2496,6 +2499,43 @@ def record_current_transfer_point(robot):
     return store_transfer_point(pose)
 
 
+# The carousel safe Z: the lowest height (gripper TCP, base frame) a carousel
+# swap may cross the cell at between the mixer, stock and used-stack seats. Kept
+# in waypoints.ini beside the transfer point. Untaught -> None, and the carousel
+# legs use their own station-relative clearance (CAROUSEL_CLEAR_LIFT) alone.
+_CAROUSEL_SAFE_Z_SECTION = 'carousel_safe_z'
+
+
+def get_carousel_safe_z():
+    """The taught carousel safe Z (m), or None if not taught. Read live, like
+    get_transfer_point, so a re-teach takes effect without a restart."""
+    parser = configparser.ConfigParser()
+    parser.read(_INI_PATH)
+    try:
+        return parser.getfloat(_CAROUSEL_SAFE_Z_SECTION, 'z')
+    except (ValueError, configparser.Error):
+        return None
+
+
+def store_carousel_safe_z(z):
+    """Persist the carousel safe Z to waypoints.ini, merging so the station
+    positions beside it survive."""
+    parser = configparser.ConfigParser()
+    parser.read(_INI_PATH)
+    if not parser.has_section(_CAROUSEL_SAFE_Z_SECTION):
+        parser.add_section(_CAROUSEL_SAFE_Z_SECTION)
+    parser.set(_CAROUSEL_SAFE_Z_SECTION, 'z', repr(float(z)))
+    with open(_INI_PATH, 'w') as fp:
+        parser.write(fp)
+    return float(z)
+
+
+def record_current_carousel_safe_z(robot):
+    """Record the arm's current Z (gripper TCP) as the carousel safe Z."""
+    robot.set_tcp(robot.tcp)
+    return store_carousel_safe_z(robot.get_pos()[2])
+
+
 # -- EPICS waypoint sync -------------------------------------------------------
 # The only two functions here that do Channel Access on the waypoint PVs.
 # Both are operator-initiated (Configuration tab), never part of a move.
@@ -3812,19 +3852,35 @@ CAROUSEL_STACK_ABOVE = 0.100         # unload: stand this far above a found used
 # Identify which carousel is on the mixer from a raster scan: the carousel-on-
 # mixer tag sits this far from the mixer-head tag, and a carousel tag must land
 # within MIXER_CAROUSEL_MATCH_TOL of that expected point to count. The sample on
-# that carousel is SAMPLE_OFFSET_Y along base +Y from the carousel tag centre.
+# that carousel is SAMPLE_OFFSET_Y along table +Y from the carousel tag centre.
 MIXER_CAROUSEL_DX = -0.065           # carousel-on-mixer tag X offset from the mixer head (m)
 MIXER_CAROUSEL_DY = -0.065           # carousel-on-mixer tag Y offset from the mixer head (m)
 MIXER_CAROUSEL_MATCH_TOL = 0.010     # max distance from (mixer head + offset) to count (m)
-SAMPLE_OFFSET_Y = 0.062              # sample is this far along base +Y from the carousel tag centre (m)
+SAMPLE_OFFSET_Y = 0.062              # sample is this far along table +Y from the carousel tag centre (m)
+# MIXER_CAROUSEL_DX/DY, SAMPLE_OFFSET_Y and the carousel slide (-X out from under
+# the retainer) are directions on the Venton TABLE, measured while its axes were
+# parallel to base X/Y. _table_to_base_xy turns them into base XY using the
+# stored Venton frame, so they follow the table when it is rotated.
+
+
+def _table_to_base_xy(dx, dy):
+    """Turn a table-frame XY offset into base XY using the stored Venton frame
+    (json/venton_frame.json) axes; unchanged when no frame is stored."""
+    frame = load_venton_frame()
+    try:
+        ax, ay = frame['x_axis'], frame['y_axis']
+        return (dx * float(ax[0]) + dy * float(ay[0]),
+                dx * float(ax[1]) + dy * float(ay[1]))
+    except (TypeError, KeyError, IndexError, ValueError):
+        return (dx, dy)
 # The 45 deg seat-clearance move after grab: 10 mm total, so cos45 along each of
 # -X and +Z. Sliding the carousel out from under its retainer while lifting.
 # Two-segment slide that clears the carousel retainer after the snap-lift: a
 # short STEEP segment to lift the carousel clear of the surface first (a single
 # shallow slide was glancing the surface), then a long SHALLOW segment to travel
 # out from under the retainer. Each is (travel_m, angle_deg_above_horizontal) and
-# runs out-and-up (-X / +Z). Place retraces the SAME segments in reverse
-# (reversed order, each +X / -Z) so a new carousel seats along the same path.
+# runs out-and-up (table -X / +Z). Place retraces the SAME segments in reverse
+# (reversed order, each table +X / -Z) so a new carousel seats along the same path.
 CAROUSEL_SLIDE_SEGMENTS = (
     (0.002, 60.0),   # steep: 2 mm at 60 deg -- lift clear of the surface first
     (0.020, 30.0),   # shallow: 20 mm at 30 deg -- travel out from under the retainer
@@ -3854,6 +3910,14 @@ CAROUSEL_CENTER_SETTLE = 10          # s to keep recapturing while the camera fo
 CAROUSEL_CENTER_ITERS = 8            # centring passes (the default is 4)
 CAROUSEL_CENTER_TOL_M = 0.0002       # how close to centred counts as centred (m)
 CAROUSEL_LOAD_APPROACH_M = 0.200     # load: approach to this camera-to-tag distance before the grab
+
+
+def _carousel_travel_z(*zs):
+    """The height to cross the cell at: the highest of `zs` and the taught
+    carousel safe Z (when there is one), so a carousel leg never travels below
+    either its own clearance or the safe Z."""
+    safe = get_carousel_safe_z()
+    return max([float(z) for z in zs] + ([safe] if safe is not None else []))
 
 
 def _fmt_m(x):
@@ -3977,12 +4041,13 @@ def _grab_carousel(robot, station, tag_distance):
 def _carousel_lift(robot):
     """The seat-clearance lift after grabbing on the mixer: up SNAP_LIFT, then a
     two-segment slide (steep to lift clear of the surface, then shallow to travel
-    out from under the retainer -- CAROUSEL_SLIDE_STEPS, each -X / +Z), then up
+    out from under the retainer -- CAROUSEL_SLIDE_STEPS, each table -X / +Z), then up
     CLEAR_LIFT. Prints the pose after each step for debugging."""
     robot.mvr2z(CAROUSEL_SNAP_LIFT)
     print("unload lift: after snap-lift   %s" % _pose_str(robot))
     for dx, dz in CAROUSEL_SLIDE_STEPS:          # steep clear-off, then shallow travel-out
-        robot.translate([-dx, 0.0, dz])
+        bx, by = _table_to_base_xy(-dx, 0.0)     # table -X, wherever the table points it
+        robot.translate([bx, by, dz])
     print("unload lift: after slide-out   %s" % _pose_str(robot))
     robot.mvr2z(CAROUSEL_CLEAR_LIFT)
     print("unload lift: after clear-lift  %s" % _pose_str(robot))
@@ -4003,11 +4068,12 @@ def _carousel_goto(robot, target):
     Lift straight up to the carry height first (straight up never approaches the
     base, and it avoids the blind diagonal descent into a seat the old routing
     guarded against), cross to directly over the target at that height and at the
-    target's heading, then come straight down onto it.
+    target's heading, then come straight down onto it. The carry height is never
+    below the taught carousel safe Z.
     """
     tgt = list(target)
     now = robot.get_pos()
-    lift_z = max(now[2], tgt[2])
+    lift_z = _carousel_travel_z(now[2], tgt[2])
     robot.moveto([now[0], now[1], lift_z])              # straight up at the current XY
     above = [tgt[0], tgt[1], lift_z] + tgt[3:]          # over the seat, at height, target heading
     robot.moveto(above)                                 # cross at height (Rxy stays clear of the base)
@@ -4088,7 +4154,10 @@ def unload_current_carousel(robot):
     _grab_carousel(robot, 'carousel_on_mixer', dist)
     _carousel_lift(robot)
     robot.set_tcp(robot.tcp)                 # gripper frame: the carousel is carried, not the camera
-    clear_z = robot.get_pos()[2]
+    lifted_z = robot.get_pos()[2]
+    clear_z = _carousel_travel_z(lifted_z)   # cross at no lower than the carousel safe Z
+    if clear_z > lifted_z:
+        robot.mvr2z(clear_z - lifted_z)      # straight up to it before crossing
     if stack_tag is not None:
         # Stack on top of the carousel already on the used stack: carry over its
         # tag, go straight down to 100 mm above it, then bump to set down by feel.
@@ -4137,16 +4206,15 @@ def place_new_carousel(robot):
     state.set_carousel_on_mixer(None)       # mid-swap: unknown until it is seated
     mixer = list(get_station_position('carousel_on_mixer'))
     clear_z = mixer[2] + CAROUSEL_CLEAR_LIFT
-    now = robot.get_pos()
-    robot.moveto([now[0], now[1], clear_z])             # up to the carry height
     # Take the GRIPPER over the stock centre at the clear height, using the stock
     # pose's own (down-facing) orientation, then put the CAMERA onto that pose.
     # Same reason as unload: the camera has to be over the tag, not the camtcp
-    # offset away from it, or the tag falls outside the view.
+    # offset away from it, or the tag falls outside the view. _carousel_goto
+    # crosses at the carousel safe Z (or higher) and comes straight down to it.
     stock = get_station_position('carousel_in_stock')
     stock_over = list(stock)
     stock_over[2] = clear_z
-    robot.moveto(stock_over)                            # gripper over stock centre, facing down
+    _carousel_goto(robot, stock_over)                   # gripper over stock centre, facing down
     robot.put_camera2tcp()                              # camera onto that pose
     tag, dist = _acquire_carousel(robot, 'carousel_in_stock',
                                   approach_distance_m=CAROUSEL_LOAD_APPROACH_M)
@@ -4172,20 +4240,25 @@ def place_new_carousel(robot):
     # back by TOTAL_DX in X -- so the start is that same point.
     net_under = CAROUSEL_GRAB_UNDER - CAROUSEL_BUMP_LIFT   # carousel hangs this far below the gripper
     start = list(mixer)                                   # taught orientation (3:6)
-    start[0] = seat_x - CAROUSEL_SLIDE_TOTAL_DX          # back along -X so the reverse slide reaches the seat X
-    start[1] = seat_y
+    back_x, back_y = _table_to_base_xy(-CAROUSEL_SLIDE_TOTAL_DX, 0.0)
+    start[0] = seat_x + back_x                           # back along table -X so the reverse slide reaches the seat
+    start[1] = seat_y + back_y
     start[2] = surface_z + CAROUSEL_SLIDE_TOTAL_DZ + CAROUSEL_SNAP_LIFT - net_under
     carry = list(start)
-    carry[2] = clear_z
+    carry[2] = _carousel_travel_z(clear_z)               # cross at no lower than the carousel safe Z
+    now_z = robot.get_pos()[2]
+    if carry[2] > now_z:
+        robot.mvr2z(carry[2] - now_z)                    # straight up to it before crossing
     robot.moveto(carry)                                  # carry above the landing start, seat heading
     print("place seating: after carry-above %s" % _pose_str(robot))
-    robot.moveto(start)                                  # down to the stand-off, offset back along -X
+    robot.moveto(start)                                  # down to the stand-off, offset back along table -X
     print("place seating: after down-to-start %s" % _pose_str(robot))
     # Reverse slide-in landing: retrace the unload lift's two-segment slide in
     # reverse (segments reversed, each +X / -Z), landing on the measured seat X,Y
     # along the same trajectory.
     for dx, dz in reversed(CAROUSEL_SLIDE_STEPS):
-        robot.translate([dx, 0.0, -dz])
+        bx, by = _table_to_base_xy(dx, 0.0)              # table +X, back in under the retainer
+        robot.translate([bx, by, -dz])
     print("place seating: after slide-in landing %s" % _pose_str(robot))
     robot.bump(z=-1, backoff=0.0)                        # bump down to seat at the real surface
     print("place seating: after bump %s" % _pose_str(robot))

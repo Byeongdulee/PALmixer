@@ -70,6 +70,8 @@ def stations(monkeypatch):
            "carousel_in_stock": [0.10, 0.44, 0.28, 2.2, -2.2, 0.70],
            "carousel_used_stack": [0.55, 0.10, 0.32, 2.2, -2.2, 1.57]}
     monkeypatch.setattr(PAL12idb, "get_station_position", lambda s: list(pos[s]))
+    # No carousel safe Z unless a test sets one (never the bench's waypoints.ini).
+    monkeypatch.setattr(PAL12idb, "get_carousel_safe_z", lambda: None)
     return pos
 
 
@@ -79,6 +81,13 @@ def quiet_camera(monkeypatch):
     # only the corridor routing is stubbed to a plain move.
     monkeypatch.setattr(PAL12idb, "move_via_transferpoint",
                         lambda robot, target: robot.moveto(target[:3]))
+
+
+@pytest.fixture(autouse=True)
+def table_parallel_to_base(monkeypatch):
+    # The table axes parallel to base X/Y, as the carousel geometry was measured
+    # (never the bench's json/venton_frame.json).
+    monkeypatch.setattr(PAL12idb, "load_venton_frame", lambda *a, **k: None)
 
 
 @pytest.fixture
@@ -216,8 +225,9 @@ def test_place_sequence_and_reverse_diagonal(stations, quiet_camera, tmp_state, 
     PAL12idb.place_new_carousel(rob)
     kinds = _kinds(rob.log)
     n = len(PAL12idb.CAROUSEL_SLIDE_STEPS)
-    # Trailing "moveto" is the park at the transport (transfer) position.
-    assert kinds == ["moveto", "moveto", "put_camera2tcp", "grab", "mvr2z",
+    # The three leading moveto are _carousel_goto over the stock (up, across,
+    # down). Trailing "moveto" is the park at the transport (transfer) position.
+    assert kinds == ["moveto", "moveto", "moveto", "put_camera2tcp", "grab", "mvr2z",
                      "moveto", "moveto"] + ["translate"] * n + ["bump", "release", "mvr2z", "moveto"]
     # the landing retraces the unload lift's segments in reverse (reversed order,
     # each +X / -Z) -- so it mirrors the lift trajectory.
@@ -304,6 +314,94 @@ def test_unload_acquires_without_an_approach_distance(stations, quiet_camera, tm
                         lambda r, station, dist: r.log.append(("grab",)))
     PAL12idb.unload_current_carousel(FakeRobot())
     assert seen["approach"] is None
+
+
+# -- carousel safe Z --------------------------------------------------------
+SAFE_Z = 0.80          # above every FakeRobot / station height in these tests
+
+
+def test_goto_crosses_at_the_safe_z(stations, monkeypatch):
+    monkeypatch.setattr(PAL12idb, "get_carousel_safe_z", lambda: SAFE_Z)
+    rob = FakeRobot()
+    target = stations["carousel_used_stack"]
+    PAL12idb._carousel_goto(rob, target)
+    moves = [e[1] for e in rob.log if e[0] == "moveto"]
+    assert moves[0][:2] == [0.30, -0.20] and moves[0][2] == SAFE_Z   # straight up
+    assert moves[1][:2] == target[:2] and moves[1][2] == SAFE_Z     # across at the safe Z
+    assert moves[2] == target                                        # straight down
+
+
+def test_unload_carries_at_the_safe_z(stations, quiet_camera, tmp_state, monkeypatch):
+    monkeypatch.setattr(PAL12idb, "get_carousel_safe_z", lambda: SAFE_Z)
+    monkeypatch.setattr(PAL12idb, "_look_for_used_stack_tag", lambda r: None)
+    monkeypatch.setattr(PAL12idb, "_acquire_carousel", lambda r, s, **k: (33, 0.20))
+    monkeypatch.setattr(PAL12idb, "_grab_carousel",
+                        lambda r, station, dist: r.log.append(("grab",)))
+    rob = FakeRobot()
+    PAL12idb.unload_current_carousel(rob)
+    moves = [e[1] for e in rob.log if e[0] == "moveto"]
+    assert moves[-2][2] == SAFE_Z            # over the used stack at the safe Z
+    assert moves[-1][2] == SAFE_Z            # and back up to it after the drop
+    i = rob.log.index(("moveto", moves[-2]))
+    assert rob.log[i - 1][0] == "mvr2z"      # straight up to it before crossing
+
+
+def test_place_carries_at_the_safe_z(stations, quiet_camera, tmp_state, monkeypatch):
+    monkeypatch.setattr(PAL12idb, "get_carousel_safe_z", lambda: SAFE_Z)
+    monkeypatch.setattr(PAL12idb, "_acquire_carousel", lambda r, s, **k: (37, 0.20))
+    monkeypatch.setattr(PAL12idb, "_grab_carousel",
+                        lambda r, station, dist: r.log.append(("grab",)))
+    rob = FakeRobot()
+    PAL12idb.place_new_carousel(rob)
+    moves = [e[1] for e in rob.log if e[0] == "moveto"]
+    assert moves[1][2] == SAFE_Z             # across to the stock at the safe Z
+    assert moves[-3][2] == SAFE_Z            # carry to over the mixer at the safe Z
+
+
+def test_safe_z_round_trips_through_the_ini(tmp_path, monkeypatch):
+    monkeypatch.setattr(PAL12idb, "_INI_PATH", str(tmp_path / "waypoints.ini"))
+    assert PAL12idb.get_carousel_safe_z() is None
+    PAL12idb.store_carousel_safe_z(-0.0224)
+    assert PAL12idb.get_carousel_safe_z() == pytest.approx(-0.0224)
+    assert PAL12idb._carousel_travel_z(-0.10) == pytest.approx(-0.0224)
+    assert PAL12idb._carousel_travel_z(0.05) == pytest.approx(0.05)  # never lowers a leg
+
+
+# -- table rotation ---------------------------------------------------------
+ROTATED_90 = {"origin_m": [0.3, -0.3, -0.44], "x_axis": [0.0, 1.0, 0.0],
+              "y_axis": [-1.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]}
+
+
+def test_slide_follows_a_rotated_table(monkeypatch):
+    # Table turned 90 deg (table +X = base +Y): the slide-out runs along base -Y.
+    monkeypatch.setattr(PAL12idb, "load_venton_frame", lambda *a, **k: ROTATED_90)
+    rob = FakeRobot()
+    PAL12idb._carousel_lift(rob)
+    slides = [e[1] for e in rob.log if e[0] == "translate"]
+    for (dx, dz), v in zip(PAL12idb.CAROUSEL_SLIDE_STEPS, slides):
+        assert v == pytest.approx([0.0, -dx, dz], abs=1e-6)
+
+
+def test_place_slide_in_follows_a_rotated_table(stations, quiet_camera, tmp_state, monkeypatch):
+    monkeypatch.setattr(PAL12idb, "load_venton_frame", lambda *a, **k: ROTATED_90)
+    monkeypatch.setattr(PAL12idb, "_acquire_carousel", lambda r, s, **k: (37, 0.20))
+    monkeypatch.setattr(PAL12idb, "_grab_carousel",
+                        lambda r, station, dist: r.log.append(("grab",)))
+    seat = [0.412, 0.097, 0.264]
+    state.set_carousel_mixer_seat(seat)
+    rob = FakeRobot()
+    PAL12idb.place_new_carousel(rob)
+    tdx = PAL12idb.CAROUSEL_SLIDE_TOTAL_DX
+    start = [e for e in rob.log if e[0] == "moveto"][-2]
+    assert start[1][0] == pytest.approx(seat[0], abs=1e-6)        # no X offset now
+    assert start[1][1] == pytest.approx(seat[1] - tdx, abs=1e-6)  # backed off along base -Y
+    slides = [e[1] for e in rob.log if e[0] == "translate"]
+    assert sum(v[1] for v in slides) == pytest.approx(tdx, abs=1e-6)  # slide-in reaches the seat
+    assert sum(v[0] for v in slides) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_table_offset_is_identity_without_a_frame():
+    assert PAL12idb._table_to_base_xy(0.01, 0.02) == (0.01, 0.02)
 
 
 # -- plumbing ---------------------------------------------------------------

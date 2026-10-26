@@ -1,0 +1,22 @@
+PALmixerServer: UR3 at UR3-12idb.xray.aps.anl.gov, tool TCP [0.0, 0.0, 0.15, 0.0, 0.0, 0.0]
+PAL12idb: applied calibrated focal length 671.5 px (was assumed ~810) to the camera; distance measurements now use it.
+PALmixerServer: AT distance correction scale=1.0529 offset=-0.0287 m
+PALmixerServer: shoulder joint guard = -150.0 deg
+unwind_wrist3_safe: wrist 3 -451.9 -> -91.9 deg (same view)
+PAL12idb: gripper grip force set to 200
+PALmixerServer: gripper activated
+ZMQ command server listening on tcp://*:9880
+PALmixer server running. Press Ctrl+C to stop.
+PALmixerServer: action 'preparation_initial' failed: flowcell_1 location is unknown; run "set_location flowcell_1 <cleaning_station|sample_table>" to reconcile
+PAL12idb: sample-table motor positioning is off; not moving sth/sav/stv.
+WARNING: mixing run e2a1d354e2c04f8aacba802be1fdbe34 saved locally; PVapp sync pending: no PVapp credentials: set pvapp.badge and pvapp.gup (a badge and a proposal it is on, no password, beamline network only), export PVAPP_USERNAME and PVAPP_PASSWORD, or have the campaign send set_credentials
+PAL12idb: sample-table motor positioning is off; not moving sth/sav/stv.
+unwind_wrist3_safe: wrist 3 -451.9 -> -91.9 deg (same view)
+PAL12idb: sample-table motor positioning is off; not moving sth/sav/stv.
+WARNING: mixing run 6ac5d4dffab34076894013f34b118972 saved locally; PVapp sync pending: no PVapp credentials: set pvapp.badge and pvapp.gup (a badge and a proposal it is on, no password, beamline network only), export PVAPP_USERNAME and PVAPP_PASSWORD, or have the campaign send set_credentials
+PAL12idb: sample-table motor positioning is off; not moving sth/sav/stv.
+unwind_wrist3_safe: wrist 3 -451.9 -> -91.9 deg (same view)
+PAL12idb: sample-table motor positioning is off; not moving sth/sav/stv.
+WARNING: mixing run 95349c0853454eccad45264a3dba1bf1 saved locally; PVapp sync pending: no PVapp credentials: set pvapp.badge and pvapp.gup (a badge and a proposal it is on, no password, beamline network only), export PVAPP_USERNAME and PVAPP_PASSWORD, or have the campaign send set_credentials
+PAL12idb: sample-table motor positioning is off; not moving sth/sav/stv.
+unwind_wrist3_safe: wrist 3 -451.9 -> -91.9 deg (same view)
