@@ -14,10 +14,14 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def new_record(sample_id, slot, carousel_id, flowcell, simulated=False, sample_uid=""):
+def new_record(sample_id, slot, carousel_id, flowcell, simulated=False, sample_uid="",
+               carousel_tag=""):
+    # carousel_tag: the AprilTag number of the physical carousel on the mixer
+    # (state.get_carousel_on_mixer), for tracking only; carousel_id is the label.
     return {"schema_version": 1, "run_id": uuid4().hex, "sample_id": sample_id,
             "sample_uid": sample_uid,
-            "slot": slot, "carousel_id": carousel_id, "flowcell": flowcell,
+            "slot": slot, "carousel_id": carousel_id, "carousel_tag": carousel_tag,
+            "flowcell": flowcell,
             "simulated": bool(simulated), "started_at": utc_now(),
             "finished_at": None, "workflow_status": "running",
             "mixing_status": "not_started", "steps": [], "pump": None}
@@ -61,6 +65,34 @@ class MixingJournal:
                 or not isinstance(envelope.get("pvapp_sync"), dict)):
             raise ValueError("Invalid mixing journal envelope")
         return envelope
+
+    def was_mixed(self, sample_id, sample_uid):
+        """True when a saved record for this sample shows mixing started.
+
+        Matched on ``sample_uid`` when one is given, else on ``sample_id``.
+        "Started" is any mixing_status but not_started: a stopped or unknown mix
+        still drew on the vial. Unreadable files are skipped, never raised --
+        this runs while a carousel load is being recorded."""
+        if not sample_uid and not sample_id:
+            return False
+        try:
+            paths = list(self.directory.glob("*.json"))
+        except OSError:
+            return False
+        for path in paths:
+            try:
+                record = self._read(path)["record"]
+                if sample_uid:
+                    if record.get("sample_uid") != sample_uid:
+                        continue
+                elif record.get("sample_id") != sample_id:
+                    continue
+                status = record.get("mixing_status")
+                if isinstance(status, str) and status != "not_started":
+                    return True
+            except Exception:                               # noqa: BLE001
+                continue
+        return False
 
     def recover_interrupted(self):
         """Called once at server startup; never invent a successful outcome."""

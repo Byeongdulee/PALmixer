@@ -88,9 +88,12 @@ class ExperimentTab(QWidget):
         self.place_carousel_btn = QPushButton("Place New Carousel")
         self.place_carousel_btn.setToolTip(
             "Bring a fresh carousel from the stock position onto the mixer.\n\n"
+            "Once it is seated, every slot is freed: all sample IDs and UUIDs "
+            "are cleared and a carousel-load record of what the old carousel "
+            "held is saved. Taught positions and the carousel ID are kept.\n\n"
             "Needs Carousel in Stock and Carousel on Mixer taught. The arm "
             "looks for a carousel in stock first and stops with an error if "
-            "none is there.")
+            "none is there; a failed placement clears nothing.")
         self.place_carousel_btn.clicked.connect(self._on_place_new_carousel)
         layout.addWidget(self.place_carousel_btn)
 
@@ -112,7 +115,8 @@ class ExperimentTab(QWidget):
         if QMessageBox.question(
                 self, "Place New Carousel",
                 "Bring a fresh carousel from stock onto the mixer?\n\n"
-                "The arm will move across the cell.",
+                "The arm will move across the cell. Once the new carousel is "
+                "seated, every slot is freed (all sample IDs are cleared).",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         self._send_command(cmd.place_new_carousel_command())

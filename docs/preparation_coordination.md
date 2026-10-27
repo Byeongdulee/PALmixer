@@ -1,10 +1,54 @@
 # PAL robot preparation: internal coordination
 
+## Update: carousel replacement (`replace_carousel`)
+
+When the carousel is exhausted, the owning run sends:
+
+```json
+{"version": 1, "run_id": "<run UUID>", "op": "replace_carousel",
+ "replacement_id": "<canonical UUID>", "action_key": "replace:<replacement_id>"}
+```
+
+It runs the **Unload Current Carousel** code path and then the
+**Place New Carousel** code path as one worker action labelled
+`preparation_replace_carousel`. Placement saves the carousel-load record, with
+this `replacement_id`, and frees every slot, as the button does. The carousel ID
+label and taught positions are unchanged, and `mount_carousel` is not called.
+
+It needs the same gate as the other motion operations: the owning run, no
+session error, and a coordinator. It is refused before acceptance unless all of
+these hold:
+
+- The coordinator is idle (`require_idle`).
+- PALmixer is not busy.
+- Cleanup reports no `problem`. A running flowcell wash is allowed: the swap is
+  meant to overlap it.
+- The mixer head and the flowcell in use are at their cleaning stations.
+- Carousel on Mixer, Used Carousel Stack and Carousel in Stock are taught.
+
+The record is kept in `replacements[replacement_id]` and returned by `status`:
+`{replacement_id, action_id, request, state, error}`, plus `load` once
+committed and `failed_phase` on failure. It is persisted when the
+request is accepted and again before each physical phase. A repeated identical
+request returns the record and never starts a second swap. A different request
+under the same identity is refused.
+
+| `state` | Meaning |
+| --- | --- |
+| `accepted` | Persisted; no motion yet |
+| `unloading` | Unload running |
+| `old_removed` | Old carousel is on the used stack |
+| `placing` | Placement running |
+| `committed` | Placed; `load` holds the carousel-load record and every slot is free |
+| `waiting_for_stock` | Stock seat empty after the unload. The session stays usable so PALsystem can end it. The operator loads a carousel and presses **Place New Carousel** on PALmixer, which records the load. |
+| `failed` | Any other error. `failed_phase` says whether unloading or placing failed. The session error is latched and the coordinator is invalidated, as for other motion operations, with no replay. |
+
 ## Update: version-1 live test endpoint
 
 The server now creates `PreparationAPI`, inactive until PALsystem's real test sends
 `preparation_control {"version":1,"run_id":"UUID","op":"begin"}`. Operations are
-`queue`, `initial`, `status`, `release`, `tag`, `make`, `unload`, `end`, `inhibit`.
+`queue`, `initial`, `status`, `release`, `tag`, `make`, `unload`, `replace_carousel`,
+`end`, `inhibit`.
 Motion operations have durable `action_key`/`action_id` records and reuse existing
 workflows. During ownership, conflicting ordinary commands are refused. A restart
 with an active session blocks further motion for inspection; there is no replay.

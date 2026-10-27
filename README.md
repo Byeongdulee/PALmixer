@@ -201,7 +201,7 @@ that call. See the docstring in `_winenv.py`.
 | `set_sample_id <slot> <sample id>` | fast | Tag `slot` with a sample ID, marking it used. Overwrites any existing ID |
 | `get_sample_id <slot>` | fast | That slot's sample ID, or `unknown` if it is unused |
 | `clear_sample_id <slot>` | fast | Drop the slot's sample ID, marking it unused again |
-| `reset_carousel` | fast | Replace the carousel: clear every sample ID **and** the taught reference position |
+| `reset_carousel` | fast | Free every slot: clear sample IDs and UUIDs, preserving taught positions and carousel tracking |
 
 Every argument is a single whitespace-delimited token except a sample ID,
 which is the rest of the line and may contain spaces (runs of whitespace in it
@@ -722,13 +722,17 @@ the Experiment tab) or as part of a workflow.
  "carousel_slots": {"1": 0.0, "2": 30.0, "3": 60.0}, "carousel_size": 3,
  "carousel_step": 30.0, "carousel_reference": [1, 0.0],
  "carousel_samples": {"1": "BSA 5 mg/ml", "3": "S20260906-142530"},
- "carousel_full": false}
+ "carousel_full": false,
+ "carousel_load": {"sequence": 0, "record": null}}
 ```
 
 `carousel_size` and `carousel_step` are echoed from the config so a client does
 not need to read it. `carousel_slots` is **derived** from `carousel_reference`
 and the step, so it is either empty (nothing taught) or complete. It and
 `carousel_samples` are keyed by slot number; JSON makes those keys strings.
+`carousel_load` is the latest carousel load (see
+[Replacing it](#the-carousel-slots-sample-ids-and-replacing-it)): sequence `0`
+and `null` until a placement has recorded one.
 
 The same snapshot is published, retained, on MQTT topic
 `aps12/<beamline>/palmixer/tracking` on every change, so a GUI connecting
@@ -828,11 +832,36 @@ advisory, not a block -- re-mixing a used slot stays legal -- but it is
 surfaced in the tracking snapshot, in red on the Automation tab, and in the
 `make_sample` completion detail. Swap in a fresh carousel, then
 `reset_carousel` (the tab's **Replace Carousel (Reset)** button, behind a
-confirmation). That clears the sample IDs **and the taught reference**, since a
-replacement carousel is not guaranteed to seat where the old one did -- so one
-slot must be taught again before the next sample. The geometry is configuration
+confirmation). That clears all sample IDs and UUIDs, making every slot free.
+The taught reference, carousel identity and current motor position are preserved;
+this command performs no motion. The geometry is configuration
 and is untouched; a physically different carousel means editing
 `json/palmixer_config.json` and restarting the server.
+
+**Every robot placement frees every slot.** When **Place New Carousel**
+(`place_new_carousel`) or a coordinated `replace_carousel` has seated the new
+carousel, PALmixer saves a carousel-load record and clears all sample IDs and
+UUIDs, in one state transition. A placement that fails clears nothing.
+The carousel ID label and taught positions are kept. `get_state` reports the
+latest record as `carousel_load`:
+
+```json
+{"sequence": 4, "record": {"load_id": "<uuid4 hex>", "sequence": 4,
+  "at": "2026-10-27T15:04:05.123456+00:00", "old_tag": "33", "new_tag": "37",
+  "replacement_id": null, "slots": [
+   {"slot": 1, "sample_id": "S1", "sample_uid": "<uuid>", "mixed": true},
+   {"slot": 2, "sample_id": "S2", "sample_uid": "", "mixed": false}]}}
+```
+
+`sequence` goes up by one per load; a client that sees a new value knows the old
+carousel's samples are gone. `old_tag` is the AprilTag that **Unload Current
+Carousel** read off the carousel it removed, and `new_tag` is the tag placement
+read (`carousel_on_mixer`). Either is `unknown` when it was not read, for example
+after a hand swap. `slots` lists everything the old slot tables held. `mixed` is
+true when a saved mixing record for that sample (by UUID, else by sample ID)
+shows that mixing started. `replacement_id` names the coordinated replacement
+that placed the carousel, or is `null` for the button. Only the latest record is
+kept. **Replace Carousel (Reset)** does not write one.
 
 ## Automation workflows
 
@@ -1196,7 +1225,9 @@ incomplete composition data; its mixing record remains pending locally.
 
 Each record contains:
 
-- A unique `run_id`, sample ID, carousel ID, slot and selected flowcell.
+- A unique `run_id`, sample ID, carousel ID, slot and selected flowcell, and
+  `carousel_tag`: the AprilTag number of the physical carousel on the mixer
+  (`carousel_on_mixer`, or `unknown`). It is recorded for tracking only.
 - `pump.settings`: the complete `parameters` snapshot returned when the pump
   dashboard accepts `sample_make`, including per-channel speeds (mL/min),
   volumes (uL), start delays (ms), aspiration/correction settings and TTL timing.

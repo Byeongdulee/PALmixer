@@ -9,6 +9,11 @@ from uuid import UUID, uuid4
 from . import config, state
 from .preparation import PreparationCoordinator
 
+# Reported when placement finds the stock seat empty after the old carousel was
+# already unloaded. Not a session failure: the operator's button press finishes it.
+NO_STOCK_MESSAGE = ("No fresh carousel in stock. Put one on the stock seat and press "
+                    "Place New Carousel on PALmixer.")
+
 
 class PreparationAPI:
     def __init__(self, server, path=None):
@@ -67,7 +72,7 @@ class PreparationAPI:
                 self.coordinator = PreparationCoordinator(journal,
                     lambda binding: self.server.workflows.position_for_preparation(binding, offset_steps=offset),
                     lambda binding: None)  # PALsystem relays persisted readiness to ChemLab.
-                self.record = dict(active=True, run_id=run_id, actions={}, error='')
+                self.record = dict(active=True, run_id=run_id, actions={}, replacements={}, error='')
                 self._save()
                 self.server.workflows.preparation = self.coordinator
                 return self.snapshot()
@@ -75,7 +80,8 @@ class PreparationAPI:
                 raise ValueError('This run does not own coordinated preparation')
             if op == 'status':
                 return dict(self.snapshot(), coordination=self.coordinator.snapshot() if self.coordinator else {},
-                            actions=deepcopy(self.record.get('actions', {})))
+                            actions=deepcopy(self.record.get('actions', {})),
+                            replacements=deepcopy(self.record.get('replacements', {})))
             if op == 'inhibit':
                 self.record['error'] = 'PALsystem inhibited further work; inspect the original run.'
                 self._save()
@@ -126,6 +132,8 @@ class PreparationAPI:
                 return {'tagged': True}
             if op in ('initial', 'make', 'unload'):
                 return self._action(message)
+            if op == 'replace_carousel':
+                return self._replace_carousel(message)
             if op == 'end':
                 if self.server._busy or self.server.workflows.cleanup_snapshot().get('active'):
                     raise ValueError('Wait for motion and cleanup to finish')
@@ -192,4 +200,91 @@ class PreparationAPI:
             self.server._current_trace = trace
         threading.Thread(target=self.server._run_action,
             args=(run, 'preparation_' + op, trace, 'preparation_' + op), daemon=True).start()
+        return deepcopy(saved)
+
+    def _replace_carousel(self, message):
+        """Unload the spent carousel and place a fresh one, as one coordinated action.
+
+        Reuses the Unload Current Carousel and Place New Carousel code paths; the
+        placement records the carousel load and frees every slot. Allowed while
+        the flowcell wash still runs -- that overlap is the point -- but not
+        while anything else moves or a cleanup has failed. Progress is persisted
+        before each physical phase, and a duplicate request returns the record
+        instead of starting a second swap."""
+        replacement_id = message.get('replacement_id')
+        try:
+            canonical = isinstance(replacement_id, str) and str(UUID(replacement_id)) == replacement_id
+        except ValueError:
+            canonical = False
+        if not canonical:
+            raise ValueError('Canonical replacement UUID required')
+        if message.get('action_key') != 'replace:' + replacement_id:
+            raise ValueError('action_key must be replace:<replacement_id>')
+        signature = json.dumps(message, sort_keys=True)
+        replacements = self.record.setdefault('replacements', {})
+        previous = replacements.get(replacement_id)
+        if previous:
+            if previous['request'] != signature:
+                raise ValueError('Replacement identity already has different contents')
+            return deepcopy(previous)
+        self.coordinator.require_idle()
+        if self.server._busy:
+            raise ValueError('PALmixer is busy')
+        problem = self.server.workflows.cleanup_snapshot().get('problem')
+        if problem:
+            raise ValueError('PALmixer cleanup needs attention: %s' % problem)
+        if state.get_mixer_head() != state.MIXER_AT_CLEANING:
+            raise ValueError('The mixer head must be at its cleaning station to replace the carousel')
+        flowcell = state.get_flowcell_in_use()
+        if state.get_flowcell_location(flowcell) != state.FC_AT_CLEANING:
+            raise ValueError('Flowcell %d must be at its cleaning station to replace the carousel' % flowcell)
+        self.server._require_positions(('carousel_on_mixer', 'carousel_used_stack', 'carousel_in_stock'))
+        no_carousel = getattr(self.server.PAL12idb, 'NoCarouselError', None)
+        trace = uuid4().hex
+        saved = dict(replacement_id=replacement_id, action_id=trace, request=signature,
+                     state='accepted', error='')
+
+        def progress(name, **extra):
+            with self.lock:
+                saved.update(state=name, **extra)
+                self._save()
+
+        def run():
+            placing = False
+            try:
+                progress('unloading')
+                unloaded = self.server._unload_carousel()
+                progress('old_removed')
+                progress('placing')
+                placing = True
+                placed, load = self.server._place_and_record_load(replacement_id)
+                progress('committed', load=load)
+                return '%s; %s; every slot cleared (carousel load %d)' % (
+                    unloaded, placed, load['sequence'])
+            except Exception as error:
+                if placing and no_carousel is not None and isinstance(error, no_carousel):
+                    # The old carousel is already on the used stack. Leave the
+                    # session usable so PALsystem can end it; the operator loads
+                    # stock and presses Place New Carousel, which records the load.
+                    progress('waiting_for_stock', error=NO_STOCK_MESSAGE)
+                    return NO_STOCK_MESSAGE
+                with self.lock:
+                    # failed_phase keeps "unload failed" apart from "old carousel
+                    # removed, placement failed" -- they need different recovery.
+                    saved.update(state='failed', failed_phase=saved['state'], error=str(error))
+                    self.record['error'] = str(error)
+                    self._save()
+                    self.coordinator.invalidate(str(error))
+                raise
+        label = 'preparation_replace_carousel'
+        with self.server._busy_lock:
+            if self.server._busy:
+                raise ValueError('PALmixer is busy')
+            replacements[replacement_id] = saved
+            self._save()  # Persist acceptance before any physical action.
+            self.server._busy = True
+            self.server._current_action = label
+            self.server._current_trace = trace
+        threading.Thread(target=self.server._run_action,
+            args=(run, label, trace, label), daemon=True).start()
         return deepcopy(saved)

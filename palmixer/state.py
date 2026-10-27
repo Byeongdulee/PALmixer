@@ -23,9 +23,11 @@ A slot is "used" exactly when it has a sample ID -- make_sample assigns one
 (auto-generating a timestamp ID if the operator did not name the sample) as
 soon as the mix step succeeds, since mixing is what consumes the vial. When
 every slot is used the carousel is a spent consumable: the operator swaps in a
-fresh one and calls reset_carousel(), which drops the sample IDs and the taught
-reference, because a replacement carousel is not guaranteed to seat where the
-old one did.
+fresh one and calls reset_carousel(), which clears the sample IDs and UUIDs
+while preserving the taught reference, carousel identity and tracked position.
+A robot placement through the server (Place New Carousel, or a coordinated
+replace_carousel) frees every slot the same way, after saving a carousel-load
+record of what the old carousel held -- see record_carousel_load().
 
 IMPORTANT -- this module must stay dependency-free (stdlib only). PAL12idb.py
 imports ``camera_tools`` at module scope, which only resolves inside the
@@ -41,10 +43,12 @@ we do not know. Callers are expected to refuse to move rather than guess.
 """
 
 import configparser
+from datetime import datetime, timezone
+import json
 import os
 import threading
 import time
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from . import config  # stdlib-only itself, so this keeps state.py importable anywhere
 
@@ -74,6 +78,7 @@ _TRACKING = "tracking"
 _CAROUSEL = "carousel"            # the taught reference: ref_slot + ref_position
 _CAROUSEL_SAMPLES = "carousel_samples"  # slot -> sample ID; a key here == used
 _CAROUSEL_UIDS = "carousel_sample_uids"
+_CAROUSEL_LOAD = "carousel_load"  # the latest carousel-load record + its sequence
 
 # Only the MOUNTED carousel is tracked -- there is no per-carousel history. A
 # carousel taken off and put back later arrives as a fresh mount and must be
@@ -662,21 +667,108 @@ def clear_slots():
 
 
 def reset_carousel():
-    """Replace the carousel: clear the entire slot inventory in one transition.
+    """Free every slot while preserving taught positions and carousel tracking.
 
-    Drops the taught reference along with the sample IDs, because a replacement
-    carousel is not guaranteed to seat where the old one did -- keeping a stale
-    reference would be the dangerous default, since every slot position is
-    derived from it. The slot last moved to goes back to UNKNOWN for the same
-    reason. The geometry (size, step) is configuration and is untouched."""
+    The Replace Carousel (Reset) button clears sample IDs and UUIDs only.
+    Physical replacement and declaring a new mounted identity are separate
+    operations; this inventory reset does not move or reteach the carousel.
+    """
+    clear_slots()
+
+
+# -- carousel loads -----------------------------------------------------------
+# Every robot placement of a new carousel frees every slot: the vials on the old
+# carousel left with it. Before the slot tables are dropped, what they held is
+# saved as one carousel-load record, so PALsystem -- which reads get_state before
+# every slot assignment -- can see a new `sequence`, release its reservations
+# and mark samples that were prepared but never mixed as unfinished. Only the
+# latest record is kept here; PALsystem keeps the history.
+def _raw_slot_table(parser):
+    """Every slot either sample section names, as ``{slot: (sample_id, uid)}``.
+
+    Deliberately not bounded by the configured size (unlike carousel_samples):
+    a tag left beyond the current size is still a vial that is now leaving."""
+    ids = _slot_keys(parser, _CAROUSEL_SAMPLES)
+    uids = _slot_keys(parser, _CAROUSEL_UIDS)
+    table = {}
+    for slot in set(ids) | set(uids):
+        pair = (ids.get(slot, "").strip(), uids.get(slot, "").strip())
+        if any(pair):
+            table[slot] = pair
+    return table
+
+
+def record_carousel_load(new_tag, was_mixed, replacement_id=None):
+    """Save the carousel-load record and free every slot, in ONE transition.
+
+    Called only after a placement has seated the new carousel -- a failed
+    placement must clear nothing. ``was_mixed(sample_id, sample_uid)`` says
+    whether the mixing records show that sample was mixed (MixingJournal.was_mixed).
+    The carousel ID label, taught reference and tracked slot are untouched.
+    Returns the record.
+    """
+    # The journal lookups read files, so they are made before taking the state
+    # lock (get_state waits on it) and only repeated inside it for a slot that
+    # was retagged in between -- the table recorded is still the one cleared.
+    mixed = {}
+
+    def lookup(pair):
+        if pair not in mixed:
+            mixed[pair] = bool(was_mixed(*pair))
+        return mixed[pair]
+
+    for pair in _raw_slot_table(_read()).values():
+        lookup(pair)
+    new = "" if new_tag is None else str(new_tag).strip()
+    saved = []
+
     def apply(parser):
-        for section in (_CAROUSEL, _CAROUSEL_SAMPLES, _CAROUSEL_UIDS):
+        try:
+            previous = int(parser.get(_CAROUSEL_LOAD, "sequence", fallback="0"))
+        except ValueError:
+            previous = 0
+        old = parser.get(_TRACKING, "last_unloaded_carousel", fallback="").strip()
+        record = {
+            "load_id": uuid4().hex,
+            "sequence": previous + 1,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "old_tag": old or UNKNOWN,
+            "new_tag": new or UNKNOWN,
+            "replacement_id": replacement_id or None,
+            "slots": [{"slot": slot, "sample_id": sample_id, "sample_uid": uid,
+                       "mixed": lookup((sample_id, uid))}
+                      for slot, (sample_id, uid) in sorted(_raw_slot_table(parser).items())],
+        }
+        if not parser.has_section(_CAROUSEL_LOAD):
+            parser.add_section(_CAROUSEL_LOAD)
+        parser.set(_CAROUSEL_LOAD, "sequence", str(record["sequence"]))
+        # Compact JSON on one line; ensure_ascii keeps free-text sample IDs safe
+        # in the ini's platform-encoded file.
+        parser.set(_CAROUSEL_LOAD, "record", json.dumps(record, separators=(",", ":")))
+        for section in (_CAROUSEL_SAMPLES, _CAROUSEL_UIDS):
             if parser.has_section(section):
                 parser.remove_section(section)
-        for option in ("carousel_slot", "carousel_id"):
-            if parser.has_option(_TRACKING, option):
-                parser.remove_option(_TRACKING, option)
+        # Consumed: the next load must not claim this carousel as its old one.
+        if parser.has_option(_TRACKING, "last_unloaded_carousel"):
+            parser.remove_option(_TRACKING, "last_unloaded_carousel")
+        saved.append(record)
     _mutate(apply)
+    return saved[0]
+
+
+def carousel_load():
+    """The latest carousel load as ``{"sequence": int, "record": dict or None}``;
+    sequence 0 and no record when no placement has recorded one yet."""
+    parser = _read()
+    try:
+        sequence = int(parser.get(_CAROUSEL_LOAD, "sequence", fallback="0"))
+    except ValueError:
+        sequence = 0
+    try:
+        record = json.loads(parser.get(_CAROUSEL_LOAD, "record", fallback="null"))
+    except ValueError:
+        record = None
+    return {"sequence": sequence, "record": record if isinstance(record, dict) else None}
 
 
 # -- D) flowcell in use -----------------------------------------------------
@@ -708,6 +800,17 @@ def get_carousel_on_mixer():
 
 def set_carousel_on_mixer(value):
     _set(_TRACKING, "carousel_on_mixer", UNKNOWN if value is None else str(value))
+
+
+# The tag unload_current_carousel read off the carousel it took from the mixer,
+# kept until the next carousel-load record names it as the old carousel (which
+# resets it). UNKNOWN when nothing has been unloaded since the last load.
+def get_last_unloaded_carousel():
+    return _get(_TRACKING, "last_unloaded_carousel", UNKNOWN)
+
+
+def set_last_unloaded_carousel(value):
+    _set(_TRACKING, "last_unloaded_carousel", UNKNOWN if value is None else str(value))
 
 
 # The real mixer seat pose [x, y, z] (gripper frame, metres) that unload's grab
@@ -789,4 +892,7 @@ def _snapshot():
         # consumer of the retained MQTT snapshot -- not just this repo's GUI --
         # gets the "replace the carousel" signal without recomputing it.
         "carousel_full": carousel_is_full(),
+        # The latest placement's load record; a new `sequence` means every slot
+        # was freed by a carousel swap (see record_carousel_load).
+        "carousel_load": carousel_load(),
     }

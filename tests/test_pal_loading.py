@@ -59,14 +59,14 @@ def test_invalid_slot_never_moves(loading, slot, method):
 
 
 @pytest.mark.parametrize("obstacle", ["mixer", "flowcell", "reference", "coordination", "offset"])
-def test_loading_refuses_uncleared_or_unconfigured_equipment(loading, obstacle):
+def test_loading_refuses_uncleared_or_unconfigured_equipment(loading, obstacle, monkeypatch):
     wf, moves, geometry = loading
     if obstacle == "mixer":
         state.set_mixer_head(state.MIXER_AT_MIXER)
     elif obstacle == "flowcell":
         state.set_flowcell_location(1, state.UNKNOWN)
     elif obstacle == "reference":
-        state.reset_carousel()
+        monkeypatch.setattr(state, "carousel_reference", lambda: None)
     elif obstacle == "coordination":
         wf.preparation = object()
     else:

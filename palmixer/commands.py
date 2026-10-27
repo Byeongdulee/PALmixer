@@ -980,8 +980,7 @@ def teach_carousel_slot_command(slot):
 
 
 def reset_carousel_command():
-    """Build the wire command to replace the carousel: drop the taught
-    reference position and every sample ID."""
+    """Free all slots, preserving the taught positions and carousel tracking."""
     return RESET_CAROUSEL
 
 

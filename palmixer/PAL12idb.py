@@ -3943,13 +3943,22 @@ def _pose_str(robot):
     return "[" + ", ".join("%.4f" % x for x in v) + "]"
 
 
+class NoCarouselError(RuntimeError):
+    """No carousel tag in view at a carousel seat -- the seat is empty.
+
+    A RuntimeError like before, so existing handlers are unchanged; its own type
+    lets a caller tell "nothing on that seat" (e.g. an empty stock seat, which
+    the operator fixes by loading one) from a motion or centring failure."""
+
+
 def _acquire_carousel(robot, station, approach_distance_m=None):
     """Centre and square the camera on the carousel at `station`.
 
-    Returns (tag_id, camera_to_tag_distance_m). Raises RuntimeError if no
-    acceptable carousel tag is in view. Mirrors locate_apriltag's centre+square
-    (including the tag mounting offset, apriltag_rz_offset) but does not drive to
-    a reference or grab -- the caller has already put the camera over the seat.
+    Returns (tag_id, camera_to_tag_distance_m). Raises NoCarouselError if no
+    acceptable carousel tag is in view, RuntimeError if centring fails. Mirrors
+    locate_apriltag's centre+square (including the tag mounting offset,
+    apriltag_rz_offset) but does not drive to a reference or grab -- the caller
+    has already put the camera over the seat.
 
     When approach_distance_m is set, after centring at the look height the camera
     is driven down to that camera-to-tag distance and re-centred there (a closer,
@@ -3963,7 +3972,7 @@ def _acquire_carousel(robot, station, approach_distance_m=None):
     # arrived over the seat and the first frames are usually blurry.
     if camera_tools._detect_apriltag(robot, settle=CAROUSEL_CENTER_SETTLE) is None:
         seen = list(getattr(robot.camera, 'AT_ids', []) or [])
-        raise RuntimeError(
+        raise NoCarouselError(
             "no carousel at %s: looked for tag(s) %s, tags in view %s"
             % (station, sorted(apriltag_ids(station) or []), seen))
 
@@ -4150,7 +4159,9 @@ def unload_current_carousel(robot):
     # that pose. Levelling the camera where it stands would leave it the camtcp
     # offset away from the centre, and the tag would fall outside the view.
     robot.put_camera2tcp()
-    _tag, dist = _acquire_carousel(robot, 'carousel_on_mixer')
+    tag, dist = _acquire_carousel(robot, 'carousel_on_mixer')
+    # Kept for the next carousel-load record's old tag (state.record_carousel_load).
+    state.set_last_unloaded_carousel(tag)
     _grab_carousel(robot, 'carousel_on_mixer', dist)
     _carousel_lift(robot)
     robot.set_tcp(robot.tcp)                 # gripper frame: the carousel is carried, not the camera

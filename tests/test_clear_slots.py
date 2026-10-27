@@ -23,17 +23,18 @@ def tracked(monkeypatch, tmp_path):
     return instance
 
 
-def test_clear_slots_preserves_reference_identity_positions_and_all_other_tracking(tracked):
+@pytest.mark.parametrize("command", [commands.clear_slots_command(), commands.reset_carousel_command()])
+def test_clear_slots_preserves_reference_identity_positions_and_all_other_tracking(tracked, command):
     before = state.snapshot()
     assert before["carousel_samples"] and before["carousel_sample_uids"]
-    assert tracked.fast_dispatch(commands.clear_slots_command()) == "OK"
+    assert tracked.fast_dispatch(command) == "OK"
     after = state.snapshot()
     assert after == dict(before, carousel_samples={}, carousel_sample_uids={}, carousel_full=False)
     assert after["carousel_reference"] == (2, 15.5)
     assert after["carousel_id"] == "tray-A"
     assert after["carousel_slot"] == 3
     # Metadata-only server fixture has no motor, robot or pump at all.
-    assert tracked.fast_dispatch("clear_slots") == "OK"
+    assert tracked.fast_dispatch(command) == "OK"
 
 
 def test_busy_clear_is_refused_without_changing_any_state(tracked):
@@ -43,7 +44,8 @@ def test_busy_clear_is_refused_without_changing_any_state(tracked):
     assert state.snapshot() == before
 
 
-def test_clear_rejects_unexpected_arguments(tracked):
+@pytest.mark.parametrize("command", [commands.clear_slots_command(), commands.reset_carousel_command()])
+def test_clear_rejects_unexpected_arguments(tracked, command):
     before = state.snapshot()
-    assert tracked.fast_dispatch("clear_slots 1").startswith("ERROR:")
+    assert tracked.fast_dispatch(command + " 1").startswith("ERROR:")
     assert state.snapshot() == before

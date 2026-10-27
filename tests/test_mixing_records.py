@@ -227,6 +227,7 @@ def test_server_records_partial_workflow_and_keeps_prepared_sample_identity(tmp_
     monkeypatch.setattr(state, "get_sample_id", lambda slot: "S1")
     monkeypatch.setattr(state, "get_carousel_id", lambda: "C1")
     monkeypatch.setattr(state, "get_flowcell_in_use", lambda: 1)
+    monkeypatch.setattr(state, "get_carousel_on_mixer", lambda: "37")
     def run(slot, sample_id):
         assert slot == 3 and sample_id == "S1"
         if failure == "before_mix":
@@ -248,6 +249,7 @@ def test_server_records_partial_workflow_and_keeps_prepared_sample_identity(tmp_
     envelope = json.loads(next(tmp_path.glob("*.json")).read_text())
     record = envelope["record"]
     assert record["sample_id"] == "S1" and record["slot"] == 3
+    assert record["carousel_id"] == "C1" and record["carousel_tag"] == "37"
     assert record["workflow_status"] == ("failed" if failure else "completed")
     assert record["mixing_status"] == ({"before_mix": "not_started", "during_mix": "stopped"}.get(failure, "completed"))
     assert instance._active_mix_record is None and instance._mix_sync_wake.is_set()

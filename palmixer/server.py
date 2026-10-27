@@ -1245,7 +1245,8 @@ class PALmixerServer:
         record = new_record(sample_id, slot, state.get_carousel_id(),
                             state.get_flowcell_in_use(), simulated=self.simulate,
                             sample_uid=(state.carousel_sample_uids().get(int(slot), "")
-                                        if state.get_sample_id(slot) == sample_id else ""))
+                                        if state.get_sample_id(slot) == sample_id else ""),
+                            carousel_tag=state.get_carousel_on_mixer())
         record["action_id"] = self._current_trace
         self._active_mix_record = record
         self._mix_record_thread = threading.get_ident()
@@ -1438,17 +1439,33 @@ class PALmixerServer:
         if self.simulate:
             time.sleep(2)
             state.set_carousel_on_mixer(None)
+            state.set_last_unloaded_carousel(None)
             return "simulated unload_carousel (mixer now empty)"
         pose = self.PAL12idb.unload_current_carousel(self.rob)
-        return "carousel unloaded to the used stack (arm at %s)" % (pose,)
+        return "carousel unloaded to the used stack (tag %s, arm at %s)" % (
+            state.get_last_unloaded_carousel(), pose)
 
     def _place_new_carousel(self):
+        detail, load = self._place_and_record_load()
+        return "%s; every slot cleared (carousel load %d)" % (detail, load["sequence"])
+
+    def _place_and_record_load(self, replacement_id=None):
+        """Place a new carousel, then record the load and free every slot.
+
+        Shared by the Place New Carousel button and the coordinated
+        replace_carousel operation, so both leave the inventory the same way.
+        The record is written only once the placement has returned: a placement
+        that raises clears nothing. Returns (detail, load record)."""
         if self.simulate:
             time.sleep(2)
-            return "simulated place_new_carousel"
-        pose = self.PAL12idb.place_new_carousel(self.rob)
-        return "new carousel placed on the mixer (tag %s, arm at %s)" % (
-            state.get_carousel_on_mixer(), pose)
+            detail = "simulated place_new_carousel"
+        else:
+            pose = self.PAL12idb.place_new_carousel(self.rob)
+            detail = "new carousel placed on the mixer (tag %s, arm at %s)" % (
+                state.get_carousel_on_mixer(), pose)
+        load = state.record_carousel_load(state.get_carousel_on_mixer(),
+                                          self._mixing_journal.was_mixed, replacement_id)
+        return detail, load
 
     def _goto_position(self, station):
         if self.simulate:

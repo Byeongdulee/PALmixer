@@ -140,14 +140,12 @@ class WorkflowTab(QWidget):
             self.sample_id_edit.setText(now)
 
     def _on_reset_carousel(self):
-        # Destructive and not obviously so: it discards the taught positions
-        # too, so say that before doing it rather than after.
         used = len(self._samples)
         if QMessageBox.question(
                 self, "Replace Carousel",
                 "Reset the carousel inventory?\n\n"
-                "This clears all %d sample ID(s) AND the taught reference position, "
-                "so one slot must be taught again before the next sample.\n\n"
+                "This clears all %d sample ID(s) and their UUIDs, making every slot free. "
+                "Taught positions, carousel identity and current motor position are preserved.\n\n"
                 "Do this after physically swapping in a fresh carousel." % used,
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return

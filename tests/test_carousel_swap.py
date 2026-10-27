@@ -169,6 +169,7 @@ def test_unload_sequence(stations, quiet_camera, tmp_state, monkeypatch):
     assert moves[-2][1][3:] == used[3:]               # dropped at the stack's own heading
     assert moves[-1][1] == moves[-2][1]               # returned to the clear height
     assert state.get_carousel_on_mixer() == state.UNKNOWN   # mixer now empty
+    assert state.get_last_unloaded_carousel() == "33"       # kept for the carousel-load record
 
 
 def test_unload_stacks_on_an_existing_used_carousel(stations, quiet_camera, tmp_state, monkeypatch):
@@ -214,6 +215,19 @@ def test_unload_errors_when_no_carousel(stations, quiet_camera, tmp_state, monke
     with pytest.raises(RuntimeError, match="no carousel"):
         PAL12idb.unload_current_carousel(FakeRobot())
     assert state.get_carousel_on_mixer() == state.UNKNOWN   # left honestly unknown
+
+
+def test_acquire_reports_an_empty_seat_as_no_carousel(monkeypatch):
+    # Its own type, so replace_carousel can tell an empty stock seat from a
+    # motion failure; still a RuntimeError with the same message for everyone else.
+    monkeypatch.setattr(PAL12idb.camera_tools, "_detect_apriltag", lambda robot, settle=None: None)
+    monkeypatch.setattr(PAL12idb, "apriltag_size", lambda s: 0.03)
+    monkeypatch.setattr(PAL12idb, "apriltag_ids", lambda s: {31, 32})
+    rob = FakeRobot()
+    rob.camera.AT_ids = []
+    assert issubclass(PAL12idb.NoCarouselError, RuntimeError)
+    with pytest.raises(PAL12idb.NoCarouselError, match="no carousel at carousel_in_stock"):
+        PAL12idb._acquire_carousel(rob, "carousel_in_stock")
 
 
 # -- place ------------------------------------------------------------------
