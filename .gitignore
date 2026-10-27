@@ -9,6 +9,8 @@ dist/
 json/mixing_records/
 palmixer/waypoints.ini
 palmixer/palmixer_state.ini
+palmixer/palmixer_state.ini.*
+palmixer/preparation-*.json*
 palmixer/daq_positions.ini
 
 # local tooling state
