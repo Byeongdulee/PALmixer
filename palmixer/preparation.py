@@ -61,6 +61,7 @@ class PreparationCoordinator:
         self._cycle = None
         self._window = None
         self._initial = None
+        self._inspection = None
         self._records = {}
         self._error = ""
         if self.path.exists():
@@ -69,6 +70,9 @@ class PreparationCoordinator:
                 raise PreparationError("Unsupported preparation state version")
             self._records = saved["placements"]
             self._error = saved.get("error", "")
+            self._inspection = saved.get("inspection")
+            if self._inspection:
+                self._error = "Restart interrupted an empty-cell inspection; reconciliation required"
             if saved.get("cycle"):
                 self._error = "Restart interrupted a sample workflow; reconciliation required"
             for record in self._records.values():
@@ -82,7 +86,7 @@ class PreparationCoordinator:
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         with temporary.open("w", encoding="utf-8") as handle:
             json.dump({"version": 1, "placements": self._records, "error": self._error,
-                       "cycle": self._cycle},
+                       "cycle": self._cycle, "inspection": self._inspection},
                       handle, allow_nan=False)
             handle.flush()
             os.fsync(handle.fileno())
@@ -94,7 +98,7 @@ class PreparationCoordinator:
     def snapshot(self):
         with self._lock:
             return deepcopy({"placements": self._records, "error": self._error,
-                             "cycle": self._cycle, "window": self._window})
+                             "cycle": self._cycle, "window": self._window, "inspection": self._inspection})
 
     def get(self, placement_id):
         with self._lock:
@@ -129,7 +133,7 @@ class PreparationCoordinator:
         """Called only after the initial existing clearance sequence returns."""
         with self._lock:
             record = self._records[placement_id]
-            if self._cycle or self._window or self._error or self._closing:
+            if self._cycle or self._window or self._error or self._closing or self._inspection:
                 raise PreparationError("Initial preparation is not eligible")
             if record["phase"] != "pending" or record["binding"]["release_after_sample_uid"] is not None:
                 raise PreparationError("Not an initial pending placement")
@@ -138,7 +142,7 @@ class PreparationCoordinator:
 
     def begin_sample(self, sample_uid, slot, action_id, *, carousel_id):
         with self._lock:
-            if self._closing or self._error or self._cycle:
+            if self._closing or self._error or self._cycle or self._inspection:
                 raise PreparationError(self._error or "A sample workflow is already active")
             if not isinstance(action_id, str) or not action_id.strip():
                 raise PreparationError("A workflow action identity is required")
@@ -193,7 +197,7 @@ class PreparationCoordinator:
 
     def _kick(self):
         record = self._active()
-        if self._closing or self._error or not record or record["phase"] != "pending":
+        if self._closing or self._error or self._inspection or not record or record["phase"] != "pending":
             return
         previous = record["binding"]["release_after_sample_uid"]
         if previous is None:
@@ -286,9 +290,30 @@ class PreparationCoordinator:
     def require_idle(self):
         """Guard a conflicting manual carousel action or return-to-vial path."""
         with self._lock:
-            if self._active() or self._cycle or self._error:
+            if self._active() or self._cycle or self._error or self._inspection:
                 raise PreparationError("Preparation coordination owns the carousel")
             self._window = None
+
+    def begin_inspection(self, inspection_id):
+        """Hold positioning and mixing while the empty cell is away from its station."""
+        with self._lock:
+            if self._inspection == inspection_id:
+                return
+            active = self._active()
+            if (self._closing or self._error or self._cycle or self._inspection
+                    or (active and active['phase'] != 'pending')):
+                raise PreparationError("Wait for PAL clearance before the empty-cell inspection")
+            self._inspection = inspection_id
+            self._save()
+
+    def end_inspection(self, inspection_id):
+        """Called only after the matching cell return and arm parking complete."""
+        with self._lock:
+            if self._inspection != inspection_id or self._error or self._closing:
+                raise PreparationError("The empty-cell inspection cannot be released")
+            self._inspection = None
+            self._save()
+            self._kick()
 
     def invalidate(self, error):
         """Latch an uncertain clearance/motion failure without automatic replay."""

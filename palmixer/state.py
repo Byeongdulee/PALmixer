@@ -698,7 +698,7 @@ def _raw_slot_table(parser):
     return table
 
 
-def record_carousel_load(new_tag, was_mixed, replacement_id=None):
+def record_carousel_load(new_tag, was_mixed, replacement_id=None, *, hand_placed=False):
     """Save the carousel-load record and free every slot, in ONE transition.
 
     Called only after a placement has seated the new carousel -- a failed
@@ -706,6 +706,10 @@ def record_carousel_load(new_tag, was_mixed, replacement_id=None):
     whether the mixing records show that sample was mixed (MixingJournal.was_mixed).
     The carousel ID label, taught reference and tracked slot are untouched.
     Returns the record.
+
+    ``hand_placed`` is the Replace Carousel (Reset) button: the operator seated a
+    carousel the camera never read. Its tag is recorded as unknown, and the old tag
+    is the last-unloaded one or, failing that, the carousel on the mixer until now.
     """
     # The journal lookups read files, so they are made before taking the state
     # lock (get_state waits on it) and only repeated inside it for a slot that
@@ -728,6 +732,8 @@ def record_carousel_load(new_tag, was_mixed, replacement_id=None):
         except ValueError:
             previous = 0
         old = parser.get(_TRACKING, "last_unloaded_carousel", fallback="").strip()
+        if hand_placed and not old:
+            old = parser.get(_TRACKING, "carousel_on_mixer", fallback="").strip()
         record = {
             "load_id": uuid4().hex,
             "sequence": previous + 1,
@@ -751,6 +757,10 @@ def record_carousel_load(new_tag, was_mixed, replacement_id=None):
         # Consumed: the next load must not claim this carousel as its old one.
         if parser.has_option(_TRACKING, "last_unloaded_carousel"):
             parser.remove_option(_TRACKING, "last_unloaded_carousel")
+        if hand_placed:
+            if not parser.has_section(_TRACKING):
+                parser.add_section(_TRACKING)
+            parser.set(_TRACKING, "carousel_on_mixer", UNKNOWN)
         saved.append(record)
     _mutate(apply)
     return saved[0]

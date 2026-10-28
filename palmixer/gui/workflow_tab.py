@@ -143,10 +143,9 @@ class WorkflowTab(QWidget):
         used = len(self._samples)
         if QMessageBox.question(
                 self, "Replace Carousel",
-                "Reset the carousel inventory?\n\n"
-                "This clears all %d sample ID(s) and their UUIDs, making every slot free. "
-                "Taught positions, carousel identity and current motor position are preserved.\n\n"
-                "Do this after physically swapping in a fresh carousel." % used,
+                "Is a new carousel seated on the mixer?\n\n"
+                "Yes frees every slot (clears all %d sample ID(s) and their UUIDs). PALsystem then "
+                "continues its queue on the new carousel. Taught positions are kept." % used,
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         self._send_command(cmd.reset_carousel_command())

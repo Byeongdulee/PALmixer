@@ -312,6 +312,8 @@ def coordinated(server, tracked, monkeypatch):
 
     monkeypatch.setattr(preparation_api, "threading",
                         SimpleNamespace(Thread=RecordingThread, RLock=threading.RLock))
+    # Robot placement is blocked by default for now; these tests exercise the full swap.
+    monkeypatch.setattr(preparation_api, "auto_place_new_carousel", lambda: True)
     api = PreparationAPI(server, tracked / "session.json")
     server.preparation_api = api
     api.request({"version": 1, "run_id": RUN, "op": "begin"})
@@ -497,4 +499,52 @@ def test_preconditions_refuse_before_accepting(coordinated, obstacle, match):
     assert c.started == [] and c.pal.log == []
     assert c.api.record.get("replacements", {}) == {}
     assert json.loads(c.path.read_text()).get("replacements", {}) == {}
+    assert sorted(state.carousel_samples()) == [1, 2, 5]
+
+
+# -- placement blocked: the operator seats the carousel and presses Reset --------------
+def test_blocked_placement_stops_after_unload_and_reset_finishes_it(coordinated, journal, monkeypatch):
+    c = coordinated
+    monkeypatch.setattr(preparation_api, "auto_place_new_carousel", lambda: False)
+    save_mix(journal, "S-one", UID_ONE)
+    message = replace_message()
+    rid = message["replacement_id"]
+    c.api.request(message)
+    c.finish()
+    record = status(c)["replacements"][rid]
+    assert record["state"] == "waiting_for_carousel"
+    assert record["error"] == preparation_api.WAITING_FOR_CAROUSEL_MESSAGE
+    assert c.pal.log == ["unload"]                      # no robot placement
+    assert sorted(state.carousel_samples()) == [1, 2, 5]  # nothing cleared yet
+    assert c.api.record["error"] == "" and c.server._last_result["ok"] is True
+    # The session is still open, yet Reset is accepted while the swap waits for it.
+    assert c.api.active and c.server.fast_dispatch("reset_carousel") == "OK"
+    record = status(c)["replacements"][rid]
+    assert record["state"] == "committed" and record["placed_by"] == "operator"
+    load = record["load"]
+    assert (load["old_tag"], load["new_tag"], load["replacement_id"]) == ("33", "unknown", rid)
+    assert [(s["slot"], s["mixed"]) for s in load["slots"]] == [(1, True), (2, False), (5, False)]
+    assert state.carousel_samples() == {} and state.get_carousel_on_mixer() == state.UNKNOWN
+    assert state.carousel_load()["record"] == load
+    # Anything else stays blocked by the session.
+    assert c.server.fast_dispatch("clear_slots").startswith("ERROR: coordinated")
+
+
+def test_reset_is_refused_in_a_session_unless_a_replacement_waits(coordinated):
+    reply = coordinated.server.fast_dispatch("reset_carousel")
+    assert reply.startswith("ERROR: coordinated preparation owns the equipment")
+    assert sorted(state.carousel_samples()) == [1, 2, 5]
+
+
+def test_reset_outside_a_session_records_a_hand_placed_load(server):
+    state.set_carousel_on_mixer(32)
+    assert server.fast_dispatch("reset_carousel") == "OK"
+    load = state.carousel_load()["record"]
+    assert (load["sequence"], load["old_tag"], load["new_tag"], load["replacement_id"]) == (1, "32", "unknown", None)
+    assert state.carousel_samples() == {} and state.get_carousel_on_mixer() == state.UNKNOWN
+
+
+def test_reset_is_refused_while_busy(server):
+    server._busy, server._current_action = True, "make_sample"
+    assert server.fast_dispatch("reset_carousel").startswith("ERROR: busy")
     assert sorted(state.carousel_samples()) == [1, 2, 5]

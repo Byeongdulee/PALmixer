@@ -5,6 +5,7 @@ from uuid import uuid4
 import pytest
 
 from palmixer import commands, state
+from palmixer.mixing_records import MixingJournal
 from palmixer.server import PALmixerServer
 
 
@@ -20,6 +21,8 @@ def tracked(monkeypatch, tmp_path):
     instance = object.__new__(PALmixerServer)
     instance._busy = False
     instance._busy_lock = threading.Lock()
+    instance._current_action = None
+    instance._mixing_journal = MixingJournal(tmp_path / "records")
     return instance
 
 
@@ -29,7 +32,14 @@ def test_clear_slots_preserves_reference_identity_positions_and_all_other_tracki
     assert before["carousel_samples"] and before["carousel_sample_uids"]
     assert tracked.fast_dispatch(command) == "OK"
     after = state.snapshot()
-    assert after == dict(before, carousel_samples={}, carousel_sample_uids={}, carousel_full=False)
+    expected = dict(before, carousel_samples={}, carousel_sample_uids={}, carousel_full=False)
+    if command == commands.reset_carousel_command():
+        # Reset declares a fresh, hand-placed carousel: it records the load (so PALsystem
+        # catches up) and the camera never read the new carousel's tag.
+        assert after["carousel_load"]["sequence"] == 1
+        assert after["carousel_load"]["record"]["new_tag"] == state.UNKNOWN
+        expected.update(carousel_load=after["carousel_load"], carousel_on_mixer=state.UNKNOWN)
+    assert after == expected
     assert after["carousel_reference"] == (2, 15.5)
     assert after["carousel_id"] == "tray-A"
     assert after["carousel_slot"] == 3

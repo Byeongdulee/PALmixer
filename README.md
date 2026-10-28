@@ -201,7 +201,7 @@ that call. See the docstring in `_winenv.py`.
 | `set_sample_id <slot> <sample id>` | fast | Tag `slot` with a sample ID, marking it used. Overwrites any existing ID |
 | `get_sample_id <slot>` | fast | That slot's sample ID, or `unknown` if it is unused |
 | `clear_sample_id <slot>` | fast | Drop the slot's sample ID, marking it unused again |
-| `reset_carousel` | fast | Free every slot: clear sample IDs and UUIDs, preserving taught positions and carousel tracking |
+| `reset_carousel` | fast | A fresh carousel is seated by hand: record the carousel load and free every slot, preserving taught positions. Refused while busy; during a coordinated session, allowed only while a replacement waits for a carousel |
 
 Every argument is a single whitespace-delimited token except a sample ID,
 which is the rest of the line and may contain spaces (runs of whitespace in it
@@ -832,9 +832,12 @@ advisory, not a block -- re-mixing a used slot stays legal -- but it is
 surfaced in the tracking snapshot, in red on the Automation tab, and in the
 `make_sample` completion detail. Swap in a fresh carousel, then
 `reset_carousel` (the tab's **Replace Carousel (Reset)** button, behind a
-confirmation). That clears all sample IDs and UUIDs, making every slot free.
-The taught reference, carousel identity and current motor position are preserved;
-this command performs no motion. The geometry is configuration
+confirmation, "Is a new carousel seated on the mixer?"). That records a
+carousel load and clears all sample IDs and UUIDs, making every slot free, so
+PALsystem releases its holds and continues. The new carousel's tag is recorded as
+`unknown`, because the camera never read it. The taught reference, carousel
+identity and current motor position are preserved; this command performs no
+motion. The geometry is configuration
 and is untouched; a physically different carousel means editing
 `json/palmixer_config.json` and restarting the server.
 
@@ -861,7 +864,16 @@ after a hand swap. `slots` lists everything the old slot tables held. `mixed` is
 true when a saved mixing record for that sample (by UUID, else by sample ID)
 shows that mixing started. `replacement_id` names the coordinated replacement
 that placed the carousel, or is `null` for the button. Only the latest record is
-kept. **Replace Carousel (Reset)** does not write one.
+kept. **Replace Carousel (Reset)** writes one too, with `new_tag` `unknown`.
+
+**Robot placement is blocked for now.** `carousel.auto_place_new_carousel` in
+`json/palmixer_config.json` is `false` (also the default when absent). A
+coordinated `replace_carousel` then unloads the old carousel and stops in state
+`waiting_for_carousel`, without latching the session. The operator seats a new
+carousel by hand and presses **Replace Carousel (Reset)**, which is accepted during
+the coordinated session while that replacement waits; it records the load with the
+replacement's ID and marks the replacement `committed`. Set the option to `true`
+once robot placement has been verified, and the full swap runs again.
 
 ## Automation workflows
 

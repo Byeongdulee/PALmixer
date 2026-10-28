@@ -45,6 +45,7 @@
     "step": -4500,
     "draw_offset_steps": 4,
     "preparation_offset_steps": -4,
+    "auto_place_new_carousel": false,
     "radius_mm": 50.0,
     "tube_diameter_mm": 10.0
   },

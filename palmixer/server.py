@@ -271,7 +271,10 @@ class PALmixerServer:
                 return json.dumps({"ok": False, "error": str(error)})
         if api and api.active and name not in {
                 cmd.STATUS, cmd.GET_STATE, "get_sample_id", "get_pose", "get_tcp", "get_joints", "stop_search"}:
-            return "ERROR: coordinated preparation owns the equipment"
+            # The one exception: a replacement stopped after unloading, waiting for the
+            # operator to seat a new carousel and press Replace Carousel (Reset).
+            if not (name == cmd.RESET_CAROUSEL and not self._busy and api.waiting_for_carousel()):
+                return "ERROR: coordinated preparation owns the equipment"
 
         if name == cmd.STATUS:
             return STATE_BUSY if self._busy else STATE_IDLE
@@ -438,7 +441,15 @@ class PALmixerServer:
         if name == cmd.RESET_CAROUSEL:
             if args:
                 return "ERROR: %s takes no arguments" % cmd.RESET_CAROUSEL
-            state.reset_carousel()
+            if self._busy:
+                return "ERROR: busy (running %r); reset the carousel once PALmixer is idle" % self._current_action
+            # A fresh carousel is seated: record the load and free every slot, exactly
+            # as Place New Carousel does, so PALsystem releases its holds and continues.
+            waiting = api.waiting_for_carousel() if api else None
+            load = state.record_carousel_load(None, self._mixing_journal.was_mixed, waiting,
+                                              hand_placed=True)
+            if waiting:
+                api.finish_by_reset(waiting, load)
             return "OK"
 
         # The sample ID is the rest of the line, so it may contain spaces.

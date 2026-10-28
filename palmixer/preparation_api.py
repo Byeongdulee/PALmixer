@@ -8,9 +8,21 @@ from uuid import UUID, uuid4
 
 from . import config, state
 from .preparation import PreparationCoordinator
+from .empty_cell import active_inspection, inspection_action
 
 # Reported when placement finds the stock seat empty after the old carousel was
 # already unloaded. Not a session failure: the operator's button press finishes it.
+#: Placement is blocked for now (carousel.auto_place_new_carousel is false): the swap
+#: stops after unloading, and the operator's Replace Carousel (Reset) finishes it.
+WAITING_FOR_CAROUSEL_MESSAGE = ("Old carousel removed. Place a new carousel on the mixer by hand, "
+                                "then press Replace Carousel (Reset) on PALmixer.")
+
+
+def auto_place_new_carousel():
+    """Whether a coordinated replacement also places the new carousel by robot."""
+    return bool(config.get_section('carousel').get('auto_place_new_carousel', False))
+
+
 NO_STOCK_MESSAGE = ("No fresh carousel in stock. Put one on the stock seat and press "
                     "Place New Carousel on PALmixer.")
 
@@ -39,9 +51,26 @@ class PreparationAPI:
             os.fsync(handle.fileno())
         os.replace(temporary, self.path)
 
+    def waiting_for_carousel(self):
+        """The replacement in this session waiting for a hand-placed carousel, or None."""
+        with self.lock:
+            if not self.active:
+                return None
+            return next((rid for rid, r in self.record.get('replacements', {}).items()
+                         if r.get('state') == 'waiting_for_carousel'), None)
+
+    def finish_by_reset(self, replacement_id, load):
+        """The operator seated a new carousel and pressed Replace Carousel (Reset)."""
+        with self.lock:
+            record = self.record.get('replacements', {}).get(replacement_id)
+            if record and record.get('state') == 'waiting_for_carousel':
+                record.update(state='committed', error='', load=load, placed_by='operator')
+                self._save()
+
     def snapshot(self):
         with self.lock:
             return {'version': 1, 'active': self.active, 'run_id': self.record.get('run_id'),
+                    'empty_cell_inspection_version': 1, 'inspection': deepcopy(active_inspection(self)),
                     'error': self.record.get('error', ''),
                     'offset_steps': config.get_section('carousel').get('preparation_offset_steps')}
 
@@ -106,6 +135,10 @@ class PreparationAPI:
                 return self.snapshot()
             if self.record.get('error') or self.coordinator is None:
                 raise ValueError(self.record.get('error') or 'No preparation coordinator')
+            if op in ('inspection_load', 'inspection_unload'):
+                return inspection_action(self, message)
+            if active_inspection(self) and op not in ('queue', 'release', 'tag'):
+                raise ValueError('An empty-cell inspection holds the equipment until the cell returns')
             if op == 'queue':
                 binding = message['binding']
                 if binding['carousel_id'] != state.get_carousel_id():
@@ -255,6 +288,11 @@ class PreparationAPI:
                 progress('unloading')
                 unloaded = self.server._unload_carousel()
                 progress('old_removed')
+                if not auto_place_new_carousel():
+                    # Placement is blocked for now. The session stays usable, and the
+                    # operator's Replace Carousel (Reset) records the load.
+                    progress('waiting_for_carousel', error=WAITING_FOR_CAROUSEL_MESSAGE)
+                    return '%s; %s' % (unloaded, WAITING_FOR_CAROUSEL_MESSAGE)
                 progress('placing')
                 placing = True
                 placed, load = self.server._place_and_record_load(replacement_id)
