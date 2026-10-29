@@ -70,7 +70,8 @@ class PreparationAPI:
     def snapshot(self):
         with self.lock:
             return {'version': 1, 'active': self.active, 'run_id': self.record.get('run_id'),
-                    'empty_cell_inspection_version': 1, 'inspection': deepcopy(active_inspection(self)),
+                    'empty_cell_inspection_version': 1, 'reset_version': 1,
+                    'inspection': deepcopy(active_inspection(self)),
                     'error': self.record.get('error', ''),
                     'offset_steps': config.get_section('carousel').get('preparation_offset_steps')}
 
@@ -105,6 +106,8 @@ class PreparationAPI:
                 self._save()
                 self.server.workflows.preparation = self.coordinator
                 return self.snapshot()
+            if op == 'reset':
+                return self._reset(message)
             if run_id != self.record.get('run_id') or not self.active:
                 raise ValueError('This run does not own coordinated preparation')
             if op == 'status':
@@ -126,12 +129,7 @@ class PreparationAPI:
                     raise ValueError('Confirm PAL cleared the carousel and holders before discarding the session')
                 if self.server._busy or self.server.workflows.cleanup_snapshot().get('active'):
                     raise ValueError('Wait for motion and cleanup to finish before discarding the session')
-                if self.coordinator:
-                    self.coordinator.invalidate('Preparation session discarded by operator')
-                    self.coordinator.close()
-                self.server.workflows.preparation = None
-                self.record = dict(active=False, run_id=run_id, error='')
-                self._save()
+                self._discard_session(run_id)
                 return self.snapshot()
             if self.record.get('error') or self.coordinator is None:
                 raise ValueError(self.record.get('error') or 'No preparation coordinator')
@@ -177,6 +175,34 @@ class PreparationAPI:
                 self._save()
                 return self.snapshot()
             raise ValueError('Unknown preparation operation')
+
+    def _discard_session(self, run_id):
+        if self.coordinator:
+            self.coordinator.invalidate('Preparation session discarded by operator')
+            self.coordinator.close()
+        self.server.workflows.preparation = None
+        self.record = dict(active=False, run_id=run_id, error='')
+        self._save()
+
+    def _reset(self, message):
+        """PALsystem's Clear interrupted run, after the operator inspected PALmixer.
+
+        Discards the session an interrupted run left open and acknowledges failed
+        cleanup steps -- the two things that make the next `begin` refuse. No motion.
+        With a session open, `run_id` must name it, so only the session PALsystem
+        saw is discarded; with none open, any run UUID will do.
+        """
+        if message.get('acknowledged') is not True:
+            raise ValueError('Confirm PAL cleared the carousel and PALmixer was inspected before resetting')
+        if self.server._busy or self.server.workflows.cleanup_snapshot().get('active'):
+            raise ValueError('Wait for motion and cleanup to finish before resetting')
+        discarded = self.active
+        if discarded:
+            if message['run_id'] != self.record.get('run_id'):
+                raise ValueError('Another run owns coordinated preparation')
+            self._discard_session(message['run_id'])
+        acknowledged = self.server.workflows.acknowledge_cleanup_problems()
+        return dict(self.snapshot(), discarded=discarded, cleanup_acknowledged=acknowledged)
 
     def _action(self, message):
         key = message['action_key']

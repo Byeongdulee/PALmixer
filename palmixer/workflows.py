@@ -183,6 +183,18 @@ class Workflows:
                     "problem": "; ".join(k + ": " + v["error"] for k, v in operations.items()
                                            if v["status"] == "failed")}
 
+    def acknowledge_cleanup_problems(self):
+        """Forget failed cleaning steps once an operator has inspected PALmixer.
+
+        A failure otherwise refuses coordinated work until that step next succeeds.
+        Returns the steps forgotten; a running step is never touched.
+        """
+        with self._cleanup_lock:
+            failed = sorted(k for k, v in self._cleanup_operations.items() if v["status"] == "failed")
+            for name in failed:
+                del self._cleanup_operations[name]
+            return failed
+
     def _cleanup_begin(self, name):
         with self._cleanup_lock:
             if name not in ("clean_mixer", "wash_flowcell"):

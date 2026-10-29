@@ -383,6 +383,58 @@ def test_discard_refused_while_mixer_or_cleanup_is_busy(tmp_path):
     assert api.active  # Session preserved until the mixer is idle.
 
 
+def _reset_server(busy=False):
+    from palmixer.workflows import Workflows
+    workflows = Workflows(None, None, None, None)
+    workflows.preparation = object()
+    return SimpleNamespace(_busy=busy, simulate=False, workflows=workflows)
+
+
+def test_reset_discards_a_left_session_and_acknowledges_failed_cleanup(tmp_path):
+    import json as _json
+    from palmixer.preparation_api import PreparationAPI
+    run_id = "752e4fc0-fa3d-47ac-ab9e-68624b0763a4"
+    path = tmp_path / "session.json"
+    path.write_text(_json.dumps({"active": True, "run_id": run_id, "actions": {}, "error": ""}))
+    server = _reset_server()
+    workflows = server.workflows
+    workflows._cleanup_end("wash_flowcell", workflows._cleanup_begin("wash_flowcell"), "pump timeout")
+    workflows._cleanup_end("clean_mixer", workflows._cleanup_begin("clean_mixer"))
+    api = PreparationAPI(server, path)
+    assert api.snapshot()["reset_version"] == 1
+    reset = {"version": 1, "run_id": run_id, "op": "reset", "acknowledged": True}
+    with pytest.raises(ValueError, match="Confirm"):
+        api.request(dict(reset, acknowledged=False))
+    with pytest.raises(ValueError, match="Another run"):
+        api.request(dict(reset, run_id="0c7a5e2b-1f43-4d8e-9a55-0f6a3c2d7b19"))
+    assert api.active and workflows.cleanup_snapshot()["problem"]
+    result = api.request(reset)
+    assert result["discarded"] is True and result["active"] is False
+    assert result["cleanup_acknowledged"] == ["wash_flowcell"]
+    cleanup = workflows.cleanup_snapshot()
+    assert not cleanup["problem"] and not cleanup["wash_complete"]
+    assert cleanup["operations"]["clean_mixer"]["status"] == "completed"
+    assert workflows.preparation is None
+    assert not PreparationAPI(server, path).active  # Durable across restart.
+    # With no session open, any run UUID resets; a repeat changes nothing.
+    again = api.request(dict(reset, run_id="0c7a5e2b-1f43-4d8e-9a55-0f6a3c2d7b19"))
+    assert again["discarded"] is False and again["cleanup_acknowledged"] == []
+
+
+def test_reset_refused_while_mixer_or_cleanup_is_busy(tmp_path):
+    from palmixer.preparation_api import PreparationAPI
+    run_id = "752e4fc0-fa3d-47ac-ab9e-68624b0763a4"
+    reset = {"version": 1, "run_id": run_id, "op": "reset", "acknowledged": True}
+    server = _reset_server(busy=True)
+    with pytest.raises(ValueError, match="motion and cleanup"):
+        PreparationAPI(server, tmp_path / "busy.json").request(reset)
+    server = _reset_server()
+    server.workflows._cleanup_begin("wash_flowcell")  # Still running.
+    with pytest.raises(ValueError, match="motion and cleanup"):
+        PreparationAPI(server, tmp_path / "washing.json").request(reset)
+    assert server.workflows.cleanup_snapshot()["active"]
+
+
 @pytest.mark.parametrize("step", [4500, -4500])
 @pytest.mark.parametrize("load_slot,position_slot", [
     (1, 13), (2, 14), (3, 15), (4, 16), (5, 1), (8, 4), (16, 12),
