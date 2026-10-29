@@ -90,7 +90,8 @@ def _build_motor(motor_cfg):
         if not ip:
             raise ValueError("motor.type is 'galil' but motor.ip is not set in "
                              "json/palmixer_config.json")
-        return GalilMotor(ip, motor_cfg.get("channel", "A"))
+        return GalilMotor(ip, motor_cfg.get("channel", "A"),
+                          speed=motor_cfg.get("speed"), accel=motor_cfg.get("accel"))
     raise ValueError("motor.type must be 'galil' or 'epics', got %r" % (kind,))
 
 

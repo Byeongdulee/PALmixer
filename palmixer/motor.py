@@ -26,6 +26,24 @@ from . import capath
 FORWARD = "forward"
 REVERSE = "reverse"
 
+# How long a finished Galil move may take to show its final counts. A stepper's
+# pulse output trails the profiler by its KS smoothing -- milliseconds -- so the
+# first read normally agrees already; this only bounds a slow one.
+_ARRIVAL_SETTLE_S = 1.0
+_ARRIVAL_POLL_S = 0.05
+
+# Galil stop codes (SC) worth naming when a move ends short of its target.
+_GALIL_STOP_CODES = {
+    0: "still moving",
+    1: "stopped at the commanded position",
+    2: "stopped by the forward limit switch",
+    3: "stopped by the reverse limit switch",
+    4: "stopped by an ST command",
+    6: "stopped by the abort input",
+    7: "stopped by an AB command",
+    8: "stopped by off-on-error",
+}
+
 
 class MotorError(Exception):
     """Raised when a PV cannot be read/written or a move does not complete."""
@@ -151,12 +169,18 @@ class GalilMotor:
     those counts against this motor. The connection is opened lazily and the
     motor turned on (SH<channel>) the first time it is used; gclib is imported
     there too, so this module stays importable on a host without it.
+
+    ``speed`` (counts/s) and ``accel`` (counts/s^2, used for deceleration too)
+    are sent before every move; None leaves the controller's own values alone.
     """
 
-    def __init__(self, ip, channel="A"):
+    def __init__(self, ip, channel="A", speed=None, accel=None):
         self.ip = ip
         self.channel = str(channel).strip().upper()
+        self.speed = _positive_count("speed", speed)
+        self.accel = _positive_count("accel", accel)
         self._g = None
+        self._stepper = False
         self._lock = threading.RLock()
 
     # -- connection ---------------------------------------------------------
@@ -187,9 +211,13 @@ class GalilMotor:
                 g = gclib.py()
                 g.GOpen(self.ip)
                 g.GCommand("SH%s;" % self.channel)   # turn the motor on (servo here)
+                # MT is +/-1 or 1.5 for a servo, 2 and up for a stepper. Only a
+                # stepper's TD is its step count; on a servo it is an encoder.
+                mt = float(g.GCommand("MG _MT%s" % self.channel))
             except Exception as e:                    # gclib.GclibError and friends
                 raise MotorError("could not open the Galil controller at %s "
                                  "(channel %s): %s" % (self.ip, self.channel, e))
+            self._stepper = abs(mt) >= 2
             self._g = g
             return g
 
@@ -201,17 +229,61 @@ class GalilMotor:
         except Exception as e:
             raise MotorError("Galil command %r failed: %s" % (cmd, e))
 
-    # -- the Motor interface ------------------------------------------------
-    def read(self):
-        """The channel's current reference position (RP), as an integer count."""
-        raw = self._command("RP")          # all channels, CSV, like tw_galil
+    def _axis_value(self, query):
+        """This channel's entry of an all-channel report (RP, TD), as an int."""
+        raw = self._command(query)         # all channels, CSV, like tw_galil
         parts = [p for p in str(raw).replace(":", "").split(",") if p.strip()]
         idx = ord(self.channel) - ord("A")
         try:
             return int(float(parts[idx]))
         except (IndexError, ValueError) as e:
-            raise MotorError("could not read channel %s position from %r: %s"
-                             % (self.channel, raw, e))
+            raise MotorError("could not read channel %s %s from %r: %s"
+                             % (self.channel, query, raw, e))
+
+    def _apply_motion_profile(self):
+        """Send the configured speed and acceleration ahead of a move.
+
+        Every move rather than once at connect: the controller keeps whatever it
+        was last told, by anyone, and forgets it on a power cycle -- saying it
+        each time is the only way the carousel is sure to turn at this speed."""
+        if self.speed is not None:
+            self._command("SP%s=%i" % (self.channel, self.speed))
+        if self.accel is not None:
+            self._command("AC%s=%i" % (self.channel, self.accel))
+            self._command("DC%s=%i" % (self.channel, self.accel))
+
+    def _verify_arrived(self, target):
+        """Return the position, or raise MotorError unless the move ended at ``target``.
+
+        GMotionComplete only says the motion stopped, not where: a limit switch,
+        an abort or off-on-error stops it early and it still "completes". So the
+        reference position (RP, what the profiler commanded) must equal the
+        target, and on a stepper so must the step count (TD, the pulses actually
+        sent to the driver). The stepper has no encoder, so this proves the
+        controller drove the whole move -- not that a stalled motor followed it.
+        """
+        deadline = time.monotonic() + _ARRIVAL_SETTLE_S
+        while True:
+            position = self.read()
+            steps = self._axis_value("TD") if self._stepper else position
+            if position == target and steps == target:
+                return position
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_ARRIVAL_POLL_S)
+        try:
+            code = int(float(self._command("MG _SC%s" % self.channel)))
+            why = _GALIL_STOP_CODES.get(code, "stop code %d" % code)
+        except (MotorError, ValueError):
+            why = "stop code unreadable"
+        counted = (", step count %i" % steps) if self._stepper else ""
+        raise MotorError("Galil channel %s did not reach %i: it ended at %i%s (%s)"
+                         % (self.channel, target, position, counted, why))
+
+    # -- the Motor interface ------------------------------------------------
+    def read(self):
+        """The channel's current reference position (RP), as an integer count."""
+        return self._axis_value("RP")
 
     def wait_done(self, timeout=120.0, poll_interval=0.1):
         """Block until this channel's move completes.
@@ -234,25 +306,39 @@ class GalilMotor:
         return
 
     def tweak(self, direction, step, timeout=60.0):
-        """Move one relative step (PR + BG) in ``direction``, wait, return the
-        new position. ``step`` is a Galil step count."""
+        """Move one relative step (PR + BG) in ``direction``, wait, verify the
+        arrival and return the new position. ``step`` is a Galil step count."""
         if direction not in (FORWARD, REVERSE):
             raise ValueError("direction must be %r or %r, got %r"
                              % (FORWARD, REVERSE, direction))
         counts = abs(int(round(float(step))))
         if direction == REVERSE:
             counts = -counts
+        target = self.read() + counts
+        self._apply_motion_profile()
         self._command("PR%s=%i" % (self.channel, counts))
         self._command("BG%s" % self.channel)
         self.wait_done(timeout=timeout)
-        return self.read()
+        return self._verify_arrived(target)
 
     def move_to(self, position, timeout=120.0):
-        """Move to an absolute step count (PA + BG), wait, return the new
-        position. The taught carousel positions are read()/move_to() in the same
-        counts, so they stay consistent."""
+        """Move to an absolute step count (PA + BG), wait, verify the arrival
+        and return the new position. The taught carousel positions are
+        read()/move_to() in the same counts, so they stay consistent."""
         self.check_in_range(position)
-        self._command("PA%s=%i" % (self.channel, int(round(float(position)))))
+        target = int(round(float(position)))
+        self._apply_motion_profile()
+        self._command("PA%s=%i" % (self.channel, target))
         self._command("BG%s" % self.channel)
         self.wait_done(timeout=timeout)
-        return self.read()
+        return self._verify_arrived(target)
+
+
+def _positive_count(name, value):
+    """A configured motion setting as a positive int, or None when unset."""
+    if value is None or value == "":
+        return None
+    n = int(round(float(value)))
+    if n <= 0:
+        raise ValueError("motor.%s must be positive, got %r" % (name, value))
+    return n

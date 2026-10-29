@@ -22,7 +22,9 @@
     "type": "galil",
     "ip": "164.54.122.210",
     "channel": "A",
-    "pv": "12idb:m6"
+    "pv": "12idb:m6",
+    "speed": 12500,
+    "accel": 128000
   },
   "gripper": {
     "stroke_m": 0.05,

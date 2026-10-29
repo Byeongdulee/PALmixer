@@ -3,8 +3,9 @@
 GalilMotor is a drop-in for Motor -- read/tweak/move_to/check_in_range -- driving
 a Galil controller channel over gclib. gclib and the controller are only present
 on the beamline, so these inject a fake gclib and pin the command strings
-(SH<channel> to turn on, PA/PR + BG to move, RP to read) and the config-driven
-selection between the Galil and EPICS backends.
+(SH<channel> to turn on, SP/AC/DC to set the speed, PA/PR + BG to move, RP to
+read, RP + TD to verify the arrival) and the config-driven selection between
+the Galil and EPICS backends.
 """
 import sys
 import types
@@ -22,7 +23,12 @@ class FakeGalil:
         self.opened = None
         self.commands = []
         self.motion_waits = []
-        self.positions = [100, 0, 0, 0, 0, 0, 0, 0]   # A..H
+        self.positions = [100, 0, 0, 0, 0, 0, 0, 0]   # A..H, RP
+        self.steps = list(self.positions)              # A..H, TD
+        self.motor_type = 2.0                          # a stepper, like the carousel
+        self.stop_code = 1
+        self.stop_short_at = None   # a limit/abort: RP and TD both end here
+        self.steps_lost = 0         # pulses that never left the controller
         self._target = 0
         self._relative = False
 
@@ -33,15 +39,22 @@ class FakeGalil:
         self.commands.append(cmd)
         if cmd == "RP":
             return ", ".join(str(p) for p in self.positions)
+        if cmd == "TD":
+            return ", ".join(str(p) for p in self.steps)
+        if cmd.startswith("MG _MT"):
+            return "%.4f" % self.motor_type
+        if cmd.startswith("MG _SC"):
+            return "%.4f" % self.stop_code
         if cmd.startswith("PAA="):
             self._target, self._relative = int(cmd.split("=")[1]), False
         elif cmd.startswith("PRA="):
             self._target, self._relative = int(cmd.split("=")[1]), True
         elif cmd.startswith("BGA"):
-            if self._relative:
-                self.positions[0] += self._target
-            else:
-                self.positions[0] = self._target
+            end = self.positions[0] + self._target if self._relative else self._target
+            if self.stop_short_at is not None:
+                end = self.stop_short_at
+            self.positions[0] = end
+            self.steps[0] = end - self.steps_lost
         return ""
 
     def GMotionComplete(self, channel):
@@ -102,6 +115,67 @@ def test_check_in_range_is_a_noop(fake_gclib):
     GalilMotor("x", "A").check_in_range(999999)   # must not raise
 
 
+# -- speed ----------------------------------------------------------------------
+def test_move_to_sends_the_speed_and_accel_before_the_move(fake_gclib):
+    GalilMotor("x", "A", speed=12500, accel=128000).move_to(500)
+    cmds = fake_gclib.commands
+    for profile in ("SPA=12500", "ACA=128000", "DCA=128000"):
+        assert cmds.index(profile) < cmds.index("PAA=500") < cmds.index("BGA")
+
+
+def test_tweak_sends_the_speed_too(fake_gclib):
+    GalilMotor("x", "A", speed=12500).tweak("forward", 25)
+    assert fake_gclib.commands.index("SPA=12500") < fake_gclib.commands.index("PRA=25")
+
+
+def test_unset_speed_leaves_the_controller_alone(fake_gclib):
+    GalilMotor("x", "A").move_to(500)
+    assert not [c for c in fake_gclib.commands if c[:2] in ("SP", "AC", "DC")]
+
+
+@pytest.mark.parametrize("bad", [0, -1, "-5"])
+def test_a_non_positive_speed_is_refused(bad):
+    with pytest.raises(ValueError, match="motor.speed"):
+        GalilMotor("x", "A", speed=bad)
+
+
+# -- arrival check --------------------------------------------------------------
+@pytest.fixture
+def no_settle(monkeypatch):
+    monkeypatch.setattr(motor_mod, "_ARRIVAL_SETTLE_S", 0.0)
+
+
+def test_move_to_checks_both_the_reference_and_the_step_count(fake_gclib):
+    GalilMotor("x", "A").move_to(500)
+    cmds = fake_gclib.commands
+    assert cmds.index("BGA") < cmds.index("TD")
+
+
+def test_a_move_stopped_short_raises_with_the_stop_code(fake_gclib, no_settle):
+    fake_gclib.stop_short_at, fake_gclib.stop_code = 300, 2
+    with pytest.raises(MotorError, match=r"did not reach 500: it ended at 300.*forward limit"):
+        GalilMotor("x", "A").move_to(500)
+
+
+def test_missing_step_pulses_raise_even_when_the_reference_arrived(fake_gclib, no_settle):
+    fake_gclib.steps_lost = 40
+    with pytest.raises(MotorError, match="step count 460"):
+        GalilMotor("x", "A").move_to(500)
+
+
+def test_a_tweak_stopped_short_raises(fake_gclib, no_settle):
+    fake_gclib.stop_short_at, fake_gclib.stop_code = 110, 7
+    with pytest.raises(MotorError, match=r"did not reach 125.*AB command"):
+        GalilMotor("x", "A").tweak("forward", 25)
+
+
+def test_a_servo_is_not_checked_against_its_encoder(fake_gclib):
+    # On a servo TD reads an encoder, not a step count, so only RP is compared.
+    fake_gclib.motor_type, fake_gclib.steps_lost = 1.0, 40
+    assert GalilMotor("x", "A").move_to(500) == 500
+    assert "TD" not in fake_gclib.commands
+
+
 def test_a_missing_gclib_is_a_clear_motor_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "gclib", None)   # import gclib -> ImportError
     with pytest.raises(MotorError, match="importing gclib failed"):
@@ -127,6 +201,13 @@ def test_build_motor_picks_galil_by_default():
     from palmixer.server import _build_motor
     m = _build_motor({"type": "galil", "ip": "10.54.122.161", "channel": "A"})
     assert isinstance(m, GalilMotor) and m.ip == "10.54.122.161" and m.channel == "A"
+    assert m.speed is None and m.accel is None
+
+
+def test_build_motor_passes_the_speed_and_accel():
+    from palmixer.server import _build_motor
+    m = _build_motor({"type": "galil", "ip": "x", "speed": 12500, "accel": 128000})
+    assert (m.speed, m.accel) == (12500, 128000)
 
 
 def test_build_motor_can_still_pick_epics():

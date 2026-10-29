@@ -85,8 +85,10 @@ _DEFAULTS = {
     # channel over gclib (ip + channel); type "epics" drives an EPICS motor
     # record (pv). 12idb:m6 was replaced by channel A of the Galil at the ip
     # below, so galil is the default; pv is kept for the epics fallback.
+    # speed (counts/s) and accel (counts/s^2, also the deceleration) are sent to
+    # the Galil before every move; None leaves the controller's own values.
     "motor": {"type": "galil", "ip": "164.54.122.210", "channel": "A",
-              "pv": "12idb:m6"},
+              "pv": "12idb:m6", "speed": None, "accel": None},
     # ChArUco board used as the hand-eye calibration target (camtcp). MUST match
     # the physical board: `dictionary` is an OpenCV aruco dictionary name,
     # squares_x/_y are the board's columns/rows of chessboard squares, and the
