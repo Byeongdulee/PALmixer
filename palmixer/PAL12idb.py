@@ -3902,6 +3902,13 @@ CAROUSEL_GRAB_UNDER = 0.012          # down after opening, to reach under the ri
 # 45 deg landing -- the bump then seats the rest. The gripper start Z is worked
 # back from this (see place_new_carousel).
 CAROUSEL_PLACE_STANDOFF = 0.005
+# Place: the carousel lands turned this many degrees about the gripper's own Z
+# from the taught mixer heading (+RZ, the same turn as the Configuration tab's
+# RZ + jog) -- at the taught heading it is that far off the seat. The carry and
+# landing-start poses carry the turn, so it is made up at the carry height and
+# the carousel slides in under the retainer already lined up; turning after the
+# slide-in is too late, it jams on the way in.
+CAROUSEL_PLACE_RZ_DEG = 19.0
 # The carousel acquire spends longer than the default on centring: the arm
 # arrives right after a move with the camera still refocusing, and a mis-centred
 # grab is costly. Longer detect/centre settle (seconds the camera keeps
@@ -3910,6 +3917,15 @@ CAROUSEL_CENTER_SETTLE = 10          # s to keep recapturing while the camera fo
 CAROUSEL_CENTER_ITERS = 8            # centring passes (the default is 4)
 CAROUSEL_CENTER_TOL_M = 0.0002       # how close to centred counts as centred (m)
 CAROUSEL_LOAD_APPROACH_M = 0.200     # load: approach to this camera-to-tag distance before the grab
+
+
+def _turn_about_tcp_z(pose, degrees):
+    """`pose` [x, y, z, rx, ry, rz] turned `degrees` about its own TCP Z -- the
+    pose robot.rotz(degrees, coordinate='tcp') reaches from it. Position unchanged."""
+    import math3d as m3d
+    t = m3d.Transform([float(v) for v in pose[:6]])
+    t.orient.rotate_zt(math.radians(degrees))
+    return t.get_pose_vector().tolist()
 
 
 def _carousel_travel_z(*zs):
@@ -4204,9 +4220,10 @@ def place_new_carousel(robot):
 
     Carry clear, swing the camera over the stock seat, grab the new carousel,
     carry it to 120 mm above the mixer, and set it down onto the mixer seat --
-    sliding in along the reverse (+X / -Z) of the unload lift and bumping to the
-    seat. MOVES the robot. Requires carousel_in_stock and carousel_on_mixer
-    taught.
+    turned +RZ CAROUSEL_PLACE_RZ_DEG from the taught heading to line up with the
+    seat, sliding in along the reverse (+X / -Z) of the unload lift and bumping
+    to the seat.
+    MOVES the robot. Requires carousel_in_stock and carousel_on_mixer taught.
 
     Not @_tracks-decorated like the transports: the tracked value is the tag id
     of the carousel it grabs, known only at runtime. The mixer is marked unknown
@@ -4250,7 +4267,7 @@ def place_new_carousel(robot):
     # TOTAL_DZ above the grab point (net_under below the measured surface), offset
     # back by TOTAL_DX in X -- so the start is that same point.
     net_under = CAROUSEL_GRAB_UNDER - CAROUSEL_BUMP_LIFT   # carousel hangs this far below the gripper
-    start = list(mixer)                                   # taught orientation (3:6)
+    start = _turn_about_tcp_z(mixer, CAROUSEL_PLACE_RZ_DEG)  # taught heading, turned to fit the seat
     back_x, back_y = _table_to_base_xy(-CAROUSEL_SLIDE_TOTAL_DX, 0.0)
     start[0] = seat_x + back_x                           # back along table -X so the reverse slide reaches the seat
     start[1] = seat_y + back_y
@@ -4260,7 +4277,7 @@ def place_new_carousel(robot):
     now_z = robot.get_pos()[2]
     if carry[2] > now_z:
         robot.mvr2z(carry[2] - now_z)                    # straight up to it before crossing
-    robot.moveto(carry)                                  # carry above the landing start, seat heading
+    robot.moveto(carry)                                  # carry above the landing start, turning to the seat heading
     print("place seating: after carry-above %s" % _pose_str(robot))
     robot.moveto(start)                                  # down to the stand-off, offset back along table -X
     print("place seating: after down-to-start %s" % _pose_str(robot))

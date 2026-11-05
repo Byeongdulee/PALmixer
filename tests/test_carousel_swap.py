@@ -263,7 +263,12 @@ def test_place_sequence_and_reverse_diagonal(stations, quiet_camera, tmp_state, 
     assert start[1][0] == pytest.approx(mixer[0] - tdx, abs=1e-6)  # back along -X for the slide
     assert start[1][1] == pytest.approx(mixer[1])
     assert start[1][2] == pytest.approx(start_z, abs=1e-6)  # the stand-off start before the landing
-    assert start[1][3:] == mixer[3:]                       # seated at the mixer heading, not stock's
+    # Seated at the mixer heading (not stock's) turned +RZ 19 deg to fit the seat --
+    # already turned at the carry, before the slide-in.
+    heading = PAL12idb._turn_about_tcp_z(mixer, PAL12idb.CAROUSEL_PLACE_RZ_DEG)[3:]
+    carry = [e for e in rob.log if e[0] == "moveto"][-3]
+    assert start[1][3:] == pytest.approx(heading, abs=1e-6)
+    assert carry[1][3:] == pytest.approx(heading, abs=1e-6)
     assert start[1][0] + tdx == pytest.approx(mixer[0], abs=1e-6)  # reverse slide reaches the seat X
     assert state.get_carousel_on_mixer() == "37"       # the carousel it seated
 
@@ -412,6 +417,20 @@ def test_place_slide_in_follows_a_rotated_table(stations, quiet_camera, tmp_stat
     slides = [e[1] for e in rob.log if e[0] == "translate"]
     assert sum(v[1] for v in slides) == pytest.approx(tdx, abs=1e-6)  # slide-in reaches the seat
     assert sum(v[0] for v in slides) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_place_turn_is_about_the_tool_z():
+    # The +RZ turn spins the tool about its own Z: position and tool Z axis stay
+    # put, tool X swings by exactly CAROUSEL_PLACE_RZ_DEG.
+    import math
+    import math3d as m3d
+    pose = [0.40, 0.10, 0.30, 3.1409, 0.0052, 0.0001]
+    turned = PAL12idb._turn_about_tcp_z(pose, PAL12idb.CAROUSEL_PLACE_RZ_DEG)
+    assert turned[:3] == pytest.approx(pose[:3])
+    a, b = m3d.Transform(pose).orient, m3d.Transform(turned).orient
+    assert b.vec_z.array == pytest.approx(a.vec_z.array, abs=1e-9)
+    cos = float(a.vec_x.array @ b.vec_x.array)
+    assert math.degrees(math.acos(cos)) == pytest.approx(PAL12idb.CAROUSEL_PLACE_RZ_DEG)
 
 
 def test_table_offset_is_identity_without_a_frame():
