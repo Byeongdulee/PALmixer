@@ -11,6 +11,10 @@ dependencies = [
     "pyqt5",
     "requests",
     "pyepics",
+    # Not imported by the package: redboard/redboard_trigger.py needs them, and
+    # the server runs it with its own interpreter.
+    "pyserial",
+    "psutil",
 ]
 requires-python = ">=3.8.1"
 readme = "README.md"

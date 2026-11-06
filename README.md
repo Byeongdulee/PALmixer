@@ -38,6 +38,7 @@ Edit `json/palmixer_config.json`, or override with environment variables:
 | `PALMIXER_MOTOR_PV` | EPICS motor PV base (default `12idb:m6`) |
 | `PALMIXER_CAROUSEL_SIZE` / `PALMIXER_CAROUSEL_STEP` | Carousel geometry: slot count, and motor travel between adjacent slots (see below) |
 | `PALMIXER_DAQ_HOST` / `PALMIXER_DAQ_PORT` | Beamline DAQ GUI address (`daq_client.py`; sample-stage motor alignment, see below) |
+| `PALMIXER_REDBOARD_ENABLED` | `1`/`0`: turn the RedBoard trigger on or off without editing the JSON (see [RedBoard trigger](#redboard-trigger)) |
 
 `carousel.step` is in the motor's own engineering units, **not** degrees:
 `12idb:m6` reads in mm with 33 mm of travel, so one slot is `1.0`. A `step`
@@ -60,6 +61,14 @@ station. See
 count, and sets how much wider than normal the fingers open for the two grabs
 that need it -- the flowcell off its cleaning station, and the mixer head. See
 [Gripper opening on a pickup](#gripper-opening-on-a-pickup).
+
+`redboard` turns on the RedBoard pulse trigger, which is restarted at every
+move of the mixer head to the carousel and must be armed before `make_sample`
+mixes, and says how to run its script. It is off unless configured -- the
+board is plugged into one machine, and wherever it is enabled but absent every
+`make_sample` stops short of mixing -- and this rig's JSON turns it on; start a
+server anywhere else with `PALMIXER_REDBOARD_ENABLED=0`. See
+[RedBoard trigger](#redboard-trigger).
 
 `robot.name` **picks the robot12idb class**, not just a label -- `UR3` builds
 `robot12idb.UR3`, `UR5` builds `robot12idb.UR5` (matched case-insensitively).
@@ -886,7 +895,9 @@ stations involved have been taught at all), so an unconfigured install is
 caught before an out-of-place flowcell is.
 
 **`make_sample <slot> [sample id]`**: mixer2cleaningstation (if needed) ->
-rotate carousel to `<slot>` -> mixer2mixingstation -> pump mix (**slot tagged
+rotate carousel to `<slot>` -> mixer2mixingstation (restarting the RedBoard
+trigger as it sets off) -> pump mix (only once the RedBoard is armed -- see
+[RedBoard trigger](#redboard-trigger); **slot tagged
 with the sample ID here**) -> mixer2cleaningstation -> pump clean_mixer (fired
 on a background thread, not awaited) -> advance carousel -> ready_flowcell_to_draw
 -> pump draw_to_flowcell -> load_sample_to_beam -> shake_sample (auto, not
@@ -1064,6 +1075,106 @@ through it is the worse of the two ways to be wrong. The one case treated as
 "not running" is a dashboard that cannot be reached at all -- indistinguishable
 from one that is switched off, and refusing to ever move the head because a
 status socket is down would strand the robot.
+
+### RedBoard trigger
+
+The RedBoard ([`redboard/`](redboard/README.md)) is a native-USB Arduino that
+watches an analog signal on A0 and, when it crosses a threshold, waits a set
+delay, fires a pulse on D7, then locks itself out for a while. The board does
+the triggering on its own; its host script, `redboard/redboard_trigger.py`,
+finds it, pushes the four operating parameters (threshold, delay, pulse
+width, lockout) into its RAM, and reports what it says.
+
+**Every time the robot starts carrying the mixer head onto the carousel**
+(`mixer2mixingstation`), the server restarts that script
+(`palmixer/redboard.py`): the instance started last time is stopped and a
+fresh one launched, so the board is configured from the script as it is on
+disk *now* -- edit the parameters at the top of the script, and the next move
+picks them up. Both paths to the carousel do this, each after its wash wait,
+so the restart marks the move really starting rather than the order for it:
+the step inside `make_sample` (standalone, or coordinated by PALsystem) and
+the Experiment tab's **Cleaning Station -> Mixer** button. The restart runs
+on a background thread; the arm never waits for it.
+
+**`make_sample` will not mix unless the board is armed**: it has acknowledged
+exactly the configuration sent, is not in a post-trigger lockout, is still
+answering its once-a-second status poll, and reads A0 *below* its threshold.
+That last one matters because the firmware is level-triggered: an input
+already above the threshold fires the board by itself, on its own schedule,
+instead of on the mix. The move takes 17-30 s and arming about 3 s, so this
+normally passes without a step of its own. Otherwise a `wait_for_redboard`
+step holds for up to `redboard.armed_timeout_s` (15 s) -- long enough to see a
+10 s lockout out -- while a script that has already failed is refused at once:
+
+```
+ERROR: the RedBoard trigger is not armed: the RedBoard script (pid 8812)
+exited with code 1: No board running the trigger sketch found. [...]. Stopped
+before mixing: the mixer head is seated on the carousel and the vial has not
+been mixed. Check the board's USB connection and logs/redboard_trigger.log,
+then run make_sample again.
+```
+
+Running `make_sample` again on the same slot is the recovery: finding the head
+at the mixer, it parks it at the cleaning station first, as it always does,
+and restarts the script on the way back. In a session coordinated by
+PALsystem, the refusal ends the run like any other failed step: clear the
+interrupted run in PALsystem, then mix that slot with `make_sample` from
+PALmixer.
+
+Only `make_sample` checks. The Experiment tab's **Cleaning Station -> Mixer**
+button restarts the script, but its manual pump **Mix** does not wait for the
+board.
+
+What a restart does, and does not, do:
+
+- It **re-pushes the parameters**, which live only in the board's RAM: a power
+  cycle or a sketch upload reverts them to the sketch's defaults (2.5 V,
+  0.1 s, 0.4 s, 10 s) until a host configures it again.
+- It **picks up edits** to the script, and starts a fresh, confirmed session.
+- It **does not reset the board**. Opening the port does not reboot a
+  native-USB board, so a lockout already running survives it -- the firmware
+  ends a lockout only on its own timer. That is why "armed" also requires the
+  board to report itself unlocked.
+- **The board triggers whether or not the script is running**, with whatever
+  parameters are in its RAM. The script configures and reports; it is not in
+  the trigger path.
+
+Only one program can hold the serial port, so each new instance first stops
+any other copy of `redboard_trigger.py` that is still running -- including one
+started by hand from an Anaconda Prompt. **Do not keep a hand-started copy
+running alongside PALmixer**: the next move to the carousel stops it. To run
+the script by hand, or upload the sketch, while the server is up, set
+`redboard.enabled` to `false` first: within a couple of seconds the server
+stops its copy and the serial port is free.
+
+The server console shows each restart, arming, trigger and failure:
+
+```
+RedBoard: restarting the trigger script for mixer2mixingstation
+RedBoard: armed (port=COM17 threshold=3.00V delay=0.26s pulse=0.39s lockout=10.00s locked=0)
+RedBoard: TRIGGER: 3.21V
+```
+
+Everything the script prints -- including the board's A0 reading every second
+-- goes to `logs/redboard_trigger.log` with timestamps, rotated between
+sessions (5 MB, 5 backups). To watch it live:
+
+```powershell
+Get-Content logs\redboard_trigger.log -Wait -Tail 20
+```
+
+The current state also rides on `get_state` as `redboard`: `state` (`armed`,
+`starting`, `failed`, ...), `ready`, `detail`, `port`, `a0_volts`,
+`threshold_volts`, `locked`, `last_trigger` and `restarts`.
+
+`--simulate` never touches the board. `redboard.enabled: false` in the JSON
+turns the trigger off without restarting the server: the running script is
+stopped within a couple of seconds, and the next `make_sample` neither
+restarts nor waits for it. A config file that fails to parse -- a typo, or a
+save caught half-written -- does not switch it off: the server keeps using the
+last copy of the file that parsed, and says so once in its console.
+`PALMIXER_REDBOARD_ENABLED` is read from the server's own environment, so it
+takes effect when the server starts, and overrides the JSON.
 
 ### Pump status panel
 

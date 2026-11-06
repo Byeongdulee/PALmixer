@@ -33,7 +33,8 @@ from .mqtt_status import (
 )
 from .pump import Pump
 from .motor import Motor, GalilMotor
-from .workflows import Workflows, WorkflowError
+from .redboard import RedBoardTrigger
+from .workflows import MIXER_TO_CAROUSEL, Workflows, WorkflowError
 from .zmq_transport import ZMQCommandServer, ZMQError
 
 STATE_IDLE = "IDLE"
@@ -97,6 +98,10 @@ def _build_motor(motor_cfg):
 
 class PALmixerServer:
     """Wires the ZMQ command server to robot/pump/motor actions, with MQTT status."""
+
+    #: The RedBoard trigger supervisor. A class attribute as well, so a server
+    #: built without __init__ (as some tests do) reads as having none.
+    redboard = None
 
     def __init__(self, simulate=False):
         self.simulate = simulate
@@ -241,8 +246,15 @@ class PALmixerServer:
         else:
             print("PALmixerServer: --simulate mode, no hardware will be touched.")
 
+        # Restarted by every move of the mixer head to the carousel, and
+        # checked before every mix; never under --simulate. See redboard.py.
+        self.redboard = RedBoardTrigger(simulate=self.simulate)
+        if self.redboard.enabled:
+            print("PALmixerServer: RedBoard trigger on -- restarted at every move "
+                  "to the carousel, required armed before make_sample mixes")
         self.workflows = Workflows(self.PAL12idb, self.rob, self.pump, self.motor,
-                                    on_step=self._publish_step, simulate=self.simulate)
+                                    on_step=self._publish_step, simulate=self.simulate,
+                                    trigger=self.redboard)
         from .preparation_api import PreparationAPI
         self.preparation_api = PreparationAPI(self)
         state.add_listener(self._publish_tracking)
@@ -298,6 +310,8 @@ class PALmixerServer:
                                    current_step=self._current_step,
                                    cleanup=self.workflows.cleanup_snapshot(),
                                    pump_status=self._pump_status,
+                                   redboard=(self.redboard.snapshot()
+                                             if self.redboard is not None else None),
                                    last_mixing_record=self._last_mixing_record,
                                    last_result=self._last_result))
 
@@ -1444,6 +1458,9 @@ class PALmixerServer:
             # tab's two buttons calling PAL12idb directly), so the wait has to
             # be repeated here.
             self.workflows.await_mixer_wash()
+            if name == MIXER_TO_CAROUSEL:
+                # And so does the RedBoard restart, after the wait like the move.
+                self.workflows.rearm_trigger("%s (Experiment tab)" % name)
         getattr(self.PAL12idb, name)(self.rob)
         return "%s complete" % name
 
@@ -2292,6 +2309,9 @@ class PALmixerServer:
         self._mix_sync_wake.set()
         self.zmq_server.stop()
         self._mqtt.close()
+        # Last: it waits for the script to exit, and holds nothing else up.
+        if self.redboard is not None:
+            self.redboard.stop()
 
 
 def main():

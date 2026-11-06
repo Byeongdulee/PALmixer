@@ -17,7 +17,8 @@ make_sample mixes a fresh vial and puts it in the beam:
 
     mixer2cleaningstation               (only if the head is at the mixer)
     rotate_carousel                     (to the slot being mixed)
-    mixer2mixingstation
+    mixer2mixingstation                 (restarts the RedBoard trigger as it sets off)
+    wait_for_redboard                   (only if the board is not armed yet)
     mix                                 (pump; the sample ID is assigned here)
     mixer2cleaningstation
     clean_mixer                         (pump 5555, not awaited)
@@ -114,6 +115,17 @@ ways to be wrong. An unreachable dashboard is the one case treated as "not
 running" -- it is indistinguishable from a dashboard that is switched off, and
 refusing to ever move the head because a status socket is down would strand
 the robot.
+
+The RedBoard trigger (palmixer/redboard.py) is restarted every time the head
+sets off for the carousel: _move_mixer_head does it for mixer2mixingstation,
+after the wash wait and before the move, so it marks the move really starting
+rather than the order for it, and server.py's _run_transport does the same for
+the Experiment tab's button. restart() hands the work to a background thread
+and returns at once -- the arm never waits on it. make_sample then refuses to
+mix unless the board reports armed (_await_trigger_armed, just before 'mix'):
+the move takes 17-30 s and arming about 3, so this normally passes without a
+step of its own, and a board that is missing stops the run with the head
+seated on the carousel and the vial not yet mixed.
 """
 
 import threading
@@ -123,6 +135,11 @@ from . import config, state
 # Imported as a bare name rather than through the module, because `pump` is
 # also the name of a constructor argument and an attribute here.
 from .pump import server_for as _pump_server_for
+from .redboard import TriggerNotArmed
+
+#: The transport that carries the mixer head onto the carousel (CRSL). Every
+#: real start of it restarts the RedBoard trigger script.
+MIXER_TO_CAROUSEL = "mixer2mixingstation"
 
 # How far the carousel advances between mixing a vial and drawing from it, in
 # carousel steps -- `carousel.draw_offset_steps` in json/palmixer_config.json,
@@ -156,7 +173,15 @@ class WorkflowError(Exception):
 
 
 class Workflows:
-    def __init__(self, pal, robot, pump, motor, on_step=None, simulate=False, preparation=None):
+    #: The RedBoard trigger (palmixer.redboard.RedBoardTrigger), and the
+    #: PALsystem preparation coordinator; None when there is none. Class
+    #: attributes as well, so an instance built without __init__ (as some
+    #: tests do) still reads as having neither.
+    trigger = None
+    preparation = None
+
+    def __init__(self, pal, robot, pump, motor, on_step=None, simulate=False, preparation=None,
+                 trigger=None):
         self.pal = pal
         self.robot = robot
         self.pump = pump
@@ -164,6 +189,7 @@ class Workflows:
         self.on_step = on_step or (lambda step, phase, detail="": None)
         self.simulate = simulate
         self.preparation = preparation
+        self.trigger = trigger
         from uuid import uuid4
         self._cleanup_session = uuid4().hex
         self._cleanup_lock = threading.Lock()
@@ -415,9 +441,57 @@ class Workflows:
         place every internal call to either goes through, so the wait applies
         everywhere the head could be moved, not just the Experiment tab's two
         buttons (handled in server.py's _run_transport).
+
+        A move to the carousel also restarts the RedBoard trigger, here rather
+        than before the wait: a wash can hold the head for minutes, and the
+        restart belongs to the move starting, not to the order for it.
         """
         self.await_mixer_wash()
+        if name == MIXER_TO_CAROUSEL:
+            self.rearm_trigger(name)
         return self._step(name, fn)
+
+    def rearm_trigger(self, reason):
+        """Restart the RedBoard trigger script as the head sets off for the
+        carousel. Returns at once and never raises -- the work happens on the
+        trigger's own thread (see palmixer/redboard.py)."""
+        if self.trigger is not None:
+            self.trigger.restart(reason)
+
+    def _await_trigger_armed(self):
+        """Refuse to mix until the RedBoard reports armed.
+
+        Silent when the trigger is off, or already armed -- the usual case,
+        since arming takes about 3 s of a 17-30 s move. Otherwise a
+        wait_for_redboard step holds for up to redboard.armed_timeout_s for an
+        arming still in progress, a lockout still running out, or A0 still
+        above the threshold; a script that has already failed is refused at
+        once. Called after the head is seated and just before 'mix', so a
+        refusal leaves the head on the carousel with the vial unmixed --
+        standalone, make_sample can simply be run again once the board is back.
+        """
+        trigger = self.trigger
+        if trigger is None or not trigger.enabled or trigger.is_armed():
+            return
+        self._step("wait_for_redboard", self._wait_trigger_armed)
+
+    def _wait_trigger_armed(self):
+        try:
+            return "RedBoard armed: %s" % self.trigger.await_armed()
+        except TriggerNotArmed as e:
+            # A coordinated make cannot simply be repeated: the failure ends
+            # the PALsystem run, which has to be cleared before PALmixer takes
+            # commands again.
+            if self.preparation is not None:
+                retry = ("clear the interrupted run in PALsystem, then mix this slot "
+                         "with make_sample from PALmixer")
+            else:
+                retry = "run make_sample again"
+            raise WorkflowError(
+                "the RedBoard trigger is not armed: %s. Stopped before mixing: the mixer "
+                "head is seated on the carousel and the vial has not been mixed. Check "
+                "the board's USB connection and logs/redboard_trigger.log, then %s."
+                % (e, retry))
 
     def _start_auto_shake(self):
         """Begin shaking the flowcell just loaded, repeating until
@@ -772,6 +846,8 @@ class Workflows:
         # A clean_mixer left running by the previous make_sample is on this
         # same pump, so it has to finish before this one can mix.
         self._await_background_pump("mix")
+        # Last before the mix, so the board is judged as close to it as possible.
+        self._await_trigger_armed()
         self._step("mix", lambda: self._pump_op("mix"))
         # The vial is spent the moment it has been mixed, so the slot is marked
         # here rather than at the end: a later step failing does not un-consume

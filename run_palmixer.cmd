@@ -51,14 +51,16 @@ if errorlevel 1 (
 )
 
 rem -- 2. the pieces each window needs -------------------------------------
-rem Checked here because both fail late otherwise: the GUI aborts on the PyQt5
-rem import in a window that closes, and pyepics is reached only when the
-rem carousel motor is first moved -- i.e. part-way through a real make_sample.
-"%PALMIXER_PYTHON%" -c "import importlib.util, sys; missing = [m for m in ('zmq', 'paho.mqtt', 'PyQt5', 'epics') if not importlib.util.find_spec(m.split('.')[0])]; print('missing: ' + ', '.join(missing)) if missing else None; sys.exit(1 if missing else 0)"
+rem Checked here because they all fail late otherwise: the GUI aborts on the
+rem PyQt5 import in a window that closes, pyepics is reached only when the
+rem carousel motor is first moved, and pyserial/psutil only when the server
+rem first launches the RedBoard trigger script with this same interpreter, at
+rem the first move to the carousel -- i.e. part-way through a real make_sample.
+"%PALMIXER_PYTHON%" -c "import importlib.util, sys; missing = [m for m in ('zmq', 'paho.mqtt', 'PyQt5', 'epics', 'serial', 'psutil') if not importlib.util.find_spec(m.split('.')[0])]; print('missing: ' + ', '.join(missing)) if missing else None; sys.exit(1 if missing else 0)"
 if errorlevel 1 (
     echo.
     echo Install the missing packages into that environment:
-    echo     "%PALMIXER_PYTHON%" -m pip install pyzmq paho-mqtt PyQt5 pyepics
+    echo     "%PALMIXER_PYTHON%" -m pip install pyzmq paho-mqtt PyQt5 pyepics pyserial psutil
     echo.
     pause
     exit /b 1

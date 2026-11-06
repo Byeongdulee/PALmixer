@@ -75,6 +75,14 @@
     "required": false,
     "timeout_s": 10.0
   },
+  "redboard": {
+    "enabled": true,
+    "script": "redboard/redboard_trigger.py",
+    "python": "",
+    "port": "",
+    "armed_timeout_s": 15.0,
+    "log_file": "logs/redboard_trigger.log"
+  },
   "apriltags": {
     "flowcell_1": {
       "id": 1,

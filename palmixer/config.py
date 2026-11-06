@@ -20,6 +20,10 @@ Sections:
                                                    looking (Z + orientation only; the
                                                    X/Y come from waypoints.ini)
     pvapp {base_url, username, owner_badge, required, timeout_s} -- sample register
+    redboard {enabled, script, python, port, armed_timeout_s, log_file}
+                                                -- RedBoard pulse trigger, restarted
+                                                   at every mixer-head move to the
+                                                   carousel (palmixer/redboard.py)
 
 Env overrides (take precedence over the JSON):
     PALMIXER_ZMQ_HOST   PALMIXER_ZMQ_PORT
@@ -31,6 +35,7 @@ Env overrides (take precedence over the JSON):
     PALMIXER_DAQ_HOST   PALMIXER_DAQ_PORT
     PALMIXER_PVAPP_URL  PALMIXER_PVAPP_BADGE
     PVAPP_USERNAME      PVAPP_PASSWORD
+    PALMIXER_REDBOARD_ENABLED   (1/0, true/false)
 
 The pump section points at the two loopback ZMQ servers run by the
 apssector12_pump_control dashboards (mixing on 5555, flowcell on 5556). Its
@@ -149,6 +154,30 @@ _DEFAULTS = {
         "required": False,       # a lost mix-confirmation costs provenance, not the sample
         "timeout_s": 10.0,
     },
+    # The RedBoard pulse trigger (redboard/README.md): a native-USB Arduino
+    # that watches A0 and fires a timed pulse on D7 by itself. The server
+    # restarts its host script, redboard/redboard_trigger.py, every time the
+    # mixer head sets off for the carousel, and make_sample will not mix
+    # until the board has confirmed it is armed -- see palmixer/redboard.py.
+    #
+    # Off by default: the board is plugged into one machine, and wherever it
+    # is enabled but absent, every make_sample stops just short of mixing.
+    # This rig's json/palmixer_config.json turns it on; a server started
+    # anywhere the board is not plugged in sets PALMIXER_REDBOARD_ENABLED=0.
+    #   script          relative to the repo root, or absolute
+    #   python          "" runs it with the server's own interpreter, which
+    #                   then needs pyserial and psutil
+    #   port            "" lets the script find the board by asking each
+    #                   serial port; "COM17" pins it
+    #   armed_timeout_s how long make_sample holds before 'mix' for an arming
+    #                   still in progress -- longer than the board's 10 s
+    #                   lockout, so a stray trigger during the move is waited
+    #                   out rather than failed
+    #   log_file        everything the script prints, rotated; relative to the
+    #                   repo root, or absolute
+    "redboard": {"enabled": False, "script": "redboard/redboard_trigger.py",
+                 "python": "", "port": "", "armed_timeout_s": 15.0,
+                 "log_file": "logs/redboard_trigger.log"},
     # Where each AprilTag search stands to start looking: a *camera* standoff
     # above the station, as a full 6-element pose. Only the Z and orientation
     # are used as written -- the X/Y come from the station's taught position
@@ -278,16 +307,37 @@ def _resolve_ur12idb_path(value):
     return preferred
 
 
+# The text of the last read of the file that parsed. The file is re-read on
+# every get_section(), so a save caught half-written, or one with a typo,
+# would otherwise drop every section to its defaults until it is fixed --
+# including redboard.enabled, quietly switching off the check make_sample
+# makes before it mixes. Kept as text and parsed afresh for each read, so no
+# caller can change what the next one gets.
+_last_good_text = None
+_last_warning = None
+
+
 def _load_file():
-    """Return the parsed JSON config, or {} if it is missing/unreadable."""
+    """Return the parsed JSON config: {} if there has never been one, and the
+    last copy that parsed if it is unreadable or malformed now."""
+    global _last_good_text, _last_warning
     try:
         with open(_CONFIG_PATH) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
+            text = f.read()
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("the top level is not a JSON object")
     except Exception as e:  # malformed JSON should not crash the app
-        print("WARNING: could not read %s (%s); using defaults" % (_CONFIG_PATH, e))
-        return {}
+        if _last_good_text is None and isinstance(e, FileNotFoundError):
+            return {}           # never had one: defaults throughout, as always
+        fallback = "the last copy that parsed" if _last_good_text is not None else "defaults"
+        warning = "WARNING: could not read %s (%s); using %s" % (_CONFIG_PATH, e, fallback)
+        if warning != _last_warning:    # once per problem, not on every read
+            print(warning)
+            _last_warning = warning
+        return json.loads(_last_good_text) if _last_good_text is not None else {}
+    _last_good_text, _last_warning = text, None
+    return data
 
 
 def _merged():
@@ -345,6 +395,12 @@ def _merged():
         cfg["pvapp"]["badge"] = env("PVAPP_BADGE")
     if env("PVAPP_GUP"):
         cfg["pvapp"]["gup"] = env("PVAPP_GUP")
+    # A switch for the one machine-specific piece of hardware, so a server run
+    # somewhere the board is not plugged in can be started without editing the
+    # shared JSON.
+    if env("PALMIXER_REDBOARD_ENABLED"):
+        cfg["redboard"]["enabled"] = (env("PALMIXER_REDBOARD_ENABLED").strip().lower()
+                                      in ("1", "true", "yes", "on"))
 
     # Collapse the per-OS mapping to a single path, so every consumer
     # (server.py's sys.path insert, the GUI's AprilTag detector import) still
