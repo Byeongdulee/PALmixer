@@ -10,7 +10,8 @@ eight taught positions. Each action maps to the same ZMQ commands as before:
   the server drives the robot to find the station's tag (PAL12idb.locate_apriltag).
 * Go To Position  -> ``goto_position <station>`` (or ``goto_transfer_point``).
 * Set Current Position -> ``set_position_here <station>`` (or
-  ``set_transfer_point_here``) -- records where the arm is standing now.
+  ``set_transfer_point_here``, or ``set_carousel_place_here`` for the Carousel
+  Place Pose) -- records where the arm is standing now.
 
 "Stop Search" sends ``stop_search``, a fast command the server answers even while
 busy (see server.py's fast_dispatch) -- deliberately left out of busy_widgets so
@@ -31,6 +32,7 @@ class ConfigTab(QWidget):
     # Dropdown data sentinel for the corridor waypoint, which is not a taught
     # station (no AprilTag, its own commands) but is a "position" for Go/Set.
     _TRANSFER_POINT = "__transfer_point__"
+    _CAROUSEL_PLACE = "__carousel_place__"
 
     # Action values carried as the action dropdown's itemData.
     _SEARCH, _GOTO, _SET = "search", "goto", "set"
@@ -96,6 +98,11 @@ class ConfigTab(QWidget):
         # has no tag, falls back to a built-in default, and uses its own
         # commands. Listed last so the taught stations stay together.
         self.position_combo.addItem("Transfer Point", self._TRANSFER_POINT)
+        # Where Place New Carousel leaves the carousel, recorded here with the
+        # carousel seated by hand. Not a station either: no tag to search, and no
+        # Go To -- it is inside the mixer seat, which the placement reaches by
+        # sliding in.
+        self.position_combo.addItem("Carousel Place Pose", self._CAROUSEL_PLACE)
         row.addWidget(self.position_combo)
 
         row.addSpacing(8)
@@ -164,24 +171,46 @@ class ConfigTab(QWidget):
         pos = self.position_combo.currentData()
         action = self.action_combo.currentData()
         is_transfer = (pos == self._TRANSFER_POINT)
-        label = "Transfer Point" if is_transfer else cmd.STATION_LABELS[pos]
+        is_place = (pos == self._CAROUSEL_PLACE)
+        label = ("Transfer Point" if is_transfer else
+                 "Carousel Place Pose" if is_place else cmd.STATION_LABELS[pos])
 
         if action == self._SEARCH:
-            if is_transfer or pos not in cmd.STATIONS:
+            if is_transfer or is_place or pos not in cmd.STATIONS:
                 QMessageBox.information(
                     self, "Search AprilTag",
-                    "%s has no AprilTag to search for.\n\nUse Go To Position or "
-                    "Set Current Position for it instead." % label)
+                    "%s has no AprilTag to search for.\n\nUse %s for it instead."
+                    % (label, "Set Current Position" if is_place
+                       else "Go To Position or Set Current Position"))
                 return
             self._send_command(cmd.search_apriltag_command(
                 pos, skip_roll=self.skip_roll_check.isChecked(),
                 from_current=self.from_current_check.isChecked()))
 
         elif action == self._GOTO:
+            if is_place:
+                QMessageBox.information(
+                    self, "Go To Position",
+                    "The Carousel Place Pose is inside the mixer seat, so there is "
+                    "no Go To for it.\n\nPlace New Carousel reaches it by coming "
+                    "down beside the seat, turning, then sliding straight in.")
+                return
             self._send_command(cmd.goto_transfer_point_command() if is_transfer
                                else cmd.goto_position_command(pos))
 
         elif action == self._SET:
+            if is_place:
+                if QMessageBox.question(
+                        self, "Set Current Position",
+                        "Record the robot's current pose as the Carousel Place Pose?"
+                        "\n\nPlace New Carousel comes down beside the seat to this "
+                        "pose's height, turns to its angle, slides straight in onto it "
+                        "and lets go. Record it with the carousel seated at its final "
+                        "position and angle.",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                    return
+                self._send_command(cmd.set_carousel_place_here_command())
+                return
             # Overwrites a taught pose every later move reads, and the arm's
             # current pose is not something the dialog can show back, so confirm
             # against the position name before sending.

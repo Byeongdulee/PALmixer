@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .. import commands as cmd
+from .. import config
 from .flowcell_selector import FlowcellSelector
 from .pump_status import PumpStatusPanel
 
@@ -112,9 +113,13 @@ class ExperimentTab(QWidget):
         self._send_command(cmd.unload_carousel_command())
 
     def _on_place_new_carousel(self):
+        slot = config.get_section("carousel").get("place_alignment_slot")
+        turn = ("The carousel table first turns slot %s to the mixing position. " % slot
+                if slot is not None else "")
         if QMessageBox.question(
                 self, "Place New Carousel",
                 "Bring a fresh carousel from stock onto the mixer?\n\n"
+                + turn +
                 "The arm will move across the cell. Once the new carousel is "
                 "seated, every slot is freed (all sample IDs are cleared).",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:

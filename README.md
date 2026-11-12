@@ -875,14 +875,69 @@ shows that mixing started. `replacement_id` names the coordinated replacement
 that placed the carousel, or is `null` for the button. Only the latest record is
 kept. **Replace Carousel (Reset)** writes one too, with `new_tag` `unknown`.
 
-**Robot placement is blocked for now.** `carousel.auto_place_new_carousel` in
-`json/palmixer_config.json` is `false` (also the default when absent). A
-coordinated `replace_carousel` then unloads the old carousel and stops in state
-`waiting_for_carousel`, without latching the session. The operator seats a new
+**The arm swings round the base between carousel seats.** Every carousel leg
+-- to the stock, the used stack or the mixer carousel -- goes direct, not
+through the transfer point: straight up to the carry height (never below the
+carousel safe Z), then the **base joint alone** turns until the arm points at
+the seat, then straight in or out to above it, then straight down. The
+Configuration tab's **Go To** for a carousel seat takes the same route, and
+goes through the transfer point first only when the arm starts on the
+sample-table side. Leaving the stock or the used stack for the transfer point
+-- the **Transfer Point** button, and the park every workflow ends with, which
+after **Unload Current Carousel** starts over the used stack -- is the same in
+reverse: straight up to the corridor's height, swing round, then across.
+Turning only the base keeps the arm's shape and reach, so it cannot fold in toward its own
+joints; a straight cross from the start did, and on the way to the stock
+carousel that bumped the arm into its own joint. The swing takes the short way
+round at the gentle joint speed the raster scan uses
+(`PAL12idb.CAROUSEL_SWING_VEL`). If the base joint is wound so far that the
+short way would pass its +-360 deg travel, the move stops with an error before
+anything moves: jog the base back on the pendant and run it again.
+
+**Placement follows a re-taught mixer carousel.** **Place New Carousel** lands on
+the seat the last **Unload Current Carousel** measured on the mixer (the
+camera-centred X/Y and the bumped surface Z, a millimetre or two truer than the
+taught pose), or on the taught **Carousel on Mixer** pose when nothing has been
+measured. A new Carousel on Mixer position -- a teach, an AprilTag search or a
+pull from EPICS -- discards that measurement, so the next placement lands on the
+new position until an unload measures the seat again. A re-teach that changes
+only the heading keeps it. The carousel on the mixer moves with the mixer side,
+unlike the fixed stock and used-stack positions, which is why its measured seat
+cannot outlive a re-teach.
+
+**Placement turns the table first.** Before the arm moves, **Place New
+Carousel** -- and the placement in a coordinated `replace_carousel` -- turns the
+carousel table so `carousel.place_alignment_slot` (11) stands at the mixing
+position, and waits for it to stop. The robot always sets a carousel down at the
+same heading, so the table's angle decides whether the carousel fits and which
+slot ends up at the mixing position; turning first makes every mount land the
+same way, so the taught slot positions hold for each new carousel. The command is
+refused before anything moves unless the mixer head is at its cleaning station,
+the flowcell in use is at its cleaning station or the beam, and the slot
+positions are taught; a coordinated swap checks the same before it unloads. A
+turn that fails stops the placement with the new carousel still in stock.
+Without the setting (absent or `null`) the table stays where it is.
+
+**Placement ends on a pose recorded by hand.** Seat a carousel on the mixer at
+its final position and angle, then on the Configuration tab pick **Carousel
+Place Pose** and **Set Current Position** (`set_carousel_place_here`): that
+records the arm's pose. With it recorded, **Place New Carousel** comes down
+beside the seat to that pose's height, turns to its angle there, then moves
+straight in along the table's X axis onto it and lets go -- no diagonal slide
+and no bump. The pose is stored with the Carousel on
+Mixer position it was recorded against and moves with it when that is
+re-taught; its angle stays as recorded. Until one is recorded, placement bumps
+down to seat instead.
+
+**Robot placement in a coordinated swap is a setting.** With
+`carousel.auto_place_new_carousel` `true` in `json/palmixer_config.json`, a
+coordinated `replace_carousel` unloads the old carousel and places the new one
+by robot. With it `false` (also the default when absent), the swap unloads the
+old carousel and stops in state `waiting_for_carousel`, without latching the
+session. The operator seats a new
 carousel by hand and presses **Replace Carousel (Reset)**, which is accepted during
 the coordinated session while that replacement waits; it records the load with the
-replacement's ID and marks the replacement `committed`. Set the option to `true`
-once robot placement has been verified, and the full swap runs again.
+replacement's ID and marks the replacement `committed`.
 
 ## Automation workflows
 

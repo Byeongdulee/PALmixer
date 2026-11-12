@@ -340,6 +340,30 @@ def get_carousel_draw_offset_steps():
         return 4
 
 
+def get_carousel_place_alignment_slot():
+    """The slot turned to the mixing position before a new carousel is placed,
+    or None to leave the table where it is.
+
+    ``carousel.place_alignment_slot``. The robot always sets a carousel down at
+    the same heading, so whether it fits the table -- and which slot then stands
+    at the mixing position -- depends on the table's angle at that moment. With
+    this slot at the mixing position the carousel aligns with the table, so every
+    mount lands the same way and the taught slot reference stays true for each
+    new carousel. Configuration, not state, like the geometry above: it is fixed
+    by how the carousel fits the table.
+
+    Raises ValueError for anything but a whole number, rather than guessing which
+    slot was meant.
+    """
+    value = config.get_section("carousel").get("place_alignment_slot")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("carousel.place_alignment_slot must be a slot number, got %r"
+                         % (value,))
+    return value
+
+
 def require_carousel_step():
     step = get_carousel_step()
     if step == UNKNOWN:

@@ -392,6 +392,9 @@ class PALmixerServer:
         if name == cmd.SET_TRANSFER_POINT_HERE:
             return self._set_transfer_point_here(args)
 
+        if name == cmd.SET_CAROUSEL_PLACE_HERE:
+            return self._set_carousel_place_here(args)
+
         if name == cmd.SET_FLOWCELL:
             if len(args) != 1:
                 return "ERROR: usage: %s <%s>" % (
@@ -729,6 +732,7 @@ class PALmixerServer:
             if args:
                 raise ValueError("%s takes no arguments" % cmd.PLACE_NEW_CAROUSEL)
             self._require_positions(('carousel_in_stock', 'carousel_on_mixer'))
+            self._place_alignment()
             return self._place_new_carousel, cmd.PLACE_NEW_CAROUSEL
 
         if name == cmd.CALIBRATE_VENTON_TABLE:
@@ -1398,6 +1402,27 @@ class PALmixerServer:
         print(detail)
         return "OK %s" % detail
 
+    def _set_carousel_place_here(self, args):
+        """Record the carousel place pose from the robot's current pose: where
+        Place New Carousel slides a new carousel in to, and lets go.
+        Fast, and refused while busy, like _set_transfer_point_here."""
+        if args:
+            return "ERROR: %s takes no arguments" % cmd.SET_CAROUSEL_PLACE_HERE
+        if self._busy:
+            return ("ERROR: busy (running %r); the robot has to be standing still "
+                    "to record from it" % self._current_action)
+        if self.simulate:
+            return "OK simulated %s" % cmd.SET_CAROUSEL_PLACE_HERE
+        if self.rob is None:
+            return "ERROR: no robot connection"
+        try:
+            pose = self.PAL12idb.record_current_carousel_place_pose(self.rob)
+        except Exception as e:                           # noqa: BLE001
+            return "ERROR: could not record the carousel place pose: %s" % e
+        detail = "recorded carousel place pose at %s" % (pose,)
+        print(detail)
+        return "OK %s" % detail
+
     def _search_apriltag(self, station, skip_roll=False, from_current=False):
         if self.simulate:
             # Sleep in small slices so a stop_search sent during a --simulate
@@ -1494,7 +1519,10 @@ class PALmixerServer:
         Shared by the Place New Carousel button and the coordinated
         replace_carousel operation, so both leave the inventory the same way.
         The record is written only once the placement has returned: a placement
-        that raises clears nothing. Returns (detail, load record)."""
+        that raises clears nothing. The table turns to the alignment slot first,
+        before the arm moves, so a turn that fails leaves the new carousel in
+        stock. Returns (detail, load record)."""
+        turned = self._turn_table_for_place()
         if self.simulate:
             time.sleep(2)
             detail = "simulated place_new_carousel"
@@ -1502,9 +1530,59 @@ class PALmixerServer:
             pose = self.PAL12idb.place_new_carousel(self.rob)
             detail = "new carousel placed on the mixer (tag %s, arm at %s)" % (
                 state.get_carousel_on_mixer(), pose)
+        if turned:
+            detail = "%s; %s" % (turned, detail)
         load = state.record_carousel_load(state.get_carousel_on_mixer(),
                                           self._mixing_journal.was_mixed, replacement_id)
         return detail, load
+
+    def _place_alignment(self):
+        """Where placement turns the table first, as (slot, motor position), or None.
+
+        carousel.place_alignment_slot names the slot that stands at the mixing
+        position when a carousel aligns with the table
+        (state.get_carousel_place_alignment_slot); None leaves the table alone.
+        The turn sweeps the table under whatever is in the carousel, so this
+        refuses -- ValueError, the synchronous ERROR reply -- unless the mixer
+        head is at its cleaning station, the flowcell in use is at its cleaning
+        station or the beam, and the slot positions are taught. Pure state reads:
+        safe on the reply path, and run again when the placement starts.
+        """
+        slot = state.get_carousel_place_alignment_slot()
+        if slot is None:
+            return None
+        state.validate_slot(slot)
+        mixer = state.get_mixer_head()
+        if mixer != state.MIXER_AT_CLEANING:
+            raise ValueError("the mixer head must be at its cleaning station to place a "
+                             "carousel: the table turns to slot %d first (mixer head: %s)"
+                             % (slot, mixer))
+        fc = state.get_flowcell_in_use()
+        where = state.get_flowcell_location(fc)
+        if where not in (state.FC_AT_CLEANING, state.FC_AT_BEAM):
+            raise ValueError("flowcell %d must be at its cleaning station or the beam to "
+                             "place a carousel: the table turns to slot %d first "
+                             "(flowcell %d: %s)" % (fc, slot, fc, where))
+        try:
+            return slot, state.slot_position(slot)
+        except KeyError as e:
+            # The message itself, not the KeyError's quoted repr.
+            raise ValueError(e.args[0])
+
+    def _turn_table_for_place(self):
+        """Turn the alignment slot to the mixing position, before the arm moves.
+
+        Motor.move_to waits for the stage to stop, so the table is still before
+        anything comes near it. Returns a detail for the reply, or "" when no
+        alignment slot is configured."""
+        aligned = self._place_alignment()
+        if aligned is None:
+            return ""
+        slot, target = aligned
+        if not self.simulate:
+            self.motor.move_to(target)
+        state.set_carousel_slot(slot)
+        return "table turned to slot %d (%s)" % (slot, target)
 
     def _goto_position(self, station):
         if self.simulate:

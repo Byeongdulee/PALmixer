@@ -265,7 +265,7 @@ class MainWindow(QMainWindow):
                 if (not last_result.get("ok")
                         and cmd.is_protective_stop_failure(detail)):
                     self._maybe_alert(last_result.get("action_id") or stamp,
-                                      "Protective Stop -- Recovery Failed", detail)
+                                      "Protective Stop -- Arm Stopped Safely", detail)
         fc_in_use = snapshot.get("flowcell_in_use")
         if fc_in_use is not None:
             self.config_tab.flowcell.set_flowcell_in_use(fc_in_use)
@@ -315,13 +315,13 @@ class MainWindow(QMainWindow):
         # only place the outcome arrives.
         if phase == PHASE_FAILURE:
             self._show_error("%s failed%s" % (action, (" -- %s" % detail) if detail else ""))
-            # A protective stop the robot could not recover from is the one
-            # async failure worth interrupting for: the arm has been put
-            # somewhere safe, but a piece may be loose and the operator has to
-            # go and look before anything else runs.
+            # A protective stop in a transport is the one async failure worth
+            # interrupting for: the arm has been put somewhere safe, but a piece
+            # may be loose and the operator has to go and look before anything
+            # else runs.
             if cmd.is_protective_stop_failure(detail):
                 self._maybe_alert(payload.get("trace") or detail,
-                                  "Protective Stop -- Recovery Failed", detail)
+                                  "Protective Stop -- Arm Stopped Safely", detail)
 
     # -- shared helpers ----------------------------------------------------------
     def _set_busy(self, busy):

@@ -7,6 +7,7 @@ reverse, the planar carry, bump-and-release) and the carousel_on_mixer state,
 not the camera geometry.
 """
 from pathlib import Path
+import math
 import sys
 import types
 
@@ -28,11 +29,17 @@ class FakeGripper:
 
 
 class FakeRobot:
-    """Tracks an xyz position and logs every motion/gripper call in order."""
+    """Tracks an xyz position and logs every motion/gripper call in order.
+
+    Joints are tracked only as far as the base swing needs: movej turns the
+    position about the base axis by the change in joint 0, as the real base
+    joint does, and logs the turn (deg) and where it left the TCP.
+    """
     def __init__(self, pos=(0.30, -0.20, 0.50)):
         self.tcp = [0, 0, 0.195, 0, 0, 0]
         self.camtcp = [0, 0.0493, 0.06, -0.5236, 0, 0]
         self.pos = list(pos)
+        self.q = [math.atan2(pos[1], pos[0]), -1.6, 1.7, -1.7, -1.57, 0.4]
         self.log = []
         self.tcp_sets = []
         self.camera = types.SimpleNamespace(QRdistance=0.20)
@@ -52,6 +59,16 @@ class FakeRobot:
     def moveto(self, p, **k):
         self.pos = [p[0], p[1], p[2]]
         self.log.append(("moveto", [round(x, 6) for x in p]))
+    def getj(self):
+        return list(self.q)
+    def movej(self, q, **k):
+        turn = q[0] - self.q[0]
+        x, y = self.pos[0], self.pos[1]
+        self.pos[0] = x * math.cos(turn) - y * math.sin(turn)
+        self.pos[1] = x * math.sin(turn) + y * math.cos(turn)
+        self.q = list(q)
+        self.log.append(("movej", round(math.degrees(turn), 6),
+                         [round(self.pos[0], 6), round(self.pos[1], 6)]))
     def bump(self, z=-1, backoff=0.0, **k):
         self.log.append(("bump", z, backoff))
     def release(self):
@@ -70,8 +87,10 @@ def stations(monkeypatch):
            "carousel_in_stock": [0.10, 0.44, 0.28, 2.2, -2.2, 0.70],
            "carousel_used_stack": [0.55, 0.10, 0.32, 2.2, -2.2, 1.57]}
     monkeypatch.setattr(PAL12idb, "get_station_position", lambda s: list(pos[s]))
-    # No carousel safe Z unless a test sets one (never the bench's waypoints.ini).
+    # No carousel safe Z unless a test sets one (never the bench's waypoints.ini),
+    # and no recorded place pose either.
     monkeypatch.setattr(PAL12idb, "get_carousel_safe_z", lambda: None)
+    monkeypatch.setattr(PAL12idb, "get_carousel_place_pose", lambda: None)
     return pos
 
 
@@ -156,11 +175,12 @@ def test_unload_sequence(stations, quiet_camera, tmp_state, monkeypatch):
     kinds = _kinds(rob.log)
     # look-lift, grab, lift(up/diag/up), carry over used stack, bump, release, back up.
     # The drop opens as soon as it bumps -- no forcing further down onto the stack.
-    # The three leading moveto are _carousel_goto to the mixer carousel: lift
-    # straight up, across at height, straight down -- DIRECT, not via the transfer
-    # point (that route crosses the base and protective-stops).
+    # The leading moveto/movej/moveto/moveto are _carousel_goto to the mixer
+    # carousel: lift straight up, swing the base round, straight across at
+    # height, straight down -- DIRECT, not via the transfer point (that route
+    # crosses the base and protective-stops).
     n = len(PAL12idb.CAROUSEL_SLIDE_STEPS)
-    assert kinds == ["moveto", "moveto", "moveto", "mvr2z", "put_camera2tcp", "grab", "mvr2z"] +                     ["translate"] * n + ["mvr2z", "moveto", "bump", "release", "moveto"]
+    assert kinds == ["moveto", "movej", "moveto", "moveto", "mvr2z", "put_camera2tcp", "grab", "mvr2z"] +                     ["translate"] * n + ["mvr2z", "moveto", "bump", "release", "moveto"]
     assert kinds.index("release") == kinds.index("bump") + 1   # open right after the bump
     # the two carries are planar over the used stack at the clear height
     moves = [e for e in rob.log if e[0] == "moveto"]
@@ -186,10 +206,10 @@ def test_unload_stacks_on_an_existing_used_carousel(stations, quiet_camera, tmp_
     PAL12idb.unload_current_carousel(rob)
     kinds = _kinds(rob.log)
     n = len(PAL12idb.CAROUSEL_SLIDE_STEPS)
-    # Three leading moveto: _carousel_goto to the mixer carousel (direct, not via
-    # the transfer point). _look_for_used_stack_tag is mocked, so its own direct
-    # goto does not appear here.
-    assert kinds == ["moveto", "moveto", "moveto", "mvr2z", "put_camera2tcp", "grab", "mvr2z"] +                     ["translate"] * n + ["mvr2z", "moveto", "moveto", "bump", "release", "moveto"]
+    # Leading moveto/movej/moveto/moveto: _carousel_goto to the mixer carousel
+    # (direct, not via the transfer point). _look_for_used_stack_tag is mocked, so
+    # its own direct goto does not appear here.
+    assert kinds == ["moveto", "movej", "moveto", "moveto", "mvr2z", "put_camera2tcp", "grab", "mvr2z"] +                     ["translate"] * n + ["mvr2z", "moveto", "moveto", "bump", "release", "moveto"]
     assert kinds.index("release") == kinds.index("bump") + 1   # open right after the bump
     moves = [e for e in rob.log if e[0] == "moveto"]
     # over the found tag's X,Y (the two seating moves and the back-up)
@@ -239,9 +259,10 @@ def test_place_sequence_and_reverse_diagonal(stations, quiet_camera, tmp_state, 
     PAL12idb.place_new_carousel(rob)
     kinds = _kinds(rob.log)
     n = len(PAL12idb.CAROUSEL_SLIDE_STEPS)
-    # The three leading moveto are _carousel_goto over the stock (up, across,
-    # down). Trailing "moveto" is the park at the transport (transfer) position.
-    assert kinds == ["moveto", "moveto", "moveto", "put_camera2tcp", "grab", "mvr2z",
+    # The leading moveto/movej/moveto/moveto are _carousel_goto over the stock
+    # (up, swing the base round, across, down). Trailing "moveto" is the park at
+    # the transport (transfer) position.
+    assert kinds == ["moveto", "movej", "moveto", "moveto", "put_camera2tcp", "grab", "mvr2z",
                      "moveto", "moveto"] + ["translate"] * n + ["bump", "release", "mvr2z", "moveto"]
     # the landing retraces the unload lift's segments in reverse (reversed order,
     # each +X / -Z) -- so it mirrors the lift trajectory.
@@ -257,7 +278,7 @@ def test_place_sequence_and_reverse_diagonal(stations, quiet_camera, tmp_state, 
     # seats the rest.
     surface = mixer[2] - PAL12idb.CAROUSEL_TEACH_BACKOFF
     net_under = PAL12idb.CAROUSEL_GRAB_UNDER - PAL12idb.CAROUSEL_BUMP_LIFT
-    start_z = surface + tdz + PAL12idb.CAROUSEL_SNAP_LIFT - net_under
+    start_z = surface + tdz + PAL12idb.CAROUSEL_PLACE_STANDOFF - net_under
     # [-1] is now the transport-position park; the down-to-start is [-2].
     start = [e for e in rob.log if e[0] == "moveto"][-2]
     assert start[1][0] == pytest.approx(mixer[0] - tdx, abs=1e-6)  # back along -X for the slide
@@ -291,8 +312,89 @@ def test_place_reuses_the_measured_mixer_seat(stations, quiet_camera, tmp_state,
     assert start[1][0] == pytest.approx(seat[0] - tdx, abs=1e-6)  # start X back along -X from the MEASURED seat X
     assert start[1][1] == pytest.approx(seat[1])           # measured seat Y
     assert start[1][2] == pytest.approx(                   # anchored on the measured surface Z
-        seat[2] + tdz + PAL12idb.CAROUSEL_SNAP_LIFT - net_under, abs=1e-6)
+        seat[2] + tdz + PAL12idb.CAROUSEL_PLACE_STANDOFF - net_under, abs=1e-6)
     assert start[1][0] + tdx == pytest.approx(seat[0], abs=1e-6)  # the slide landing reaches the measured seat X
+
+
+def test_place_landing_ends_the_stand_off_above_the_seat(stations, quiet_camera, tmp_state,
+                                                        monkeypatch):
+    # The slide-in ends -- the lowest point the place drives to, where the bump
+    # takes over -- CAROUSEL_PLACE_STANDOFF above the seated height: 10 mm, the
+    # lowest height the operator set by jogging after it hit the platform at 3
+    # and at 4 mm.
+    monkeypatch.setattr(PAL12idb, "_acquire_carousel", lambda r, s, **k: (37, 0.20))
+    monkeypatch.setattr(PAL12idb, "_grab_carousel",
+                        lambda r, station, dist: r.log.append(("grab",)))
+    seat = [0.412, 0.097, 0.264]
+    state.set_carousel_mixer_seat(seat)
+    rob = FakeRobot()
+    lowest = []
+    real_translate = rob.translate
+    def translate(v, **k):
+        real_translate(v, **k)
+        lowest.append(rob.pos[2])
+    rob.translate = translate
+    PAL12idb.place_new_carousel(rob)
+    net_under = PAL12idb.CAROUSEL_GRAB_UNDER - PAL12idb.CAROUSEL_BUMP_LIFT
+    seated = seat[2] - net_under                           # gripper Z with the carousel seated
+    assert min(lowest) == pytest.approx(seated + PAL12idb.CAROUSEL_PLACE_STANDOFF, abs=1e-6)
+    assert PAL12idb.CAROUSEL_PLACE_STANDOFF == pytest.approx(0.010)
+
+
+PLACE = [0.402, 0.101, 0.255, 1.18, 2.90, 0.0]
+
+
+def test_place_with_a_recorded_pose_lowers_turns_then_slides_in(stations, quiet_camera,
+                                                                tmp_state, monkeypatch):
+    # With a place pose recorded (the carousel seated by hand at its final
+    # position and angle): down beside the seat to its height, turn to its angle
+    # there, then straight in along table +X onto it, then let go -- no diagonal
+    # slide and no bump.
+    monkeypatch.setattr(PAL12idb, "get_carousel_place_pose", lambda: list(PLACE))
+    monkeypatch.setattr(PAL12idb, "_acquire_carousel", lambda r, s, **k: (37, 0.20))
+    monkeypatch.setattr(PAL12idb, "_grab_carousel",
+                        lambda r, station, dist: r.log.append(("grab",)))
+    rob = FakeRobot()
+    PAL12idb.place_new_carousel(rob)
+    kinds = _kinds(rob.log)
+    assert "translate" not in kinds and "bump" not in kinds
+    i = kinds.index("release")
+    assert kinds[i - 4:] == ["moveto"] * 4 + ["release", "mvr2z", "moveto"]
+    carry, lowest, turned, final = [e[1] for e in rob.log[i - 4:i]]
+    tdx = PAL12idb.CAROUSEL_SLIDE_TOTAL_DX                # table axes = base axes in these tests
+    # (moveto logs positions rounded to 6 decimals, hence abs=1e-6)
+    assert lowest[:3] == pytest.approx([PLACE[0] - tdx, PLACE[1], PLACE[2]], abs=1e-6)  # beside it, at its height
+    assert carry[:2] == pytest.approx(lowest[:2], abs=1e-6) and carry[2] > lowest[2]    # straight down to it
+    assert lowest[3:] != PLACE[3:]                       # came down at the slide-in angle
+    assert turned[:3] == pytest.approx(lowest[:3], abs=1e-6)  # turned where it stood
+    assert turned[3:] == pytest.approx(PLACE[3:], abs=1e-6)
+    assert final == PLACE                                # then straight in
+
+
+def test_place_pose_round_trips_and_moves_with_the_mixer_carousel(tmp_path, monkeypatch):
+    monkeypatch.setattr(PAL12idb, "_INI_PATH", str(tmp_path / "waypoints.ini"))
+    assert PAL12idb.get_carousel_place_pose() is None
+    mixer = [0.511, -0.053, -0.212, 1.19, 2.91, 0.0]
+    PAL12idb.store_station_position("carousel_on_mixer", mixer)
+    PAL12idb.store_carousel_place_pose(PLACE)
+    assert PAL12idb.get_carousel_place_pose() == pytest.approx(PLACE)
+    # The mixer side re-taught 8 cm over: the place pose moves with it, angle kept.
+    PAL12idb.store_station_position(
+        "carousel_on_mixer", [mixer[0] + 0.05, mixer[1] + 0.07, mixer[2]] + mixer[3:])
+    moved = PAL12idb.get_carousel_place_pose()
+    assert moved[:3] == pytest.approx([PLACE[0] + 0.05, PLACE[1] + 0.07, PLACE[2]])
+    assert moved[3:] == pytest.approx(PLACE[3:])
+
+
+def test_recording_the_place_pose_uses_the_gripper_tcp(tmp_path, monkeypatch):
+    monkeypatch.setattr(PAL12idb, "_INI_PATH", str(tmp_path / "waypoints.ini"))
+    PAL12idb.store_station_position("carousel_on_mixer", [0.511, -0.053, -0.212, 1.19, 2.91, 0.0])
+    rob = FakeRobot()
+    vector = types.SimpleNamespace(tolist=lambda: list(PLACE))
+    rob.get_pose = lambda: types.SimpleNamespace(get_pose_vector=lambda: vector)
+    assert PAL12idb.record_current_carousel_place_pose(rob) == pytest.approx(PLACE)
+    assert rob.tcp_sets == ["gripper"]
+    assert PAL12idb.get_carousel_place_pose() == pytest.approx(PLACE)
 
 
 def test_place_marks_mixer_unknown_until_seated(stations, quiet_camera, tmp_state, monkeypatch):
@@ -348,6 +450,131 @@ def test_goto_crosses_at_the_safe_z(stations, monkeypatch):
     assert moves[0][:2] == [0.30, -0.20] and moves[0][2] == SAFE_Z   # straight up
     assert moves[1][:2] == target[:2] and moves[1][2] == SAFE_Z     # across at the safe Z
     assert moves[2] == target                                        # straight down
+
+
+def test_goto_swings_the_base_before_crossing(stations):
+    # The stock carousel is reached by turning the base joint alone first, so the
+    # arm keeps its shape round the base and only then goes straight in -- a
+    # straight cross from the start pulled it in toward the base while turning
+    # and bumped it into its own joint.
+    rob = FakeRobot()                                    # at azimuth -33.7 deg
+    q_before = rob.getj()
+    target = stations["carousel_in_stock"]               # at azimuth 77.2 deg
+    PAL12idb._carousel_goto(rob, target)
+    assert _kinds(rob.log) == ["moveto", "movej", "moveto", "moveto"]
+    turn = math.degrees(math.atan2(target[1], target[0]) - math.atan2(-0.20, 0.30))
+    assert rob.log[1][1] == pytest.approx(turn, abs=1e-4)    # the base alone, by the azimuth gap
+    assert rob.getj()[1:] == q_before[1:]                     # every other joint kept its angle
+    swung = rob.log[1][2]
+    assert math.atan2(swung[1], swung[0]) == pytest.approx(math.atan2(target[1], target[0]))
+    assert math.hypot(*swung) == pytest.approx(math.hypot(0.30, -0.20))   # same reach
+    assert rob.log[2][1][:2] == target[:2]                   # then straight in over the seat
+
+
+def test_swing_takes_the_short_way_round():
+    # +170 deg to -170 deg is 20 deg across the -X axis, not 340 deg back round.
+    r = math.radians
+    rob = FakeRobot(pos=(0.40 * math.cos(r(170)), 0.40 * math.sin(r(170)), 0.5))
+    turn = PAL12idb._swing_base_to(rob, [0.30 * math.cos(r(-170)), 0.30 * math.sin(r(-170))])
+    assert turn == pytest.approx(20.0)
+    assert rob.log[0][1] == pytest.approx(20.0)
+
+
+def test_swing_is_skipped_when_already_pointing_at_the_seat():
+    rob = FakeRobot(pos=(0.40, 0.0, 0.5))
+    assert PAL12idb._swing_base_to(rob, [0.30, 0.003]) == 0.0      # 0.57 deg off
+    assert rob.log == []
+
+
+def test_swing_refuses_to_pass_the_base_joint_limit():
+    rob = FakeRobot(pos=(0.40, 0.0, 0.5))
+    rob.q[0] = math.radians(350.0)                       # wound almost to the limit
+    with pytest.raises(RuntimeError, match="limit"):
+        PAL12idb._swing_base_to(rob, [0.0, 0.40])        # +90 deg would reach 440 deg
+    assert rob.log == []                                  # refused before moving
+
+
+TP = [0.25, -0.16, 0.60, 2.2, -2.2, 0.0]   # the corridor, above every test station
+
+
+@pytest.fixture
+def corridor(monkeypatch, stations):
+    stations["sample_table"] = [-0.24, -0.38, 0.40, -2.2, 2.2, 0.0]
+    monkeypatch.setattr(PAL12idb, "get_transfer_point", lambda: list(TP))
+    return TP
+
+
+def test_goto_station_swings_into_a_carousel_seat_from_the_corridor(corridor, stations):
+    # From the transfer point, never the straight leg down and across the front
+    # of the base into the seat (it folded the arm into its own joint): swing
+    # round at the corridor's height, go straight in, and only then go down.
+    rob = FakeRobot(pos=TP[:3])
+    PAL12idb.goto_station(rob, "carousel_in_stock")
+    stock = stations["carousel_in_stock"]
+    assert rob.tcp_sets[0] == "gripper"
+    assert _kinds(rob.log) == ["moveto", "movej", "moveto", "moveto"]
+    moves = [e[1] for e in rob.log if e[0] == "moveto"]
+    assert moves[1][:2] == stock[:2] and moves[1][2] == TP[2]   # in over the seat, still at height
+    assert moves[2] == stock                                     # then straight down
+
+
+def test_goto_station_crosses_the_corridor_first_from_the_sample_table(corridor, stations):
+    rob = FakeRobot(pos=stations["sample_table"][:3])
+    PAL12idb.goto_station(rob, "carousel_in_stock")
+    assert _kinds(rob.log) == ["moveto", "moveto", "movej", "moveto", "moveto"]
+    assert rob.log[0][1] == TP                                   # through the corridor first
+
+
+def test_goto_station_goes_direct_between_carousel_seats(corridor, stations):
+    # Over the used stack the arm is already on the mixer side, and from there
+    # the corridor's straight leg would cross the base as well.
+    rob = FakeRobot(pos=stations["carousel_used_stack"][:3])
+    PAL12idb.goto_station(rob, "carousel_in_stock")
+    assert _kinds(rob.log) == ["moveto", "movej", "moveto", "moveto"]
+    assert all(e[1] != TP for e in rob.log if e[0] == "moveto")
+
+
+def test_goto_station_at_the_seat_already_stays_put(corridor, stations):
+    stock = stations["carousel_in_stock"]
+    rob = FakeRobot(pos=stock[:3])
+    PAL12idb.goto_station(rob, "carousel_in_stock")
+    assert rob.log == [("moveto", stock)]
+
+
+def test_transfer_point_from_the_used_stack_goes_up_then_swings(corridor, stations):
+    # Back from the used stack (where Unload Current Carousel leaves the arm, and
+    # every workflow parks here when it ends): straight up first, then the base
+    # alone, then across -- never the straight move that cuts across the base.
+    used = stations["carousel_used_stack"]
+    rob = FakeRobot(pos=used[:3])
+    PAL12idb.goto_transfer_point(rob)
+    assert rob.tcp_sets[0] == "gripper"
+    assert _kinds(rob.log) == ["moveto", "movej", "moveto", "moveto"]
+    moves = [e[1] for e in rob.log if e[0] == "moveto"]
+    assert moves[0] == [used[0], used[1], TP[2]]                 # up first, at the stack's X/Y
+    swung = rob.log[1][2]
+    assert math.atan2(swung[1], swung[0]) == pytest.approx(math.atan2(TP[1], TP[0]))
+    assert moves[1][:3] == TP[:3]                                # then across to the corridor
+    assert moves[2] == TP
+
+
+def test_transfer_point_from_the_mixer_side_stays_straight(corridor, stations):
+    rob = FakeRobot(pos=(0.40, -0.25, 0.30))      # nearer the corridor than either stack seat
+    PAL12idb.goto_transfer_point(rob)
+    assert rob.log == [("moveto", TP)]
+
+
+def test_corridor_leg_from_the_used_stack_goes_up_then_swings(corridor, stations):
+    # The same entry into the corridor for every station move and transport.
+    used = stations["carousel_used_stack"]
+    table = stations["sample_table"]
+    rob = FakeRobot(pos=used[:3])
+    PAL12idb.move_via_transferpoint(rob, list(table))
+    assert _kinds(rob.log) == ["moveto", "movej", "moveto", "moveto", "moveto"]
+    moves = [e[1] for e in rob.log if e[0] == "moveto"]
+    assert moves[0] == [used[0], used[1], TP[2]]                 # up first
+    assert moves[2] == TP                                        # at the corridor
+    assert moves[3] == table                                     # then on to the station
 
 
 def test_unload_carries_at_the_safe_z(stations, quiet_camera, tmp_state, monkeypatch):
@@ -441,6 +668,7 @@ def test_table_offset_is_identity_without_a_frame():
 def test_command_builders():
     assert cmd.unload_carousel_command() == "unload_carousel"
     assert cmd.place_new_carousel_command() == "place_new_carousel"
+    assert cmd.set_carousel_place_here_command() == "set_carousel_place_here"
 
 
 def test_state_round_trips_and_defaults_unknown(tmp_state):
@@ -449,6 +677,41 @@ def test_state_round_trips_and_defaults_unknown(tmp_state):
     assert state.get_carousel_on_mixer() == "34"
     state.set_carousel_on_mixer(None)
     assert state.get_carousel_on_mixer() == state.UNKNOWN
+
+
+MIXER_POSE = [0.40, 0.10, 0.30, 2.2, -2.2, 0.10]
+SEAT = [0.401, 0.099, 0.24]
+
+
+@pytest.fixture
+def tmp_waypoints(tmp_path, monkeypatch, tmp_state):
+    monkeypatch.setattr(PAL12idb, "_INI_PATH", str(tmp_path / "waypoints.ini"))
+    PAL12idb.store_station_position("carousel_on_mixer", MIXER_POSE)
+    state.set_carousel_mixer_seat(SEAT)
+
+
+def test_reteaching_the_mixer_carousel_clears_the_measured_seat(tmp_waypoints):
+    # The placement must follow a re-taught position, not the seat measured before it.
+    PAL12idb.store_station_position("carousel_on_mixer", [0.45, 0.17] + MIXER_POSE[2:])
+    assert state.get_carousel_mixer_seat() is None
+
+
+def test_a_pulled_mixer_carousel_position_clears_the_measured_seat(tmp_waypoints):
+    # pull_positions_from_pvs writes every station through _write_ini_position,
+    # not store_station_position -- the clearing has to happen there.
+    PAL12idb._write_ini_position(PAL12idb.carousel_on_mixerID, [0.45, 0.17] + MIXER_POSE[2:])
+    assert state.get_carousel_mixer_seat() is None
+
+
+def test_an_unchanged_or_heading_only_rewrite_keeps_the_seat(tmp_waypoints):
+    PAL12idb._write_ini_position(PAL12idb.carousel_on_mixerID, MIXER_POSE)   # a pull of the same value
+    PAL12idb.store_station_position("carousel_on_mixer", MIXER_POSE[:3] + [1.2, 2.9, 0.0])
+    assert state.get_carousel_mixer_seat() == pytest.approx(SEAT)
+
+
+def test_other_stations_keep_the_seat(tmp_waypoints):
+    PAL12idb.store_station_position("carousel_in_stock", [0.10, 0.44, 0.28, 2.2, -2.2, 0.7])
+    assert state.get_carousel_mixer_seat() == pytest.approx(SEAT)
 
 
 def test_mixer_seat_round_trips_and_defaults_none(tmp_state):

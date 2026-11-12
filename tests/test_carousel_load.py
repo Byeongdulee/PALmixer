@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import pytest
 
-from palmixer import preparation_api, state
+from palmixer import commands as cmd, preparation_api, state
 from palmixer.mixing_records import MixingJournal, new_record
 from palmixer.preparation_api import NO_STOCK_MESSAGE, PreparationAPI
 from palmixer.server import PALmixerServer
@@ -187,7 +187,9 @@ class FakePAL:
 
 
 @pytest.fixture
-def server(tracked, journal):
+def server(tracked, journal, monkeypatch):
+    # No table turn unless a test configures one (never the bench's config file).
+    monkeypatch.setattr(state, "get_carousel_place_alignment_slot", lambda: None)
     instance = object.__new__(PALmixerServer)
     instance.simulate = False
     instance.PAL12idb = FakePAL()
@@ -255,6 +257,115 @@ def test_mixing_record_carries_the_carousel_tag(server, journal):
     assert (record["sample_id"], record["sample_uid"]) == ("S-one", UID_ONE)
 
 
+# -- placement turns the table to the alignment slot first --------------------------
+class FakeMotor:
+    """Records each absolute move in the PAL log, so the order against the arm shows."""
+
+    def __init__(self, log):
+        self.log = log
+        self.error = None
+
+    def move_to(self, position, timeout=120.0):
+        if self.error:
+            raise self.error
+        self.log.append(("turn", position))
+        return position
+
+
+# The tracked fixture teaches slot 2 at 15.5 with a 4.2 step: slot 4 is at 23.9.
+SLOT_4 = 15.5 + 2 * 4.2
+
+
+@pytest.fixture
+def aligned(server, monkeypatch):
+    monkeypatch.setattr(state, "get_carousel_place_alignment_slot", lambda: 4)
+    server.motor = FakeMotor(server.PAL12idb.log)
+    return server
+
+
+def test_place_turns_the_table_to_the_alignment_slot_before_the_arm_moves(aligned):
+    reply = aligned._place_new_carousel()
+    assert aligned.PAL12idb.log == [("turn", pytest.approx(SLOT_4)), "place"]
+    assert state.get_carousel_slot() == 4
+    assert "table turned to slot 4" in reply and "every slot cleared (carousel load 1)" in reply
+
+
+def test_without_an_alignment_slot_the_table_stays_put(server):
+    server.motor = FakeMotor(server.PAL12idb.log)
+    server._place_new_carousel()
+    assert server.PAL12idb.log == ["place"]
+    assert state.get_carousel_slot() == 3
+
+
+@pytest.mark.parametrize("obstacle,match", [
+    ("mixer_head", "mixer head must be at its cleaning station"),
+    ("flowcell_in_gripper", "flowcell 1 must be at its cleaning station or the beam"),
+    ("flowcell_unknown", "flowcell 1 must be at its cleaning station or the beam"),
+    ("untaught", "has not been taught"),
+    ("slot_off_the_carousel", "slot"),
+])
+def test_place_is_refused_before_anything_moves_when_the_table_cannot_turn(
+        aligned, monkeypatch, obstacle, match):
+    if obstacle == "mixer_head":
+        state.set_mixer_head(state.MIXER_AT_MIXER)
+    elif obstacle == "flowcell_in_gripper":
+        state.set_flowcell_location(1, state.FC_IN_GRIPPER)
+    elif obstacle == "flowcell_unknown":
+        state.set_flowcell_location(1, state.UNKNOWN)
+    elif obstacle == "untaught":
+        monkeypatch.setattr(state, "carousel_reference", lambda: None)
+    else:
+        monkeypatch.setattr(state, "get_carousel_place_alignment_slot", lambda: 9)  # 8 slots
+    with pytest.raises(ValueError, match=match):
+        aligned._resolve(cmd.PLACE_NEW_CAROUSEL, [])       # the synchronous ERROR reply
+    with pytest.raises(ValueError, match=match):
+        aligned._place_new_carousel()                      # re-checked when it starts
+    assert aligned.PAL12idb.log == []
+    assert state.get_carousel_slot() == 3
+    assert state.carousel_load() == {"sequence": 0, "record": None}
+
+
+def test_place_with_the_flowcell_at_the_beam_still_turns(aligned):
+    state.set_flowcell_location(1, state.FC_AT_BEAM)
+    aligned._resolve(cmd.PLACE_NEW_CAROUSEL, [])
+    aligned._place_new_carousel()
+    assert aligned.PAL12idb.log == [("turn", pytest.approx(SLOT_4)), "place"]
+
+
+def test_a_failed_turn_leaves_the_new_carousel_in_stock(aligned):
+    aligned.motor.error = RuntimeError("Galil did not answer")
+    with pytest.raises(RuntimeError, match="Galil did not answer"):
+        aligned._place_new_carousel()
+    assert aligned.PAL12idb.log == []                       # the arm never moved
+    assert state.get_carousel_slot() == 3                   # not recorded as turned
+    assert state.carousel_load() == {"sequence": 0, "record": None}
+
+
+def test_simulated_place_records_the_alignment_slot(aligned, monkeypatch):
+    import palmixer.server as server_module
+    monkeypatch.setattr(server_module.time, "sleep", lambda s: None)
+    aligned.simulate = True
+    aligned.motor.error = RuntimeError("a simulated place must not touch the motor")
+    aligned._place_new_carousel()
+    assert aligned.PAL12idb.log == []
+    assert state.get_carousel_slot() == 4
+
+
+@pytest.mark.parametrize("value,expected", [(None, None), (11, 11)])
+def test_alignment_slot_comes_from_the_carousel_config(monkeypatch, value, expected):
+    from palmixer import config
+    monkeypatch.setattr(config, "get_section", lambda name: {"place_alignment_slot": value})
+    assert state.get_carousel_place_alignment_slot() == expected
+
+
+@pytest.mark.parametrize("value", ["11", 11.5, True])
+def test_alignment_slot_must_be_a_whole_number(monkeypatch, value):
+    from palmixer import config
+    monkeypatch.setattr(config, "get_section", lambda name: {"place_alignment_slot": value})
+    with pytest.raises(ValueError, match="place_alignment_slot"):
+        state.get_carousel_place_alignment_slot()
+
+
 # -- PAL12idb pieces, compiled from source (UR_12idb is not importable here) ------
 PAL_SOURCE = Path(__file__).resolve().parents[1] / "palmixer" / "PAL12idb.py"
 
@@ -312,7 +423,7 @@ def coordinated(server, tracked, monkeypatch):
 
     monkeypatch.setattr(preparation_api, "threading",
                         SimpleNamespace(Thread=RecordingThread, RLock=threading.RLock))
-    # Robot placement is blocked by default for now; these tests exercise the full swap.
+    # These tests exercise the full robot swap; the blocked-placement test turns it off.
     monkeypatch.setattr(preparation_api, "auto_place_new_carousel", lambda: True)
     api = PreparationAPI(server, tracked / "session.json")
     server.preparation_api = api
@@ -500,6 +611,29 @@ def test_preconditions_refuse_before_accepting(coordinated, obstacle, match):
     assert c.api.record.get("replacements", {}) == {}
     assert json.loads(c.path.read_text()).get("replacements", {}) == {}
     assert sorted(state.carousel_samples()) == [1, 2, 5]
+
+
+def test_replace_turns_the_table_between_the_unload_and_the_placement(coordinated, monkeypatch):
+    c = coordinated
+    monkeypatch.setattr(state, "get_carousel_place_alignment_slot", lambda: 4)
+    c.server.motor = FakeMotor(c.pal.log)
+    rid = replace_message()["replacement_id"]
+    c.api.request(replace_message(rid))
+    c.finish()
+    assert c.pal.log == ["unload", ("turn", pytest.approx(SLOT_4)), "place"]
+    assert status(c)["replacements"][rid]["state"] == "committed"
+    assert state.get_carousel_slot() == 4
+
+
+def test_replace_is_refused_before_the_unload_when_the_table_cannot_turn(coordinated, monkeypatch):
+    c = coordinated
+    monkeypatch.setattr(state, "get_carousel_place_alignment_slot", lambda: 4)
+    monkeypatch.setattr(state, "carousel_reference", lambda: None)
+    c.server.motor = FakeMotor(c.pal.log)
+    with pytest.raises(ValueError, match="has not been taught"):
+        c.api.request(replace_message())
+    assert c.started == [] and c.pal.log == []
+    assert c.api.record.get("replacements", {}) == {}
 
 
 # -- placement blocked: the operator seats the carousel and presses Reset --------------

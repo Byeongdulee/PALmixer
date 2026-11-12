@@ -124,7 +124,11 @@ _DEFAULTS = {
     # same number. PVapp's "CRS" holder type describes the same hardware
     # (app/holders.py) and must agree: radius and tube diameter are carried here
     # too so the two can be compared without opening both repos.
+    # `place_alignment_slot` is the slot Place New Carousel turns to the mixing
+    # position before the arm moves: the table angle at which a carousel set down
+    # at the robot's fixed heading aligns with the table (None: no turn).
     "carousel": {"size": 0, "step": 0.0, "draw_offset_steps": 4, "preparation_offset_steps": None,
+                 "place_alignment_slot": None,
                  "radius_mm": 50.0, "tube_diameter_mm": 10.0},
     # ZMQ endpoints of the apssector12_pump_control dashboards. speed_* are
     # advisory (the dashboard owns the real mix speed); timeouts govern the

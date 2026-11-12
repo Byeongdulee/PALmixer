@@ -53,7 +53,26 @@ def no(monkeypatch):
 
 def test_position_dropdown_lists_taught_stations_then_transfer_point(tab):
     datas = [tab.position_combo.itemData(i) for i in range(tab.position_combo.count())]
-    assert datas == list(cmd.TAUGHT_STATIONS) + [ConfigTab._TRANSFER_POINT]
+    assert datas == list(cmd.TAUGHT_STATIONS) + [ConfigTab._TRANSFER_POINT,
+                                                 ConfigTab._CAROUSEL_PLACE]
+
+
+def test_set_records_the_carousel_place_pose(tab, yes):
+    _select(tab.position_combo, ConfigTab._CAROUSEL_PLACE)
+    _select(tab.action_combo, ConfigTab._SET)
+    tab._on_go()
+    assert tab.sent == [cmd.set_carousel_place_here_command()]
+
+
+def test_carousel_place_pose_has_no_go_to_or_search(tab, monkeypatch):
+    shown = []
+    monkeypatch.setattr(ct.QMessageBox, "information", lambda *a, **k: shown.append(a[1]))
+    _select(tab.position_combo, ConfigTab._CAROUSEL_PLACE)
+    for action in (ConfigTab._GOTO, ConfigTab._SEARCH):
+        _select(tab.action_combo, action)
+        tab._on_go()
+    assert tab.sent == []
+    assert shown == ["Go To Position", "Search AprilTag"]
 
 
 def test_action_dropdown_has_the_three_actions(tab):

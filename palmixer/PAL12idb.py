@@ -250,6 +250,10 @@ APRILTAG_SUBJECT = {
 # does (so the recorded Z is anchored to the real surface), but it does NOT grab
 # -- there is nothing to pick up at a carousel centre. See locate_apriltag.
 NO_GRAB_STATIONS = ('carousel_on_mixer', 'carousel_in_stock', 'carousel_used_stack')
+# The carousel seats. Every move into one takes the carousel route
+# (_carousel_goto: swing round, then down) -- goto_station included, see
+# _goto_carousel_station.
+CAROUSEL_STATIONS = ('carousel_on_mixer', 'carousel_in_stock', 'carousel_used_stack')
 # Fallbacks for the `apriltags` config section, used when it says nothing about
 # a tag. Only sizes: an unconfigured *number* means "whichever tag is nearest
 # the image center", which is a real behaviour rather than a missing value.
@@ -2208,7 +2212,7 @@ except ImportError:
 placement_speed = DEFAULT_SPEED / 2
 placement_accel = DEFAULT_ACCEL / 2
 
-# -- protective-stop recovery ------------------------------------------------
+# -- protective stops ---------------------------------------------------------
 # A protective stop does not arrive as one exception type. The robot raises it
 # two different ways, from two different modules, and a stop that kills a
 # running program surfaces as a third class that merely shares a name with the
@@ -2235,30 +2239,14 @@ for _mod, _name in (('common.robUR', 'RobotException'),
     if isinstance(_exc, type) and issubclass(_exc, BaseException):
         _MOTION_FAULTS = _MOTION_FAULTS + (_exc,)
 
-# How far above a seat the recovery search stands to look for its AprilTag.
-# The taught pose with this added to Z, at the taught orientation -- not
-# search_reference(), which is a tuned camera standoff for a teach. Recovery is
-# already at the seat when it starts, so this is a straight lift off it.
-#
-# 100 mm, not the 200 mm first tried. The tag sits distance_gripper_tag (50 mm)
-# below the taught pose, so this leaves the camera ~0.15 m off it -- close to
-# the standoffs the search_refs poses use, and within reach of the 12 mm
-# flowcell tags. At 200 mm the camera stood ~0.25 m off, further out than any
-# tuned reference, and a 12 mm tag may not resolve from there. Being nearer
-# than the 0.2 m working standoff costs nothing: descend_to_apriltag steps
-# either way (step = measured - distance), so it simply backs off to it.
-RECOVERY_SEARCH_LIFT = 0.10
-# The lift between re-grabbing a mis-seated piece and setting it back down, so
-# the second attempt comes down onto the seat instead of dragging across it.
-RECOVERY_RESEAT_LIFT = 0.05
-# Where the arm retreats to when recovery has given up, before the operator is
-# asked to come and look. Enough to be clear of the seat, small enough not to
+# Where the arm retreats to after a protective stop in a transport, before the
+# operator is asked to come and look. Enough to be clear of the seat, small enough not to
 # be a move of its own.
 RECOVERY_ABORT_LIFT = 0.10
 
 
 class ProtectiveStopUnrecovered(RuntimeError):
-    """A protective stop that recovery could not get past.
+    """A protective stop during a transport.
 
     Raised only after the arm has been put somewhere safe (gripper released
     where that is wanted, lifted clear). Carries
@@ -2271,9 +2259,8 @@ def _is_protective_stop(robot, exc):
     """True only if `exc` is a motion fault *and* the robot really is stopped.
 
     The exception type alone is not enough: robUR raises its RobotException for
-    an unreachable pose and a TCP-set timeout as well, and "recovering" from
-    one of those would unlock nothing and then drive the arm around for no
-    reason. The safety mode is the authority, so it decides; the type only
+    an unreachable pose and a TCP-set timeout as well, and treating one of
+    those as a stop would open the gripper and lift the arm for no reason. The safety mode is the authority, so it decides; the type only
     keeps unrelated failures (a lost camera, a bad station name) out.
     """
     if _MOTION_FAULTS and not isinstance(exc, _MOTION_FAULTS):
@@ -2287,14 +2274,6 @@ def _is_protective_stop(robot, exc):
             return False
 
 
-def _recoverable_station(station):
-    """Whether `station` has an AprilTag a recovery search could find.
-
-    False for sample_on_mixer_station: its pose is derived from the mixer
-    cleaning station by a fixed offset (see _sample_on_mixer_from), and there
-    is no tag on the seat itself to search for.
-    """
-    return station in APRILTAG_SUBJECT
 flowcell_ID = state.get_flowcell_in_use()
 from . import capath
 capath.ensure()                 # must precede the epics import: see capath.py
@@ -2390,7 +2369,26 @@ def _read_ini_position(ID):
 _DERIVED_FROM_KEY = 'derived_from'
 
 
+# How far (m, any of X/Y/Z) carousel_on_mixer has to move for the seat an
+# unload measured there to count as out of date. Above float noise, below any
+# real re-teach.
+_SEAT_MOVED_M = 0.0001
+
+
 def _write_ini_position(ID, pos, derived_from = None):
+    # A new carousel_on_mixer position -- a teach, an AprilTag search, an EPICS
+    # pull -- supersedes the seat the last unload measured there, which
+    # place_new_carousel would otherwise still land on (2026-11-12: it put a
+    # carousel down onto the flowcell washing station after every mixer-side
+    # station had been moved). Only X/Y/Z count: the seat holds no heading.
+    if ID == carousel_on_mixerID:
+        old = _read_ini_position(ID)
+        if old is None or any(abs(float(a) - float(b)) > _SEAT_MOVED_M
+                              for a, b in zip(old[:3], pos[:3])):
+            if state.get_carousel_mixer_seat() is not None:
+                state.set_carousel_mixer_seat(None)
+                print("carousel_on_mixer moved: cleared the measured mixer seat; "
+                      "placing lands on the taught pose until an unload measures it again")
     # Merge into the existing file rather than overwriting it, so other
     # stations' cached positions survive.
     parser = configparser.ConfigParser()
@@ -2534,6 +2532,58 @@ def record_current_carousel_safe_z(robot):
     """Record the arm's current Z (gripper TCP) as the carousel safe Z."""
     robot.set_tcp(robot.tcp)
     return store_carousel_safe_z(robot.get_pos()[2])
+
+
+# The carousel place pose: where the gripper leaves a new carousel on the mixer
+# -- its final, seated position and angle, recorded by hand with the carousel
+# seated (record_current_carousel_place_pose). Place New Carousel comes down
+# beside the seat to its height, turns to its angle, slides straight in onto it
+# and lets go. Kept in waypoints.ini with the Carousel on
+# Mixer position it was recorded against, and shifted by however far that has
+# moved since, so re-teaching the mixer side carries it along; the angle is kept
+# as recorded. Unrecorded -> None, and placing bumps down to seat instead.
+_CAROUSEL_PLACE_SECTION = 'carousel_place'
+_CAROUSEL_PLACE_REF = ('ref_X', 'ref_Y', 'ref_Z')
+
+
+def get_carousel_place_pose():
+    """The carousel place pose [x, y, z, rx, ry, rz], or None if not recorded.
+
+    Shifted by how far Carousel on Mixer has moved since it was recorded. Read
+    live, like get_transfer_point, so a re-record takes effect without a restart.
+    """
+    parser = configparser.ConfigParser()
+    parser.read(_INI_PATH)
+    try:
+        pose = [parser.getfloat(_CAROUSEL_PLACE_SECTION, f) for f in _POSITION_FIELDS]
+        ref = [parser.getfloat(_CAROUSEL_PLACE_SECTION, f) for f in _CAROUSEL_PLACE_REF]
+    except (ValueError, configparser.Error):
+        return None
+    mixer = get_station_position('carousel_on_mixer')
+    return [pose[i] + float(mixer[i]) - ref[i] for i in range(3)] + pose[3:]
+
+
+def store_carousel_place_pose(pose):
+    """Persist the carousel place pose with the Carousel on Mixer position it is
+    recorded against, merging so the station positions beside it survive."""
+    mixer = get_station_position('carousel_on_mixer')
+    parser = configparser.ConfigParser()
+    parser.read(_INI_PATH)
+    if not parser.has_section(_CAROUSEL_PLACE_SECTION):
+        parser.add_section(_CAROUSEL_PLACE_SECTION)
+    for f, v in zip(_POSITION_FIELDS, pose):
+        parser.set(_CAROUSEL_PLACE_SECTION, f, repr(float(v)))
+    for f, v in zip(_CAROUSEL_PLACE_REF, mixer[:3]):
+        parser.set(_CAROUSEL_PLACE_SECTION, f, repr(float(v)))
+    with open(_INI_PATH, 'w') as fp:
+        parser.write(fp)
+    return [float(v) for v in pose]
+
+
+def record_current_carousel_place_pose(robot):
+    """Record the arm's current pose (gripper TCP) as the carousel place pose."""
+    robot.set_tcp(robot.tcp)
+    return store_carousel_place_pose(robot.get_pose().get_pose_vector().tolist())
 
 
 # -- EPICS waypoint sync -------------------------------------------------------
@@ -3110,28 +3160,15 @@ def dropdown_sampletable(robot):
                        release_above=sampletable_release_above)
 
 
-# -- protective-stop recovery -------------------------------------------------
-# A protective stop used to end a transport outright: the exception propagated,
-# @_tracks marked the piece's location unknown, and the operator had to unlock
-# the robot by hand and re-teach. These sequences try to get past one on their
-# own, and when they cannot, put the arm somewhere safe and fetch someone.
-#
-# Recovery is scoped to the single pickup or dropdown that failed, never to the
-# transport as a whole. Re-running a transport would be wrong twice over: the
-# recovered pose is deliberately not stored, so the retry would go straight back
-# to the taught pose the stop just disproved; and at a target-end stop the piece
-# is already at the target, so the retry would drive back to p1 and pick up air.
-#
-# One attempt, then stop. A protective stop raised *during* recovery is not
-# recovered again -- whatever tripped it is evidently still there.
-#
-# What locate_apriltag leaves behind matters here, and is not obvious: it ends
-# with put_tcp2camera(), which puts the *gripper tip* where the *camera* was --
-# one camera standoff above the tag -- so its trailing grab() closes on empty
-# air and its bump() only touches the piece and backs off. It returns parked on
-# the reference pose with the fingers closed and empty. That is exactly the
-# state _move_leg() leaves for pickup(), which opens the fingers before
-# descending, so a search composes straight into a pickup.
+# -- protective stops in a transport ------------------------------------------
+# A protective stop at a pickup, a set-down or in mid-travel ends the transport
+# the same way: the stop is cleared, the gripper opened, the arm lifted clear
+# (_abort_protective_stop), and the operator is called with a dialog naming the
+# station. Nothing searches and nothing retries. An automatic search-and-reseat
+# (added 2026-09-21) was taken out on 2026-11-12: a stop means something at the
+# seat is not where it is taught, and searching or re-seating there only meets
+# it again -- on 2026-11-12 it hit a second stop while searching a washing
+# station a carousel had just been dropped on.
 
 def _stop_is_cleared(robot):
     """True if the robot is out of protective stop (safety mode 1 or 2)."""
@@ -3142,22 +3179,6 @@ def _stop_is_cleared(robot):
             return not robot.is_protective_stopped()
         except Exception:                  # noqa: BLE001 - cannot tell
             return False
-
-
-def _release_and_require_clear(robot, station):
-    """robot.release_after_unlock(), then check it actually worked.
-
-    release_after_unlock (robUR.py:711) prints and carries on when the unlock
-    fails, and the release() it then sends is URScript the controller discards
-    while stopped -- so it can return normally having neither cleared the stop
-    nor opened the gripper. Recovery would go on believing the fingers were
-    open when they are still clamped on the piece, so the mode is re-read here
-    and a stop that did not clear ends the attempt.
-    """
-    robot.release_after_unlock()
-    if not _stop_is_cleared(robot):
-        raise RuntimeError("the protective stop did not clear, so the gripper "
-                           "release was discarded by the controller")
 
 
 def _abort_protective_stop(robot, station, reason, release=True):
@@ -3199,114 +3220,37 @@ def _abort_protective_stop(robot, station, reason, release=True):
            reason, "; ".join(done)))
 
 
-def _recovery_search_pose(station):
-    """The taught seat pose lifted RECOVERY_SEARCH_LIFT, orientation kept.
-
-    Not search_reference(): that substitutes a camera standoff and attitude
-    tuned for teaching a station from across the cell. Recovery is already
-    standing on the seat, so this is a straight lift off it and nothing else
-    moves.
-    """
-    above = list(get_station_position(station))
-    above[2] = above[2] + RECOVERY_SEARCH_LIFT
-    return above
-
-
-def _search_seat_again(robot, station):
-    """Stand over `station` and re-find its AprilTag, without storing anything.
-
-    Returns the found pose. store=False is the whole point: a recovery search
-    is a guess made under duress, and letting it overwrite a taught position in
-    waypoints.ini would quietly replace a good teach with it.
-    """
-    above = _recovery_search_pose(station)
-    robot.set_tcp(robot.tcp)               # an aborted search can leave camtcp live
-    robot.moveto(above)                    # at the seat already, so effectively a lift
-    return locate_apriltag(robot, pos=station, ref_pos=above, store=False,
-                           via_transferpoint=False)
-
-
-def _recover_at_start(robot, station, height, open_extra_m = 0.0):
-    """Protective stop while picking up: re-find the seat, then pick up.
-
-    Unlock, stand RECOVERY_SEARCH_LIFT over the taught seat, search for its
-    AprilTag from there, and pick up from the pose that finds. locate_apriltag
-    leaves the arm on that pose with the fingers closed and empty, which is
-    exactly where pickup() expects to begin, so the pickup is the ordinary one.
-    """
-    if not robot.unlock_protective_stop():
-        _abort_protective_stop(robot, station,
-                               "the protective stop would not clear")
-    if not _recoverable_station(station):
-        _abort_protective_stop(
-            robot, station,
-            "it carries no AprilTag, so there is nothing to search for")
-    print("PAL12idb: recovering at %s -- standing %.2f m over the seat to look "
-          "for its AprilTag." % (station, RECOVERY_SEARCH_LIFT))
-    found = _search_seat_again(robot, station)
-    pickup(robot, height=height, open_extra_m=open_extra_m)
-    return found
-
-
-def _recover_at_target(robot, station, station_pos, place):
-    """Protective stop while setting down: let go, re-find the piece, re-seat it.
-
-    Unlock and open the gripper (the piece is at or nearly at its seat), back
-    off RECOVERY_SEARCH_LIFT, and search for the tag from over the taught seat.
-    Then pick the piece back up, lift RECOVERY_RESEAT_LIFT, and set it down at
-    the *taught* pose -- so the second attempt lands where the first was aiming
-    rather than wherever the stop left things.
-
-    `place` is the station's own set-down, passed in so the retry uses it too:
-    the sample table is placed at half speed and the deep seats are placed by
-    feel, and a recovery that fell back to a plain dropdown() would set the
-    piece down differently from the way that station is meant to be.
-    """
-    _release_and_require_clear(robot, station)
-    robot.mvr2z(RECOVERY_SEARCH_LIFT)
-    if not _recoverable_station(station):
-        _abort_protective_stop(
-            robot, station,
-            "it carries no AprilTag, so there is nothing to search for")
-    print("PAL12idb: recovering at %s -- released, backed off %.2f m, looking "
-          "for the AprilTag again." % (station, RECOVERY_SEARCH_LIFT))
-    _search_seat_again(robot, station)
-    pickup(robot, height=RECOVERY_RESEAT_LIFT)
-    place()
-
-
 def _pickup_recovering(robot, station, height, open_extra_m = 0.0):
-    """pickup(), recovering once from a protective stop at the seat.
+    """pickup(), stopping safely on a protective stop at the seat.
 
-    With `station` None -- a call site that has not been told which seat it is
-    working on -- this is exactly pickup(), so an unconverted caller keeps
-    today's fail-fast behaviour rather than recovering against a seat nobody
-    named.
+    No search and no retry: the stop is cleared, the gripper opened (the piece
+    stays in its seat), the arm lifted clear and the operator called
+    (_abort_protective_stop), as for a stop between seats. With `station` None
+    -- a call site that has not been told which seat it is working on -- this
+    is exactly pickup(), and a stop propagates as it is.
     """
     try:
         pickup(robot, height=height, open_extra_m=open_extra_m)
     except Exception as e:
         if station is None or not _is_protective_stop(robot, e):
             raise
-        print("PAL12idb: protective stop picking up at %s (%s); recovering."
+        print("PAL12idb: protective stop picking up at %s (%s); stopping safely."
               % (station, e))
-        try:
-            _recover_at_start(robot, station, height, open_extra_m)
-        except ProtectiveStopUnrecovered:
-            raise
-        except Exception as e2:            # noqa: BLE001 - one attempt only
-            _abort_protective_stop(robot, station, "recovery failed: %s" % e2)
+        _abort_protective_stop(robot, station, "protective stop while picking up")
 
 
 def _dropdown_recovering(robot, station, station_pos,
                          height = needle_clear_height, by_bump = False,
                          place = None, release_above = dropdown_release_above):
-    """Set down at `station`, recovering once from a protective stop there.
+    """Set down at `station`, stopping safely on a protective stop there.
 
-    `place` overrides how: transport2sampletable places at half speed via
-    dropdown_sampletable(), and the recovery has to re-place the same way.
-    Defaults to the ordinary dropdown(). `release_above` is passed to that
-    default dropdown() (the computed-Z release height above the grab point).
+    No search and no retry: the stop is cleared, the gripper opened (the piece
+    is on or nearly on its seat), the arm lifted clear and the operator called
+    (_abort_protective_stop), as for a stop between seats. `place` overrides
+    how the piece is set down: transport2sampletable places at half speed via
+    dropdown_sampletable(). Defaults to the ordinary dropdown(). `release_above`
+    is passed to that default dropdown() (the computed-Z release height above
+    the grab point).
     """
     if place is None:
         def place():
@@ -3317,22 +3261,16 @@ def _dropdown_recovering(robot, station, station_pos,
     except Exception as e:
         if station is None or not _is_protective_stop(robot, e):
             raise
-        print("PAL12idb: protective stop setting down at %s (%s); recovering."
+        print("PAL12idb: protective stop setting down at %s (%s); stopping safely."
               % (station, e))
-        try:
-            _recover_at_target(robot, station, station_pos, place)
-        except ProtectiveStopUnrecovered:
-            raise
-        except Exception as e2:            # noqa: BLE001 - one attempt only
-            _abort_protective_stop(robot, station, "recovery failed: %s" % e2)
+        _abort_protective_stop(robot, station, "protective stop while setting down")
 
 
 def _move_leg_recovering(robot, target, via_transferpoint, station = None):
     """_move_leg(), abandoning safely on a protective stop in mid-travel.
 
-    No search here: a stop between seats leaves the arm somewhere with no tag
-    to re-find and no seat to re-measure against, so there is nothing to
-    recover to. The arm is released and lifted clear and the operator called.
+    The same safe stop as at a seat, and no search: the arm is released and
+    lifted clear and the operator called.
     Releasing drops whatever is being carried -- chosen deliberately over
     leaving a stalled arm holding a piece out over the cell.
     """
@@ -3436,8 +3374,47 @@ def move_via_transferpoint(robot, target):
     # is travel for its own sake. The final moveto still runs -- there can be
     # a centimetre and an orientation left to take up -- it just goes direct.
     if not already_at(robot, target):
-        robot.moveto(get_transfer_point())
+        _enter_corridor(robot)
     robot.moveto(target)
+
+def _enter_corridor(robot):
+    """Move to the transfer point, the corridor's mixer-side end.
+
+    From the carousel side (_on_carousel_side) go up, swing the base round and
+    only then across (_carousel_goto): the straight move from the stock or used
+    stack cuts in across the front of the base and folds the arm into its own
+    joint, as the move the other way did (2026-11-12). From everywhere else it
+    is the straight move it has always been.
+    """
+    corridor = get_transfer_point()
+    if _on_carousel_side(robot):
+        _carousel_goto(robot, corridor)
+    else:
+        robot.moveto(corridor)
+
+def _on_carousel_side(robot):
+    """Is the TCP nearer the stock or used-stack carousel than the transfer point (X/Y)?
+
+    Those two seats sit on +Y, across the front of the base from the corridor
+    on -Y, so a straight move between them and the transfer point cuts in
+    toward the base. A seat not taught yet is nothing to be near; a position
+    that cannot be read answers False -- the straight move every corridor leg
+    made before.
+    """
+    try:
+        now = robot.get_pos()
+        corridor = get_transfer_point()
+    except Exception:
+        return False
+    to_corridor = math.hypot(now[0] - corridor[0], now[1] - corridor[1])
+    for seat in ('carousel_in_stock', 'carousel_used_stack'):
+        try:
+            p = get_station_position(seat)
+        except Exception:
+            continue
+        if math.hypot(now[0] - p[0], now[1] - p[1]) < to_corridor:
+            return True
+    return False
 
 def _move_leg(robot, target, via_transferpoint):
     # One leg of a transport, routed through transfer_point or not. Both legs
@@ -3494,12 +3471,11 @@ def transport(robot, p1, p2, height = needle_clear_height, drop_height = None,
     if drop_height is None:
         drop_height = height
     #
-    # `p1_station` / `p2_station` name the two seats, which is what lets a
-    # protective stop at either end be recovered from (the recovery has to know
-    # which AprilTag to look for and which taught pose to stand over). Left
-    # None, the wrappers below are exactly pickup()/dropdown()/_move_leg() and
-    # nothing recovers -- so an un-named caller keeps today's fail-fast
-    # behaviour instead of recovering against a seat nobody identified.
+    # `p1_station` / `p2_station` name the two seats, so a protective stop at
+    # either end ends in the safe stop with that station named in the dialog
+    # (_abort_protective_stop). Left None, the pickup and set-down wrappers
+    # below are exactly pickup()/dropdown(), and a stop there propagates as it
+    # is.
     activate_gripper(robot)
     _move_leg_recovering(robot, p1, via_transferpoint, p1_station)
     # `height` has to reach pickup()/dropdown() too, not just the travel Z
@@ -3910,10 +3886,13 @@ CAROUSEL_SLIDE_TOTAL_DZ = sum(dz for _dx, dz in CAROUSEL_SLIDE_STEPS)   # total 
 CAROUSEL_TEACH_BACKOFF = 0.060
 CAROUSEL_BUMP_LIFT = 0.001           # up after the grab bump finds the surface
 CAROUSEL_GRAB_UNDER = 0.012          # down after opening, to reach under the rim (11 mm net below surface)
-# Place: how far above the surface the carousel should stand after the reverse
-# 45 deg landing -- the bump then seats the rest. The gripper start Z is worked
-# back from this (see place_new_carousel).
-CAROUSEL_PLACE_STANDOFF = 0.005
+# Place: how far above its seated height the carousel stands at the end of the
+# slide-in landing -- the lowest point the place drives to; the bump seats the
+# rest. The gripper start Z is worked back from this (see place_new_carousel).
+# 10 mm, set from the operator's jog (2026-11-12): the landing hit the mixer
+# platform at 3 mm and again at 4 mm, and the lowest height for this move is
+# gripper Z -0.2728 with Carousel on Mixer taught at Z -0.2118 -- 10 mm.
+CAROUSEL_PLACE_STANDOFF = 0.010
 # Place: the carousel lands turned this many degrees about the gripper's own Z
 # from the taught mixer heading (+RZ, the same turn as the Configuration tab's
 # RZ + jog) -- at the taught heading it is that far off the seat. The carry and
@@ -3929,6 +3908,18 @@ CAROUSEL_CENTER_SETTLE = 10          # s to keep recapturing while the camera fo
 CAROUSEL_CENTER_ITERS = 8            # centring passes (the default is 4)
 CAROUSEL_CENTER_TOL_M = 0.0002       # how close to centred counts as centred (m)
 CAROUSEL_LOAD_APPROACH_M = 0.200     # load: approach to this camera-to-tag distance before the grab
+# A cross between carousel seats -- or from the stock or used stack to the
+# transfer point -- starts with the base joint alone (_swing_base_to): the arm
+# swings round the base axis to the target's azimuth keeping its shape, then
+# goes straight in or out to it. Joint speed and
+# acceleration of that swing -- the gentle base step the raster scan uses --
+# and the smallest swing worth making; below it the cross is already radial.
+CAROUSEL_SWING_VEL = 0.3             # rad/s
+CAROUSEL_SWING_ACC = 0.3             # rad/s^2
+CAROUSEL_SWING_MIN_DEG = 1.0         # deg
+# The base joint's own travel either side of zero (deg). A swing that would
+# carry it further is refused rather than taken the long way round.
+BASE_JOINT_LIMIT_DEG = 360.0
 
 
 def _turn_about_tcp_z(pose, degrees):
@@ -4090,6 +4081,35 @@ def _carousel_lift(robot):
     print("unload lift: after clear-lift  %s" % _pose_str(robot))
 
 
+def _swing_base_to(robot, xy):
+    """Turn the base joint alone until the TCP points at `xy` (base frame).
+
+    Every other joint keeps its angle, so the arm swings round the base axis as
+    one rigid piece: same reach, same height, same fold, the tool heading turned
+    by the same angle. Takes the short way round. Raises RuntimeError, before
+    moving, if that would carry the base joint past BASE_JOINT_LIMIT_DEG -- the
+    long way round sweeps the arm through the rest of the cell. Returns the
+    angle turned in degrees, 0.0 when the TCP already points within
+    CAROUSEL_SWING_MIN_DEG of `xy`.
+    """
+    now = robot.get_pos()
+    turn = math.degrees(math.atan2(xy[1], xy[0]) - math.atan2(now[1], now[0]))
+    turn = (turn + 180.0) % 360.0 - 180.0               # the short way round
+    if abs(turn) < CAROUSEL_SWING_MIN_DEG:
+        return 0.0
+    q = list(robot.getj())
+    base = math.degrees(q[0]) + turn
+    if abs(base) > BASE_JOINT_LIMIT_DEG:
+        raise RuntimeError(
+            "swinging the base %+.1f deg would take it to %.1f deg, past its "
+            "+-%.0f deg limit; jog the base joint back on the pendant first"
+            % (turn, base, BASE_JOINT_LIMIT_DEG))
+    q[0] = math.radians(base)
+    print("base swing: %+.1f deg to %.1f deg" % (turn, base))
+    robot.movej(q, acc=CAROUSEL_SWING_ACC, vel=CAROUSEL_SWING_VEL, wait=True)
+    return turn
+
+
 def _carousel_goto(robot, target):
     """Move to a carousel seat DIRECTLY, never via the transfer point.
 
@@ -4102,18 +4122,26 @@ def _carousel_goto(robot, target):
     Rxy >~0.32 m, well clear of the base -- going direct is both what the bench
     needs and the safer path.
 
+    Even between the seats, though, a straight cross turns the arm while pulling
+    it in toward the base, and on the way to the stock carousel that bumped the
+    arm into its own joint (2026-11-12). So the cross starts with the base joint
+    alone: it swings the arm round to the target's azimuth keeping its shape
+    (_swing_base_to), and the only inward move left is the short radial one.
+
     Lift straight up to the carry height first (straight up never approaches the
     base, and it avoids the blind diagonal descent into a seat the old routing
-    guarded against), cross to directly over the target at that height and at the
-    target's heading, then come straight down onto it. The carry height is never
-    below the taught carousel safe Z.
+    guarded against), swing the base round to the target, go straight in or out
+    to directly over the target at that height and at the target's heading, then
+    come straight down onto it. The carry height is never below the taught
+    carousel safe Z.
     """
     tgt = list(target)
     now = robot.get_pos()
     lift_z = _carousel_travel_z(now[2], tgt[2])
     robot.moveto([now[0], now[1], lift_z])              # straight up at the current XY
+    _swing_base_to(robot, tgt)                          # base joint alone, round to the seat's azimuth
     above = [tgt[0], tgt[1], lift_z] + tgt[3:]          # over the seat, at height, target heading
-    robot.moveto(above)                                 # cross at height (Rxy stays clear of the base)
+    robot.moveto(above)                                 # straight in or out along that azimuth
     robot.moveto(tgt)                                   # straight down onto the seat
 
 
@@ -4232,9 +4260,11 @@ def place_new_carousel(robot):
 
     Carry clear, swing the camera over the stock seat, grab the new carousel,
     carry it to 120 mm above the mixer, and set it down onto the mixer seat --
-    turned +RZ CAROUSEL_PLACE_RZ_DEG from the taught heading to line up with the
-    seat, sliding in along the reverse (+X / -Z) of the unload lift and bumping
-    to the seat.
+    turned +RZ CAROUSEL_PLACE_RZ_DEG from the taught heading for the way down.
+    With a carousel place pose recorded, it comes down beside the seat to that
+    pose's height, turns to its angle there, slides straight in along table +X
+    onto it and lets go. Without one, it slides in along the reverse (+X / -Z)
+    of the unload lift and bumps to the seat.
     MOVES the robot. Requires carousel_in_stock and carousel_on_mixer taught.
 
     Not @_tracks-decorated like the transports: the tracked value is the tag id
@@ -4263,27 +4293,37 @@ def place_new_carousel(robot):
     robot.mvr2z(CAROUSEL_CLEAR_LIFT)                     # lift clear of the stock seat
     # Reuse the REAL mixer seat measured by unload's grab (gripper frame): the
     # camera-centred X,Y and the bumped surface Z. Fall back to the taught pose
-    # only if no unload has measured it. Using the measured X,Y (not the taught
-    # X,Y, which is a mm or two off) lets the landing be the exact reverse of the
-    # lift -- same two-segment slide travel (SLIDE_STEPS), landing right on the seat.
+    # when nothing has been measured since carousel_on_mixer was last taught.
+    # Using the measured X,Y (not the taught X,Y, which is a mm or two off) lets
+    # the landing be the exact reverse of the lift -- same two-segment slide
+    # travel (SLIDE_STEPS), landing right on the seat.
     seat = state.get_carousel_mixer_seat()
     if seat is not None:
         seat_x, seat_y, surface_z = seat
     else:
         seat_x, seat_y = mixer[0], mixer[1]
         surface_z = mixer[2] - CAROUSEL_TEACH_BACKOFF
-    # Make the place start coincide EXACTLY with the unload lift's "after slide-out"
-    # point, so place reverses the lift step for step: straight down to this start,
-    # slide in 30 deg then 60 deg (the lift's segments reversed), then straight down
-    # (the bump) through the snap-lift to seat. The lift ends CAROUSEL_SNAP_LIFT +
-    # TOTAL_DZ above the grab point (net_under below the measured surface), offset
-    # back by TOTAL_DX in X -- so the start is that same point.
+    # Start from the unload lift's "after slide-out" point, so place reverses the
+    # lift step for step: straight down to this start, slide in 30 deg then 60 deg
+    # (the lift's segments reversed), then straight down (the bump) to seat. The
+    # lift ends CAROUSEL_SNAP_LIFT + TOTAL_DZ above the grab point (net_under below
+    # the measured surface), offset back by TOTAL_DX in X; the place start is that
+    # point with CAROUSEL_PLACE_STANDOFF in place of the snap-lift, so the slide-in
+    # ends -- and the bump starts -- that far above the seat.
     net_under = CAROUSEL_GRAB_UNDER - CAROUSEL_BUMP_LIFT   # carousel hangs this far below the gripper
     start = _turn_about_tcp_z(mixer, CAROUSEL_PLACE_RZ_DEG)  # taught heading, turned to fit the seat
     back_x, back_y = _table_to_base_xy(-CAROUSEL_SLIDE_TOTAL_DX, 0.0)
-    start[0] = seat_x + back_x                           # back along table -X so the reverse slide reaches the seat
-    start[1] = seat_y + back_y
-    start[2] = surface_z + CAROUSEL_SLIDE_TOTAL_DZ + CAROUSEL_SNAP_LIFT - net_under
+    final = get_carousel_place_pose()
+    if final is not None:
+        # The pose recorded by hand: start beside it, back along table -X by the
+        # slide travel, already at its height -- the lowest point of the place.
+        start[0] = final[0] + back_x
+        start[1] = final[1] + back_y
+        start[2] = final[2]
+    else:
+        start[0] = seat_x + back_x                       # back along table -X so the reverse slide reaches the seat
+        start[1] = seat_y + back_y
+        start[2] = surface_z + CAROUSEL_SLIDE_TOTAL_DZ + CAROUSEL_PLACE_STANDOFF - net_under
     carry = list(start)
     carry[2] = _carousel_travel_z(clear_z)               # cross at no lower than the carousel safe Z
     now_z = robot.get_pos()[2]
@@ -4293,15 +4333,23 @@ def place_new_carousel(robot):
     print("place seating: after carry-above %s" % _pose_str(robot))
     robot.moveto(start)                                  # down to the stand-off, offset back along table -X
     print("place seating: after down-to-start %s" % _pose_str(robot))
-    # Reverse slide-in landing: retrace the unload lift's two-segment slide in
-    # reverse (segments reversed, each +X / -Z), landing on the measured seat X,Y
-    # along the same trajectory.
-    for dx, dz in reversed(CAROUSEL_SLIDE_STEPS):
-        bx, by = _table_to_base_xy(dx, 0.0)              # table +X, back in under the retainer
-        robot.translate([bx, by, -dz])
-    print("place seating: after slide-in landing %s" % _pose_str(robot))
-    robot.bump(z=-1, backoff=0.0)                        # bump down to seat at the real surface
-    print("place seating: after bump %s" % _pose_str(robot))
+    if final is not None:
+        # Down at the lowest point, beside the seat: turn to the recorded angle
+        # there, then go straight in along table +X onto the recorded pose.
+        robot.moveto(list(start[:3]) + list(final[3:]))
+        print("place seating: after turn %s" % _pose_str(robot))
+        robot.moveto(final)
+        print("place seating: at the recorded place pose %s" % _pose_str(robot))
+    else:
+        # Reverse slide-in landing: retrace the unload lift's two-segment slide in
+        # reverse (segments reversed, each +X / -Z), landing on the measured seat
+        # X,Y along the same trajectory.
+        for dx, dz in reversed(CAROUSEL_SLIDE_STEPS):
+            bx, by = _table_to_base_xy(dx, 0.0)          # table +X, back in under the retainer
+            robot.translate([bx, by, -dz])
+        print("place seating: after slide-in landing %s" % _pose_str(robot))
+        robot.bump(z=-1, backoff=0.0)                    # bump down to seat at the real surface
+        print("place seating: after bump %s" % _pose_str(robot))
     robot.release()
     print("place seating: after release %s" % _pose_str(robot))
     robot.mvr2z(CAROUSEL_CLEAR_LIFT)                     # retract clear
@@ -4522,6 +4570,11 @@ def goto_station(robot, pos):
     not depend on knowing where it started. Pressed for the station the arm is
     already at, it stays put rather than making the round trip (already_at()).
 
+    The carousel seats are the exception: the corridor's straight last leg into
+    one folds the arm into its own joint, so they take the carousel route --
+    swing round, then down -- crossing the corridor first only from the
+    sample-table side (_goto_carousel_station).
+
     The arm ends at the taught pose itself: the same pose a transport starts
     from, distance_gripper_tag + grab_depth above the grab point. It does not
     grab, release, or descend.
@@ -4532,9 +4585,48 @@ def goto_station(robot, pos):
         # taught position by eye is worth nothing if the trip to it does not
         # take the path the transports take.
         move_to_cleaningstation(robot, target)
+    elif pos in CAROUSEL_STATIONS:
+        _goto_carousel_station(robot, target)
     else:
         move_via_transferpoint(robot, target)
     return target
+
+def _goto_carousel_station(robot, target):
+    """goto_station's route into a carousel seat: swing round first, then down.
+
+    Never the corridor's straight last leg: from the transfer point that line
+    runs down and across the front of the base, and the arm folds into its own
+    joint on the way (a protective stop at Rxy 0.21 m, elbow 151.6 deg, going to
+    the stock carousel on 2026-11-12). _carousel_goto lifts, swings the base
+    round to the seat keeping the arm's shape, goes straight in at height, and
+    only then comes straight down. The corridor is still crossed first when the
+    arm starts on the sample-table side -- the crossing it exists for.
+    """
+    robot.set_tcp(robot.tcp)        # a seat is a gripper pose, as in the carousel workflows
+    if already_at(robot, target):
+        robot.moveto(target)        # take up what is left, as move_via_transferpoint does
+        return
+    if _on_sample_table_side(robot):
+        robot.moveto(get_transfer_point())
+    _carousel_goto(robot, target)
+
+def _on_sample_table_side(robot):
+    """Is the TCP nearer the sample table than the transfer point (in X/Y)?
+
+    The corridor joins the sample table to the mixer side, where the carousel
+    seats are; a move into a seat needs it only from the sample-table side.
+    Anything unreadable answers True: the corridor detour, which is what every
+    station "go to" made before the carousel seats had their own route.
+    """
+    try:
+        now = robot.get_pos()
+        table = get_station_position('sample_table')
+        corridor = get_transfer_point()
+        to_table = math.hypot(now[0] - table[0], now[1] - table[1])
+        to_corridor = math.hypot(now[0] - corridor[0], now[1] - corridor[1])
+    except Exception:
+        return True
+    return to_table < to_corridor
 
 def goto_transfer_point(robot):
     """Move the arm to the corridor waypoint, and stop there.
@@ -4550,10 +4642,15 @@ def goto_transfer_point(robot):
     expressed in that frame: an aborted AprilTag search can leave the camera
     TCP active, and that would put the camera on the pose with the gripper an
     offset away from it.
+
+    From the stock or used-stack carousel it goes up, swings the base round and
+    only then across (_enter_corridor) -- the straight move from there folds the
+    arm into its own joint. That is where Unload Current Carousel leaves the
+    arm, and every workflow parks here when it ends.
     """
     robot.set_tcp(robot.tcp)
     target = get_transfer_point()
-    robot.moveto(target)
+    _enter_corridor(robot)
     return target
 
 def record_current_orientation(robot, pos):
@@ -4721,9 +4818,7 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
     # search_reference(). This used to be a per-station constant, which meant
     # a station that physically moved was still searched for where it used to
     # be, and no edit to waypoints.ini could say otherwise.
-    # ref_pos lets a caller say where to search from instead. Protective-stop
-    # recovery does: it stands over the seat it just failed at, not at the
-    # tuned teaching standoff (see _recovery_search_pose).
+    # ref_pos lets a caller say where to search from instead.
     # from_current searches from wherever the arm is standing. For a station
     # that has moved far enough that its configured reference no longer looks
     # anywhere near the tag: drive or jog the camera over it by eye (the
@@ -4781,9 +4876,9 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
     # earlier step would otherwise put the camera on the reference pose and the
     # gripper an offset away from it.
     robot.set_tcp(robot.tcp)
-    # via_transferpoint=False for a recovery search: the arm is standing on the
-    # seat it stopped at, so the corridor detour would drag it sideways out of
-    # whatever it is touching before lifting off it.
+    # via_transferpoint=False for a caller already standing on the seat: the
+    # corridor detour would drag the arm sideways out of whatever it is
+    # touching before lifting off it.
     #
     # from_current skips the approach outright. Routing through the corridor to
     # reach a pose the arm is already on would be the whole point of the mode
@@ -4893,9 +4988,8 @@ def locate_apriltag(robot, pos = '', stop_event=None, skip_roll=False,
     robot.set_tcp(robot.tcp)
     p = robot.get_pose()
     v = p.get_pose_vector().tolist()
-    # store=False for a recovery search: a position found under duress must not
-    # overwrite a good teach in waypoints.ini. The pose is still returned, so
-    # the caller can use it for the run in hand.
+    # store=False finds without recording: the pose is returned for the
+    # caller's own use, and the teach in waypoints.ini is left alone.
     if store:
         store_station_position(pos, v)
     return v

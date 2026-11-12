@@ -12,8 +12,8 @@ from .empty_cell import active_inspection, inspection_action
 
 # Reported when placement finds the stock seat empty after the old carousel was
 # already unloaded. Not a session failure: the operator's button press finishes it.
-#: Placement is blocked for now (carousel.auto_place_new_carousel is false): the swap
-#: stops after unloading, and the operator's Replace Carousel (Reset) finishes it.
+#: With carousel.auto_place_new_carousel false the swap stops after unloading, and
+#: the operator's Replace Carousel (Reset) finishes it.
 WAITING_FOR_CAROUSEL_MESSAGE = ("Old carousel removed. Place a new carousel on the mixer by hand, "
                                 "then press Replace Carousel (Reset) on PALmixer.")
 
@@ -298,6 +298,10 @@ class PreparationAPI:
         if state.get_flowcell_location(flowcell) != state.FC_AT_CLEANING:
             raise ValueError('Flowcell %d must be at its cleaning station to replace the carousel' % flowcell)
         self.server._require_positions(('carousel_on_mixer', 'carousel_used_stack', 'carousel_in_stock'))
+        if auto_place_new_carousel():
+            # The placement turns the table first; refused now, not once the old
+            # carousel is already off.
+            self.server._place_alignment()
         no_carousel = getattr(self.server.PAL12idb, 'NoCarouselError', None)
         trace = uuid4().hex
         saved = dict(replacement_id=replacement_id, action_id=trace, request=signature,

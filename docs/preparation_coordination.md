@@ -24,6 +24,9 @@ these hold:
 - Cleanup reports no `problem`. A running flowcell wash is allowed: the swap is
   meant to overlap it.
 - The mixer head and the flowcell in use are at their cleaning stations.
+- With robot placement on (`carousel.auto_place_new_carousel`), the carousel
+  table can be turned to `carousel.place_alignment_slot`: the slot positions
+  are taught.
 - Carousel on Mixer, Used Carousel Stack and Carousel in Stock are taught.
 
 The record is kept in `replacements[replacement_id]` and returned by `status`:
@@ -38,7 +41,7 @@ under the same identity is refused.
 | `accepted` | Persisted; no motion yet |
 | `unloading` | Unload running |
 | `old_removed` | Old carousel is on the used stack |
-| `placing` | Placement running |
+| `placing` | Placement running: the table turns to the alignment slot, then the arm places |
 | `committed` | Placed; `load` holds the carousel-load record and every slot is free |
 | `waiting_for_stock` | Stock seat empty after the unload. The session stays usable so PALsystem can end it. The operator loads a carousel and presses **Place New Carousel** on PALmixer, which records the load. |
 | `failed` | Any other error. `failed_phase` says whether unloading or placing failed. The session error is latched and the coordinator is invalidated, as for other motion operations, with no replay. |

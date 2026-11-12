@@ -31,6 +31,7 @@ IDLE alone says nothing about success.
     "goto_position <station>"             -> "ACCEPTED" | "ERROR: <reason>"
     "goto_transfer_point"                 -> "ACCEPTED" | "ERROR: <reason>"
     "set_transfer_point_here"             -> "OK <pose>" | "ERROR: <reason>"
+    "set_carousel_place_here"             -> "OK <pose>" | "ERROR: <reason>"
     "<transport_name>"                    -> "ACCEPTED" | "ERROR: <reason>"
     "zalign"                              -> "ACCEPTED" | "ERROR: <reason>"
     "release_gripper"                     -> "ACCEPTED" | "ERROR: <reason>"
@@ -254,6 +255,12 @@ GOTO_TRANSFER_POINT = "goto_transfer_point"
 # goto_transfer_point and every cross-cell leg route through the new one. Fast
 # bookkeeping like set_position_here -- no move.
 SET_TRANSFER_POINT_HERE = "set_transfer_point_here"
+
+# Record where Place New Carousel leaves a new carousel: the arm's current pose,
+# with the carousel seated at its final position and angle
+# (PAL12idb.record_current_carousel_place_pose -> waypoints.ini
+# [carousel_place]). Fast bookkeeping like set_transfer_point_here -- no move.
+SET_CAROUSEL_PLACE_HERE = "set_carousel_place_here"
 
 # Measure the Venton table's surface frame in robot base coordinates by reading
 # the table fiducials (apriltags.venton_table_* with id + table_xy_mm) from the
@@ -751,6 +758,11 @@ def goto_transfer_point_command():
 def set_transfer_point_here_command():
     """Build the wire command to teach the transfer point from the current pose."""
     return SET_TRANSFER_POINT_HERE
+
+
+def set_carousel_place_here_command():
+    """Build the wire command to record the carousel place pose from the current pose."""
+    return SET_CAROUSEL_PLACE_HERE
 
 
 def calibrate_venton_table_command():
