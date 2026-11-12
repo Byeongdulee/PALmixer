@@ -19,6 +19,7 @@ Command mapping (see the pump repo's ZMQ_COMMANDS.md / FLOWCELL_ZMQ_COMMANDS.md)
     mix()                    -> 5555  sample_make
     clean_mixer()            -> 5555  clean_all
     draw_to_flowcell()       -> 5556  draw_to_flowcell   (+ device)
+    pull_back_gap()          -> 5556  pull_back_gap      (+ device)
     aspirate_from_flowcell() -> 5556  aspirate_from_flowcell (+ device)
     wash_flowcell()          -> 5556  wash_flowcell      (+ device)
     shake_sample()           -> 5556  flow2_sample / flow3_sample (device is
@@ -36,6 +37,15 @@ that motion finished. To keep the blocking ``(ok, detail)`` contract every
 motion op waits: it sends the command, then polls the server's ``status`` until
 ``operation_active`` goes false before returning. Mixing additionally requires
 the terminal MAKE SAMPLE status to say COMPLETE; STOP/error/unknown is not success.
+The draw and the gap pull-back likewise require their own ``Complete:`` line on
+the flowcell they ran on (VERIFIED_FLOWCELL_OPS), and wait on that flowcell's
+own busy flag rather than the server's, so the other flowcell being busy
+neither delays them nor stands in for their result.
+
+**The FlowCell recipe is not PALmixer's.** Since apssector12_pump_control 3.0.0
+every volume, speed and port a flowcell op uses is fixed in that repo's
+flow_cells/flowcell_config.py; the server refuses overrides, and PALmixer only
+names the op and the device.
 
 **One lock per server, not one lock overall.** The whole send+poll runs under
 the lock belonging to the endpoint it is talking to. Within a server that
@@ -201,9 +211,23 @@ OP_SERVERS = {
     "mix": MIXER_SERVER,
     "clean_mixer": MIXER_SERVER,
     "draw_to_flowcell": FLOWCELL_SERVER,
+    "pull_back_gap": FLOWCELL_SERVER,
     "aspirate_from_flowcell": FLOWCELL_SERVER,
     "wash_flowcell": FLOWCELL_SERVER,
     "shake_sample": FLOWCELL_SERVER,
+}
+
+#: Flowcell commands whose success PALmixer will not take on trust: the device
+#: they ran on has to report exactly this status (case-insensitive) when the
+#: command ends. The flowcell dashboard writes ``Complete: <command, spaced>``
+#: on success and ``Error`` / ``Stopped ...`` otherwise, and the idle server
+#: alone cannot tell those apart. For the pull-back this is what makes a
+#: refusal -- syringe not at the volume a finished prefill leaves -- a failure
+#: rather than a quiet "complete" that sends the flowcell to the vial with no
+#: gap.
+VERIFIED_FLOWCELL_OPS = {
+    "draw_to_flowcell": "complete: draw to flowcell",
+    "pull_back_gap": "complete: pull back gap",
 }
 
 
@@ -414,10 +438,28 @@ class Pump:
 
     def draw_to_flowcell(self):
         """Draw mixed solution from the mixer into the in-use flowcell."""
-        d = self._flowcell_device()
+        d = self.flowcell_device()
         return self._run_remote(self._flowcell, "draw_to_flowcell",
                                 {"device": d},
                                 "draw_to_flowcell (device %d)" % d)
+
+    def pull_back_gap(self):
+        """Pull back the prefill gap in the in-use flowcell's sample line.
+
+        The flowcell wash ends with a prefill that leaves the syringe holding
+        a set volume on the sample port; this retracts the configured gap from
+        there. Workflows sends it with the flowcell lifted clear of its
+        cleaning station, on the way to the vial, so the needle draws in air.
+        The volume and speed are the FlowCell recipe's, not PALmixer's.
+
+        Succeeds only on the device's own ``Complete: pull back gap``: the
+        dashboard refuses (without moving) a syringe that does not hold what a
+        finished prefill leaves, and that refusal has to stop the draw.
+        """
+        d = self.flowcell_device()
+        return self._run_remote(self._flowcell, "pull_back_gap",
+                                {"device": d},
+                                "pull_back_gap (device %d)" % d)
 
     def aspirate_from_flowcell(self):
         """Expel solution back out of the in-use flowcell.
@@ -425,14 +467,14 @@ class Pump:
         (The flowcell server's ``aspirate_from_flowcell`` is a legacy name that
         actually expels; PALmixer keeps the same name for continuity.)
         """
-        d = self._flowcell_device()
+        d = self.flowcell_device()
         return self._run_remote(self._flowcell, "aspirate_from_flowcell",
                                 {"device": d},
                                 "aspirate_from_flowcell (device %d)" % d)
 
     def wash_flowcell(self):
         """Wash the in-use flowcell after a sample has been returned to it."""
-        d = self._flowcell_device()
+        d = self.flowcell_device()
         return self._run_remote(self._flowcell, "wash_flowcell",
                                 {"device": d},
                                 "wash_flowcell (device %d)" % d)
@@ -445,7 +487,7 @@ class Pump:
         flowcell2 and ``flow3_sample`` for flowcell3, and sets the device from
         the name itself. So this picks the command instead of the argument --
         id 1 -> ``flow2_sample``, id 2 -> ``flow3_sample``, the same mapping
-        _flowcell_device() makes.
+        flowcell_device() makes.
 
         ``flowcell_id`` pins the target explicitly instead of reading the
         "flowcell in use" setting -- Workflows' auto-shake loop passes the
@@ -457,7 +499,7 @@ class Pump:
         Volume and cycle count come from the flowcell dashboard's own settings,
         like every other op's speeds and ports.
         """
-        d = self._flowcell_device(flowcell_id)
+        d = self.flowcell_device(flowcell_id)
         command = "flow2_sample" if d == 0 else "flow3_sample"
         return self._run_remote(self._flowcell, command, None,
                                 "shake_sample (%s)" % command)
@@ -585,9 +627,27 @@ class Pump:
         entry["connected"] = bool(reply.get("connected"))
         entry["operation_active"] = bool(reply.get("operation_active"))
         entry["stop_requested"] = bool(reply.get("emergency_stop_requested"))
+        # The locked FlowCell recipe's summary (apssector12_pump_control
+        # 3.0.0+): where the prefill and the gap pull-back leave the syringe.
+        # None from an older dashboard, which has no pull_back_gap.
+        recipe = reply.get("recipe")
+        entry["recipe"] = recipe if isinstance(recipe, dict) else None
         for i, pump in enumerate(reply.get("pumps") or []):
             entry["pumps"].append({
                 "name": str(pump.get("name") or "flowcell%d" % (i + 2)),
+                "device": pump.get("device", i),
+                # Per flowcell: the server-level flag above is true while
+                # *either* is busy, which is not the question when it is one
+                # particular flowcell that is about to be picked up.
+                "operation_active": bool(pump.get("operation_active")),
+                # Last read-back plunger position, uL; None while it moves and
+                # after a stop or failure. Read by Workflows to refuse a draw
+                # whose gap could not be pulled back, before anything moves.
+                "position_ul": pump.get("position_ul"),
+                # Why the dashboard does not trust that position, when it does
+                # not (a failed operation, a stop); None otherwise.
+                "trust_reason": (None if pump.get("position_trusted", True)
+                                 else pump.get("trust_reason")),
                 "status": str(pump.get("status") or ""),
                 # "Position: 430.0 / 1000 uL  |  valve: 3" -- already meant for
                 # a person to read, so it is passed through as it comes.
@@ -595,9 +655,8 @@ class Pump:
             })
         return entry
 
-    # -- internals ------------------------------------------------------------
     @staticmethod
-    def _flowcell_device(flowcell_id=None):
+    def flowcell_device(flowcell_id=None):
         """Map a PALmixer flowcell id (1/2) to the 0-based device int.
 
         id 1 -> device 0 (flowcell2), id 2 -> device 1 (flowcell3). Uses the
@@ -606,6 +665,8 @@ class Pump:
         """
         fc = flowcell_id if flowcell_id is not None else state.get_flowcell_in_use()
         return 0 if fc == 1 else 1
+
+    # -- internals ------------------------------------------------------------
 
     def _run_remote(self, endpoint, command, extra, label, record=None):
         """Send one motion command and block until that server goes idle.
@@ -647,10 +708,30 @@ class Pump:
                     record.update(settings=deepcopy(parameters),
                                   settings_source="sample_make response parameters (planned, not measured)")
                 self._notify_mix_record(record)
-            draw_device = payload.get("device") if command == "draw_to_flowcell" else None
-            return self._wait_idle(endpoint, label, record=record, draw_device=draw_device)
+            expected = VERIFIED_FLOWCELL_OPS.get(command)
+            verify_device = payload.get("device") if expected else None
+            return self._wait_idle(endpoint, label, record=record,
+                                   verify_device=verify_device, expected_status=expected)
 
-    def _wait_idle(self, endpoint, label, record=None, draw_device=None):
+    @staticmethod
+    def _device_entry(st, device):
+        return next((p for p in st.get("pumps", []) if p.get("device") == device), {})
+
+    @classmethod
+    def _active(cls, st, verify_device):
+        """Is the operation being waited for still running?
+
+        For a per-device op that is the device's own flag: the server-level
+        one stays true while the *other* flowcell is busy, and waiting on it
+        would hold a finished pull-back -- with a flowcell lifted in the air --
+        until an unrelated shake ended.
+        """
+        if verify_device is None:
+            return bool(st.get("operation_active", False))
+        return bool(cls._device_entry(st, verify_device).get("operation_active", False))
+
+    def _wait_idle(self, endpoint, label, record=None, verify_device=None,
+                   expected_status=None):
         """Poll ``status`` until ``operation_active`` is false (or timeout).
 
         "Not active" is ambiguous immediately after a command is accepted: the
@@ -671,6 +752,11 @@ class Pump:
         The grace only covers the *start*. Once the operation has been seen
         running, the original behaviour applies unchanged -- idle ends the
         wait, and the terminal status still has to say COMPLETE.
+
+        `verify_device` / `expected_status` (VERIFIED_FLOWCELL_OPS): the op ran
+        on that flowcell, its activity is that flowcell's own flag, and it has
+        succeeded only if that flowcell's status ends up reading exactly
+        `expected_status`.
         """
         deadline = time.monotonic() + self._op_timeout_s
         start_deadline = time.monotonic() + self._startup_grace_s
@@ -687,22 +773,24 @@ class Pump:
                 if record is not None:
                     record["status"] = "unknown"
                 return False, "%s: status query failed: %r" % (label, st)
-            if st.get("operation_active", False):
+            active = self._active(st, verify_device)
+            if active:
                 seen_active = True
             elif (not seen_active
-                    and not self._operation_begun(st, draw_device)
+                    and not self._operation_begun(st, verify_device)
                     and time.monotonic() < start_deadline):
                 # Accepted, but the dashboard has not picked it up yet. Not a
                 # completed operation with no evidence -- an operation with
                 # nothing to report because it has not started.
                 continue
-            if not st.get("operation_active", False):
-                st = self._settle(endpoint, st, record, draw_device)
-                if draw_device is not None:
-                    device = next((p for p in st.get("pumps", []) if p.get("device") == draw_device), {})
-                    terminal = str(device.get("status") or "").strip()
-                    if terminal.lower() != "complete: draw to flowcell":
-                        return False, "%s: draw completion unverified (%s)" % (label, terminal or "no status")
+            if not active:
+                st = self._settle(endpoint, st, record, verify_device)
+                if verify_device is not None:
+                    terminal = str(self._device_entry(st, verify_device).get("status")
+                                   or "").strip()
+                    if terminal.lower() != expected_status:
+                        return False, "%s: completion unverified (%s)" % (
+                            label, terminal or "no status")
                 if record is not None:
                     record["terminal_operation"] = str(st.get("operation") or "")
                     record["status"] = _mix_completion(st.get("operation"))
@@ -716,7 +804,7 @@ class Pump:
                 return False, ("%s: still active after %g s"
                                % (label, self._op_timeout_s))
 
-    def _settle(self, endpoint, st, record, draw_device):
+    def _settle(self, endpoint, st, record, verify_device):
         """Re-poll a just-gone-idle operation until its verdict stops being
         "inconclusive", or `startup_grace_s` runs out. Returns the last status.
 
@@ -731,10 +819,10 @@ class Pump:
         Best effort throughout: a failed re-poll keeps the reading already in
         hand rather than turning a completed operation into a contact error.
         """
-        if record is None and draw_device is None:
+        if record is None and verify_device is None:
             return st                   # nothing here demands terminal evidence
         deadline = time.monotonic() + self._startup_grace_s
-        while self._inconclusive(st, record, draw_device):
+        while self._inconclusive(st, record, verify_device):
             if time.monotonic() >= deadline:
                 break
             time.sleep(self._poll_interval_s)
@@ -745,14 +833,14 @@ class Pump:
             if not isinstance(fresh, dict) or not fresh.get("ok", False):
                 break
             st = fresh
-            if st.get("operation_active", False):
+            if self._active(st, verify_device):
                 # A *new* operation has started underneath us. Nothing further
                 # this call reads would be about the one it was waiting for.
                 break
         return st
 
-    @staticmethod
-    def _operation_begun(st, draw_device):
+    @classmethod
+    def _operation_begun(cls, st, verify_device):
         """Has the dashboard said anything at all about this operation yet?
 
         Any of: a Status line in the operation report, or -- for a per-device
@@ -763,17 +851,14 @@ class Pump:
         """
         if _status_text(st.get("operation")):
             return True
-        if draw_device is None:
+        if verify_device is None:
             return False
-        device = next((p for p in st.get("pumps", [])
-                       if p.get("device") == draw_device), {})
-        return bool(str(device.get("status") or "").strip())
+        return bool(str(cls._device_entry(st, verify_device).get("status") or "").strip())
 
-    @staticmethod
-    def _inconclusive(st, record, draw_device):
-        if draw_device is not None:
-            device = next((p for p in st.get("pumps", [])
-                           if p.get("device") == draw_device), {})
+    @classmethod
+    def _inconclusive(cls, st, record, verify_device):
+        if verify_device is not None:
+            device = cls._device_entry(st, verify_device)
             status = str(device.get("status") or "").strip().upper()
             if status.startswith(("COMPLETE", "ERROR", "FAIL", "STOP",
                                   "CANCEL", "ABORT")):

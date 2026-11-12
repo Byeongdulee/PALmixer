@@ -23,7 +23,10 @@ make_sample mixes a fresh vial and puts it in the beam:
     mixer2cleaningstation
     clean_mixer                         (pump 5555, not awaited)
     advance_carousel                    (draw_offset_steps forward, awaited)
-    ready_flowcell_to_draw              (onto sample_on_mixer_station)
+    wait_for_wash_flowcell              (only if the flowcell's wash is still running)
+    wait_for_flowcell_pump              (only if its dashboard still reports it busy)
+    ready_flowcell_to_draw              (onto sample_on_mixer_station; pulls back
+                                         the prefill gap once the flowcell is lifted)
     draw_to_flowcell                    (pump 5556, runs while 5555 cleans)
     load_sample_to_beam
     shake_sample                        (pump, auto, not awaited)
@@ -39,11 +42,29 @@ turns the carousel to a named slot's drawing position first:
 
     advance_carousel                    (draw_load_sample only, to <slot>)
     mixer2cleaningstation               (only if the head is at the mixer)
-    ready_flowcell_to_draw
+    wait_for_wash_flowcell / wait_for_flowcell_pump  (as above)
+    ready_flowcell_to_draw              (pulls back the gap once lifted)
     draw_to_flowcell                    (pump)
     load_sample_to_beam
     shake_sample                        (pump, auto, not awaited)
     park_at_transfer_point
+
+The flowcell leaves its cleaning station only once its own pump is idle and
+its gap can be pulled back (Workflows.await_flowcell_ready). The wash that
+unload_sample fires unawaited pushes bleach, DI and air out through the
+needle, so it is waited out with the flowcell still seated -- not, as before,
+with the flowcell already lowered onto the vial. The wash ends with the
+FlowCell prefill, which leaves the syringe on the sample port holding a set
+volume; ready_flowcell_to_draw then pulls the gap back (pump pull_back_gap)
+once the flowcell is lifted clear of its station, so the needle draws in air
+rather than whatever is standing in the station, and the gap is made just
+before the draw rather than whenever the wash happened to finish. The pump
+refuses a pull-back from any other volume, and a refusal stops the transport
+with the flowcell held above its station; so check_flowcell_can_draw() reads
+the same volumes from the dashboard's status and refuses the draw up front --
+when the command is accepted, before mixing, and again just before the pickup
+-- if the dashboard is not answering, predates the locked recipe, or reports
+a syringe the pull-back would refuse.
 
 unload_sample runs one of two sequences. The default discards the sample:
 
@@ -435,6 +456,166 @@ class Workflows:
             time.sleep(MIXER_PUMP_POLL_S)
         return "the mixing pumps are idle; the mixer head is free to move"
 
+    # -- the flowcell leaving its cleaning station ----------------------------
+    def _flowcell_status(self):
+        """(flowcell server entry, the in-use flowcell's row) from a fresh
+        status poll, or (None, None) when there is no pump to ask. The row is
+        None when the server gave no row for that flowcell (unreachable)."""
+        if self.pump is None or self.simulate:
+            return None, None
+        snapshot = getattr(self.pump, "status_snapshot", None)
+        device_of = getattr(self.pump, "flowcell_device", None)
+        if snapshot is None or device_of is None:
+            return None, None
+        try:
+            server = snapshot()["servers"]["flowcell"]
+        except Exception:                       # noqa: BLE001 - reads as unreachable
+            return {"error": "no status from the flowcell server", "pumps": []}, None
+        device = device_of()
+        row = next((r for r in server.get("pumps") or []
+                    if r.get("device") == device and "operation_active" in r), None)
+        return server, row
+
+    def flowcell_pump_running(self):
+        """Is the flowcell dashboard running an operation on the in-use flowcell?
+
+        Asked of the hardware, as mixer_pumps_running() is and for the same
+        reason: a wash started from the flowcell dashboard, or by a PALmixer
+        session before a restart, leaves no thread here to join. Only the
+        in-use flowcell's own flag counts -- the other one shaking at the beam
+        is no reason to keep this one in its station. False when the dashboard
+        cannot be reached; check_flowcell_can_draw() refuses that case itself.
+        """
+        _server, row = self._flowcell_status()
+        return bool(row and row.get("operation_active"))
+
+    def check_flowcell_can_draw(self, wash_may_still_run=True):
+        """Refuse, before anything moves, a draw whose gap pull-back would be refused.
+
+        ready_flowcell_to_draw pulls the prefill gap back once the flowcell is
+        lifted clear of its cleaning station; the flowcell dashboard refuses
+        that unless the syringe holds what a finished wash/prefill leaves (or
+        already holds the pulled-back volume). A refusal there leaves the
+        flowcell held in the air, so the knowable reasons are checked here
+        first, with nothing moved: the dashboard answers, it runs the locked
+        recipe (apssector12_pump_control 3.0.0+, which has pull_back_gap), and
+        the flowcell's syringe holds one of those two volumes (both read from
+        the dashboard's own status, never assumed here).
+
+        `wash_may_still_run` is for the guards run when a draw is accepted:
+        the wash unload_sample left running ends at exactly the volume wanted,
+        so a pump that is still busy is not judged yet -- await_flowcell_ready
+        checks again once it is idle, just before the pickup.
+        """
+        server, row = self._flowcell_status()
+        if server is None:
+            return
+        fc = state.get_flowcell_in_use()
+        if server.get("error") or row is None:
+            raise WorkflowError(
+                "the flowcell pump dashboard (FlowCellControl) is not answering (%s); "
+                "start it, then retry. The flowcell has not been moved."
+                % (server.get("error") or "no status for flowcell %d" % fc))
+        recipe = server.get("recipe")
+        if not isinstance(recipe, dict) or "prefill_final_ul" not in recipe:
+            raise WorkflowError(
+                "FlowCellControl reports no locked recipe, so it predates "
+                "apssector12_pump_control 3.0.0 and cannot pull back the gap before a "
+                "draw. Update it, then retry. The flowcell has not been moved.")
+        if wash_may_still_run and (row.get("operation_active") or any(
+                _pump_server_for(op) == "flowcell" for op in self._background_pump_threads())):
+            return
+        ready = float(recipe["prefill_final_ul"])
+        done = float(recipe["pulled_back_ul"])
+        tolerance = float(recipe.get("position_tolerance_ul", 0.5))
+        position = row.get("position_ul")
+        if position is None:
+            why = row.get("trust_reason")
+            raise WorkflowError(
+                "the flowcell dashboard does not know how much flowcell %d's syringe "
+                "holds (%s). Run Wash + prefill on flowcell %d, then retry. The flowcell "
+                "has not been moved." % (
+                    fc, "position untrusted: %s" % why if why else
+                    "its last operation was stopped or failed, or it is not answering",
+                    fc))
+        position = float(position)
+        if abs(position - ready) > tolerance and abs(position - done) > tolerance:
+            raise WorkflowError(
+                "flowcell %d's syringe holds %.1f uL, not the %g uL a finished wash "
+                "leaves (%g uL once the gap is pulled back), so the gap could not be "
+                "pulled back before the draw. Run Wash + prefill on flowcell %d, then "
+                "retry. The flowcell has not been moved." % (fc, position, ready, done, fc))
+
+    def await_flowcell_ready(self):
+        """Hold the flowcell in its cleaning station until it can leave for a draw.
+
+        Run before ready_flowcell_to_draw picks it up -- in make_sample,
+        draw_and_load and draw_load_sample, and for the Experiment tab's Ready
+        Flowcell to Draw button. First the flowcell's own pump is waited out:
+        a wash_flowcell thread of ours (the one unload_sample fires unawaited),
+        then anything the dashboard still reports running on this flowcell,
+        which covers a wash PALmixer did not start. The wash pushes bleach, DI
+        and air out through the needle, so the flowcell must not go anywhere
+        until it ends -- waiting here, seated, rather than with the flowcell
+        already lowered onto the vial, which is where this wait used to be.
+        Then check_flowcell_can_draw() confirms, still seated, that the gap
+        will be pulled back once it is lifted.
+
+        Each wait is its own step, as for the mixer head, and is bounded by the
+        pump's per-operation timeout, raising rather than moving on expiry.
+        """
+        if self.simulate or self.pump is None:
+            return
+        self._await_background_pump("pull_back_gap")
+        if self.flowcell_pump_running():
+            self._step("wait_for_flowcell_pump", self._poll_flowcell_pump_idle)
+        self.check_flowcell_can_draw(wash_may_still_run=False)
+
+    def _poll_flowcell_pump_idle(self):
+        timeout = self._mixer_wash_timeout_s()          # the pump's own op timeout
+        deadline = time.time() + timeout
+        fc = state.get_flowcell_in_use()
+        while self.flowcell_pump_running():
+            if time.time() >= deadline:
+                raise WorkflowError(
+                    "flowcell %d's pump has been running for over %.0f s; refusing to take "
+                    "the flowcell out of its cleaning station while liquid may still be "
+                    "flowing through it. Stop the operation on the flowcell dashboard, "
+                    "then retry." % (fc, timeout))
+            time.sleep(MIXER_PUMP_POLL_S)
+        return "flowcell %d's pump is idle; the flowcell is free to leave its station" % fc
+
+    def _ready_flowcell_to_draw(self):
+        """ready_flowcell_to_draw, pulling the prefill gap back once the
+        flowcell is lifted clear of its station (PAL12idb's `before_approach`).
+
+        Reported inside this step rather than as a step of its own: it happens
+        part-way through the transport, and a step nested in another would
+        leave the server's current_step blank for the rest of the move. A
+        refusal stops the transport right there, with the flowcell held above
+        its station -- it never reaches the vial without its gap.
+        """
+        pulled = []
+
+        def pull_back():
+            ok, detail = self.pump.pull_back_gap()
+            if not ok:
+                raise WorkflowError(
+                    "the prefill gap was not pulled back, so the flowcell was stopped "
+                    "above its cleaning station instead of going on to the vial: %s" % detail)
+            pulled.append(detail)
+
+        self.pal.ready_flowcell_to_draw(self.robot, before_approach=pull_back)
+        return "gap pulled back after the lift: %s" % pulled[0] if pulled else ""
+
+    def ready_flowcell_to_draw(self):
+        """The Experiment tab's Ready Flowcell to Draw, under the same rule as
+        the draw workflows: wait for the flowcell's pump and confirm its gap
+        can be pulled back while it is still seated, then carry it to the
+        seat, pulling the gap back once it is lifted."""
+        self.await_flowcell_ready()
+        return self._ready_flowcell_to_draw()
+
     def _move_mixer_head(self, name, fn):
         """Run a mixer-head transport (mixer2cleaningstation /
         mixer2mixingstation), waiting out a wash in progress first. The one
@@ -808,6 +989,11 @@ class Workflows:
         transport earlier. A slot consumed by a direct call (a script, a test)
         is never left anonymous either way."""
         target_position = self._check_make_sample(slot, sample_id)
+        # Before the mix, not only before the draw: a vial mixed and then left
+        # undrawn because the flowcell could not take it is the costly way to
+        # find out. (Not part of _check_make_sample, which PAL loading also
+        # uses and which never involves the flowcell.)
+        self.check_flowcell_can_draw()
         mixer_loc = state.get_mixer_head()
 
         if self.simulate:
@@ -868,11 +1054,12 @@ class Workflows:
         self._step("advance_carousel",
                     lambda: self._advance_carousel(slot, target_position))
 
-        self._step("ready_flowcell_to_draw", lambda: self.pal.ready_flowcell_to_draw(self.robot))
         # The clean_mixer started above is on the other pump and is left to run
-        # alongside this. Only a flowcell-side leftover -- the wash fired by a
-        # preceding unload_sample -- is waited for here.
-        self._await_background_pump("draw_to_flowcell")
+        # alongside this. Only the flowcell's own pump -- typically the wash a
+        # preceding unload_sample fired -- holds the flowcell in its station,
+        # and its gap is confirmed pullable before it is picked up.
+        self.await_flowcell_ready()
+        self._step("ready_flowcell_to_draw", self._ready_flowcell_to_draw)
         self._step("draw_to_flowcell", lambda: self._pump_op("draw_to_flowcell"))
         if on_lift_complete is None:
             self._step("load_sample_to_beam", lambda: self.pal.load_sample_to_beam(self.robot))
@@ -995,6 +1182,7 @@ class Workflows:
         mixer_loc = state.get_mixer_head()
         self._require_known(mixer_loc, state.WHAT_MIXER_HEAD,
                              (state.MIXER_AT_MIXER, state.MIXER_AT_CLEANING))
+        self.check_flowcell_can_draw()
 
     def draw_and_load(self):
         """Draw an already-mixed sample into the flowcell and put it in the beam.
@@ -1027,11 +1215,13 @@ class Workflows:
             self._move_mixer_head("mixer2cleaningstation",
                                   lambda: self.pal.mixer2cleaningstation(self.robot))
 
-        self._step("ready_flowcell_to_draw", lambda: self.pal.ready_flowcell_to_draw(self.robot))
+        # Run straight after an unload, the wash it fired is usually still
+        # going: the flowcell waits it out in its station (await_flowcell_ready).
+        self.await_flowcell_ready()
+        self._step("ready_flowcell_to_draw", self._ready_flowcell_to_draw)
         # Awaited, unlike unload's wash: the arm is holding the flowcell down
         # on the mixer for the duration, and it must not be carried to the beam
         # until the draw has actually finished putting sample in it.
-        self._await_background_pump("draw_to_flowcell")
         self._step("draw_to_flowcell", lambda: self._pump_op("draw_to_flowcell"))
         self._step("load_sample_to_beam", lambda: self.pal.load_sample_to_beam(self.robot))
         self._start_auto_shake()
@@ -1067,9 +1257,11 @@ class Workflows:
         if state.get_mixer_head() == state.UNKNOWN:
             raise WorkflowError("mixer head location is unknown")
         try:
-            return state.slot_position(slot)
+            position = state.slot_position(slot)
         except KeyError as e:
             raise WorkflowError(e.args[0])
+        self.check_flowcell_can_draw()
+        return position
 
     def draw_load_sample(self, slot, sample_id=None):
         """Draw an already-prepared slot into the selected flow cell without mixing."""
@@ -1101,12 +1293,11 @@ class Workflows:
         # under the seat, so the requested slot has to already be there, not
         # spun into place underneath a flowcell that has already landed.
         self._step("advance_carousel", lambda: self._advance_carousel(slot, target_position))
-        self._step("ready_flowcell_to_draw", lambda: self.pal.ready_flowcell_to_draw(self.robot))
-        # The wash a preceding unload_sample left running is on this same pump,
-        # and the arm holds the flowcell down on the vial until the draw
-        # returns -- so it is waited out here, as a named step, rather than
-        # stalling inside the draw.
-        self._await_background_pump("draw_to_flowcell")
+        # The wash a preceding unload_sample left running is on this flowcell's
+        # own pump and pushes liquid out through its needle, so the flowcell
+        # waits it out in its station, as named steps, before it is picked up.
+        self.await_flowcell_ready()
+        self._step("ready_flowcell_to_draw", self._ready_flowcell_to_draw)
         self._step("draw_to_flowcell", lambda: self._pump_op("draw_to_flowcell"))
         self._step("load_sample_to_beam", lambda: self.pal.load_sample_to_beam(self.robot))
         self._start_auto_shake()

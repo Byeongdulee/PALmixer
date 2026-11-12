@@ -3688,8 +3688,18 @@ def load_flowcell_from_beam_to_cleaningstation(robot):
 # from there, which is what sample_on_mixer_station is. make_sample turns the
 # vial it just mixed round to this seat (carousel.draw_offset_steps) before
 # calling this, so the flowcell descends onto that vial.
+#
+# `before_approach` runs once the flowcell has been lifted clear of its
+# station (pickup() raises it by needle_clear_height, so the needle is in air)
+# and before it travels to the seat. Workflows pulls back the prefill gap
+# here: in air the needle draws in air, where in the station it could draw
+# whatever liquid is standing there. Unlike load_sample_to_beam's notification
+# hook, an exception from it propagates and stops the transport on the spot --
+# a gap that was not pulled back must keep the flowcell away from the vial --
+# leaving the flowcell held above its station and, through @_tracks, its
+# location unknown, as for any other failure part-way through a transport.
 @_tracks(_flowcell_setter, state.FC_IN_GRIPPER)
-def ready_flowcell_to_draw(robot):
+def ready_flowcell_to_draw(robot, before_approach=None):
     if flowcell_ID == 1:
         cleaning_station = get_cleaningstation_position(1)
     else:
@@ -3702,6 +3712,8 @@ def ready_flowcell_to_draw(robot):
     move_to_cleaningstation(robot, cleaning_station, via_transferpoint=False)
     _pickup_recovering(robot, 'cleaning_station', height=needle_clear_height,
                        open_extra_m=cleaning_station_open_extra())
+    if before_approach is not None:
+        before_approach()
     p2 = list(get_sample_on_mixerstation_position())
     p2[2] = p2[2]-distance_gripper_tag+needle_clear_height
     robot.moveto(p2)

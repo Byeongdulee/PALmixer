@@ -1070,6 +1070,9 @@ class PALmixerServer:
             self._require_positions(self.workflows.stations_for_make_sample())
             try:
                 self.workflows._check_make_sample(slot, sample_id)
+                # Refused here rather than after the mix: see
+                # Workflows.check_flowcell_can_draw.
+                self.workflows.check_flowcell_can_draw()
             except WorkflowError as e:
                 raise ValueError(str(e))
             label = "%s %s%s" % (cmd.MAKE_SAMPLE, slot,
@@ -1461,6 +1464,13 @@ class PALmixerServer:
             if name == MIXER_TO_CAROUSEL:
                 # And so does the RedBoard restart, after the wait like the move.
                 self.workflows.rearm_trigger("%s (Experiment tab)" % name)
+        if name == "ready_flowcell_to_draw":
+            # The same rule as the draw workflows, so a hand-stepped draw gets
+            # its gap too: the flowcell waits out its pump and has its gap
+            # confirmed pullable while still seated, then the gap is pulled
+            # back once it is lifted (Workflows.ready_flowcell_to_draw).
+            detail = self.workflows.ready_flowcell_to_draw()
+            return "%s complete%s" % (name, "; " + detail if detail else "")
         getattr(self.PAL12idb, name)(self.rob)
         return "%s complete" % name
 

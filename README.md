@@ -193,7 +193,7 @@ that call. See the docstring in `_winenv.py`.
 | `motor_tweak forward\|reverse <step>` | worker | Tweak `12idb:m6` by `step` |
 | `move_to_pal_loading <target_sample_slot>` | worker | Position a sample slot for PAL loading using the configured preparation offset. Requires the mixer head and selected flowcell at their cleaning stations; refused during coordinated preparation |
 | `move_to_mixing <target_sample_slot>` | worker | After PAL clears the carousel, position the sample's own slot at the mixer with no offset. Rotates only; does not mix. Has the same standalone clearance and coordination checks as `move_to_pal_loading` |
-| `pump mix\|clean_mixer\|draw_to_flowcell\|aspirate_from_flowcell\|wash_flowcell\|shake_sample` | worker | Run a pump operation (ZMQ to apssector12_pump_control). `shake_sample` cycles the sample inside the flowcell in use -- `flow2_sample` for flowcell 1, `flow3_sample` for flowcell 2, since that server names the device in the command rather than as an argument. The Automation tab's **Shake Sample** button; the other five are the Experiment tab's Pump row |
+| `pump mix\|clean_mixer\|draw_to_flowcell\|aspirate_from_flowcell\|wash_flowcell\|shake_sample` | worker | Run a pump operation (ZMQ to apssector12_pump_control). `shake_sample` cycles the sample inside the flowcell in use -- `flow2_sample` for flowcell 1, `flow3_sample` for flowcell 2, since that server names the device in the command rather than as an argument. The Automation tab's **Shake Sample** button; the other five are the Experiment tab's Pump row. (The gap pull-back is not a separate command: `ready_flowcell_to_draw` runs it -- see [Flowcell gap pull-back](#flowcell-gap-pull-back).) |
 | `stop_pump` | fast | End an active `shake_sample` cycle now (sends the flowcell server's `stop_shaking`, not its plainer `stop` -- see [Pump concurrency](#pump-concurrency)). Fast and ungated by the busy flag, because the point is to reach a pump operation that is running -- exactly when a worker command would be refused; `Pump` sends it on a socket the running op is not holding. Does nothing to an unrelated draw/wash/aspirate. The Automation tab's **Stop Shake** button, which stays enabled while the server is BUSY |
 | `set_mixing_speed <rpm>` | fast | The speed the next `mix` runs at. Bounds-checked against `pump.min_rpm`/`max_rpm`; refused while an action is running |
 | `get_mixing_speed` | fast | That speed, in rpm |
@@ -236,7 +236,7 @@ The `PAL12idb` transport functions above, each sent as its own bare command:
 | `mixer2mixingstation` | Cleaning Station -> Mixer |
 | `load_flowcell_from_cleaningstation_to_beam` | Cleaning Station -> Beam |
 | `load_flowcell_from_beam_to_cleaningstation` | Beam -> Cleaning Station |
-| `ready_flowcell_to_draw` | Ready Flowcell to Draw (onto the sample seat) |
+| `ready_flowcell_to_draw` | Ready Flowcell to Draw (onto the sample seat; waits for the flowcell's pump and pulls back the prefill gap once lifted -- see [Flowcell gap pull-back](#flowcell-gap-pull-back)) |
 | `load_sample_to_beam` | Load Sample to Beam |
 | `return_sample` | Return Sample from Beam |
 | `wash_flowcell_after_return` | Wash Flowcell After Return |
@@ -899,10 +899,13 @@ rotate carousel to `<slot>` -> mixer2mixingstation (restarting the RedBoard
 trigger as it sets off) -> pump mix (only once the RedBoard is armed -- see
 [RedBoard trigger](#redboard-trigger); **slot tagged
 with the sample ID here**) -> mixer2cleaningstation -> pump clean_mixer (fired
-on a background thread, not awaited) -> advance carousel -> ready_flowcell_to_draw
--> pump draw_to_flowcell -> load_sample_to_beam -> shake_sample (auto, not
-awaited) -> park at the transfer point. Requires the flowcell in use to be at
-its cleaning station, the slot to be within the configured carousel size, and
+on a background thread, not awaited) -> advance carousel -> wait for the
+flowcell's own pump, if busy -> ready_flowcell_to_draw (pulling back the prefill
+gap once the flowcell is lifted) -> pump draw_to_flowcell -> load_sample_to_beam
+-> shake_sample (auto, not awaited) -> park at the transfer point. Requires the
+flowcell in use to be at its cleaning station with its gap pullable (see
+[Flowcell gap pull-back](#flowcell-gap-pull-back) -- checked before mixing),
+the slot to be within the configured carousel size, and
 the carousel to have been located (one taught reference). Also refused
 outright while a previous run's mixer clean is still going -- see
 [Mixer wash safety](#mixer-wash-safety).
@@ -925,13 +928,14 @@ rounding cannot accumulate across runs. The tracked carousel slot follows the
 motion and wraps around the ring, so it keeps meaning "the slot the carousel is
 turned to" rather than "the slot last mixed".
 
-**`draw_and_load`**: mixer2cleaningstation (if needed) ->
-ready_flowcell_to_draw -> pump draw_to_flowcell -> load_sample_to_beam ->
+**`draw_and_load`**: mixer2cleaningstation (if needed) -> wait for the
+flowcell's own pump, if busy -> ready_flowcell_to_draw (pulling back the gap
+once lifted) -> pump draw_to_flowcell -> load_sample_to_beam ->
 shake_sample (auto, not awaited) -> park at the transfer point. The tail of
 `make_sample` without the mixing, for a vial that already holds what is
 wanted -- one mixed by an earlier run, or a sample just recovered by
 `unload_sample aspirate`. Requires the flowcell in use to be at the cleaning
-station and the mixer head's location to be known. Nothing here touches the
+station with its gap pullable, and the mixer head's location to be known. Nothing here touches the
 carousel: no slot is consumed and no sample ID is assigned, so the vial drawn
 from is whichever one the last rotation left the mixer over. **This does not
 rotate the carousel** -- if you want a specific slot, use `draw_load_sample`
@@ -940,8 +944,9 @@ draws from whatever vial happens to already be at the draw point, silently.
 
 **`draw_load_sample <slot> [sample id]`**: advance carousel (to `<slot>`'s
 *drawing* position -- `draw_offset_steps` forward of its mixing position, same
-as `make_sample`'s advance) -> mixer2cleaningstation (if needed) ->
-ready_flowcell_to_draw -> pump draw_to_flowcell -> load_sample_to_beam ->
+as `make_sample`'s advance) -> mixer2cleaningstation (if needed) -> wait for
+the flowcell's own pump, if busy -> ready_flowcell_to_draw (pulling back the
+gap once lifted) -> pump draw_to_flowcell -> load_sample_to_beam ->
 shake_sample (auto, not awaited) -> park at the transfer point. `draw_and_load`'s
 slot-aware counterpart, for a named,
 already-prepared slot rather than whatever the carousel already happens to be
@@ -960,9 +965,60 @@ wash_flowcell -> raise the robot back to sample-table height -> park at the
 transfer point. Requires the flowcell in use to be at the sample table. The
 wash is **not awaited**: it needs the flowcell sitting in the station rather
 than the arm that put it there, so the lift runs alongside it and the sequence
-returns without waiting. The next call to the **same** pump waits for it in
-its turn -- the `draw_to_flowcell` of a following `make_sample`, for instance.
-The `mix` of that run does not: that is the other pump.
+returns without waiting. The next draw waits for it -- with the flowcell still
+in its station, before it is picked up (see
+[Flowcell gap pull-back](#flowcell-gap-pull-back)). The `mix` of that run does
+not: that is the other pump.
+
+### Flowcell gap pull-back
+
+The FlowCell wash ends with a prefill that leaves the syringe on the sample
+port holding a set volume -- 180 uL with apssector12_pump_control's shipped
+recipe. The 50 uL **gap** is not pulled back there: PALmixer has the pump pull
+it back (`pull_back_gap`) as `ready_flowcell_to_draw` lifts the flowcell clear
+of its cleaning station, after the pickup and before the flowcell travels to
+the vial. The needle is in air at that moment, so the gap is air rather than
+whatever is standing in the station, and it is made just before the draw
+instead of whenever the wash happened to finish. Every volume and speed
+involved is the FlowCell recipe's, fixed in that repo's
+`flow_cells/flowcell_config.py`; PALmixer only names the command and the
+flowcell.
+
+`make_sample`, `draw_and_load`, `draw_load_sample` and the Experiment tab's
+**Ready Flowcell to Draw** all go through `Workflows.await_flowcell_ready()`
+before the pickup:
+
+1. **The flowcell's own pump is waited out**, with the flowcell seated: a
+   `wash_flowcell` of ours still running (`wait_for_wash_flowcell`), then
+   anything the dashboard reports running on *this* flowcell
+   (`wait_for_flowcell_pump`) -- a wash started from the dashboard, or by a
+   PALmixer session before a restart. The other flowcell being busy does not
+   count. The wash pushes bleach, DI and air out through the needle; before
+   this, the draws waited for it only after the flowcell had been carried to
+   the vial and lowered onto it. The wait is bounded by
+   `pump.operation_timeout_s` and raises rather than moving on expiry.
+2. **The pull-back is confirmed acceptable** (`check_flowcell_can_draw`): the
+   pump refuses a pull-back unless the syringe holds the prefill's end volume
+   (or already the pulled-back volume, which it leaves alone), and a refusal
+   after the lift would leave the flowcell held in the air. So the draw is
+   refused while it is still seated if the flowcell dashboard does not answer,
+   predates the locked recipe (no `pull_back_gap`), reports the position as
+   untrusted (after a failed operation or a stop; the refusal quotes the
+   dashboard's reason), or reports a syringe volume the pull-back would refuse
+   -- for example 0 uL after FlowCellControl was restarted, which homes both
+   syringes. The volumes and the tolerance are
+   read from the dashboard's own status (`recipe.prefill_final_ul`,
+   `recipe.pulled_back_ul`, each flowcell's `position_ul`), never assumed here.
+   The same check runs when the command is accepted -- before the mix, for
+   `make_sample` -- except that a wash still running is let finish first.
+
+The pull-back itself succeeds only on that flowcell's own
+`Complete: pull back gap` status, as the draw does on `Complete: draw to
+flowcell`. If it is refused anyway, the transport stops with the flowcell held
+above its station and its location `unknown`, and the run fails: the flowcell
+never reaches the vial without its gap. In `make_sample` that is after the mix;
+the mixed vial waits at the draw seat, and can be drawn with
+`draw_load_sample <slot>` once the flowcell has been washed.
 
 **Parking.** Every workflow's last step, `park_at_transfer_point`, sends the
 arm to the fixed corridor pose (`goto_transfer_point`) once everything before
@@ -1208,7 +1264,7 @@ There are two pump servers, and they are independent hardware:
 | Port | Dashboard | Operations |
 |---|---|---|
 | 5555 | `pump_dashboard.py` | `mix`, `clean_mixer` |
-| 5556 | `flowcell_dashboard.py` | `draw_to_flowcell`, `aspirate_from_flowcell`, `wash_flowcell` |
+| 5556 | `flowcell_dashboard.py` | `draw_to_flowcell`, `pull_back_gap`, `aspirate_from_flowcell`, `wash_flowcell`, `shake_sample` |
 
 `Pump` holds **one lock per server**, on the endpoint itself. Within a server
 everything serializes -- the ZMQ REQ socket cannot be shared and neither can the
@@ -1246,7 +1302,7 @@ by default.
 `palmixer/pump.py` is a **ZMQ client** to
 [apssector12_pump_control](../apssector12_pump_control), which runs the real
 TriContinent syringe pumps behind two loopback-only ZMQ REP servers. It
-implements the five operations the GUI and workflows call, routing each to the
+implements the operations the GUI and workflows call, routing each to the
 right server:
 
 | PALmixer op | Server | Endpoint | ZMQ command |
@@ -1254,8 +1310,17 @@ right server:
 | `mix` | mixing | `tcp://127.0.0.1:5555` | `sample_make` |
 | `clean_mixer` | mixing | `tcp://127.0.0.1:5555` | `clean_all` |
 | `draw_to_flowcell` | flowcell | `tcp://127.0.0.1:5556` | `draw_to_flowcell` |
+| `pull_back_gap` | flowcell | `tcp://127.0.0.1:5556` | `pull_back_gap` (needs apssector12_pump_control 3.0.0+) |
 | `aspirate_from_flowcell` | flowcell | `tcp://127.0.0.1:5556` | `aspirate_from_flowcell` |
 | `wash_flowcell` | flowcell | `tcp://127.0.0.1:5556` | `wash_flowcell` |
+
+Flowcell requests carry only the command and the device: since
+apssector12_pump_control 3.0.0 the FlowCell recipe (volumes, speeds, ports) is
+fixed in that repo's `flow_cells/flowcell_config.py` and the server refuses
+overrides. `draw_to_flowcell` and `pull_back_gap` succeed only on their
+flowcell's own `Complete: ...` status, and wait on that flowcell's own busy
+flag, so the other flowcell being busy neither delays them nor stands in for
+their result.
 
 Operations serialize per pump server. Mixing-server cleanup can overlap a
 flowcell-server draw; operations on the same server wait for each other.
