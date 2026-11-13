@@ -71,6 +71,8 @@ class PreparationAPI:
         with self.lock:
             return {'version': 1, 'active': self.active, 'run_id': self.record.get('run_id'),
                     'empty_cell_inspection_version': 1, 'reset_version': 1,
+                    # A swap that ends without a failure has parked before reporting it.
+                    'replace_parks_version': 1,
                     'inspection': deepcopy(active_inspection(self)),
                     'error': self.record.get('error', ''),
                     'offset_steps': config.get_section('carousel').get('preparation_offset_steps')}
@@ -269,7 +271,16 @@ class PreparationAPI:
         the flowcell wash still runs -- that overlap is the point -- but not
         while anything else moves or a cleanup has failed. Progress is persisted
         before each physical phase, and a duplicate request returns the record
-        instead of starting a second swap."""
+        instead of starting a second swap.
+
+        With robot placement on, the table turns to its alignment slot first, with
+        the old carousel still on it, so a motor fault stops the swap before
+        anything else moves. A swap that ends without a failure -- committed,
+        waiting_for_stock or waiting_for_carousel -- then parks the arm with the
+        standard workflow park before it reports that state. This worker action
+        cleared cleanup.parked when it started, and PALsystem's wait for the last
+        sample's unload needs it set again (replace_parks_version 1). A failed
+        swap never parks; a failed park fails the swap in 'parking'."""
         replacement_id = message.get('replacement_id')
         try:
             canonical = isinstance(replacement_id, str) and str(UUID(replacement_id)) == replacement_id
@@ -314,8 +325,16 @@ class PreparationAPI:
                 saved.update(state=name, **extra)
                 self._save()
 
+        def park(done):
+            # A failed park reports what the swap had already done -- a carousel
+            # seated and its load recorded, or one taken back to the used stack --
+            # which the bare motion error would lose.
+            try:
+                self.server.workflows._park()
+            except Exception as error:
+                raise RuntimeError('%s; parking the arm failed: %s' % (done, error)) from error
+
         def run():
-            placing = False
             try:
                 progress('unloading')
                 if place_by_robot:
@@ -332,41 +351,45 @@ class PreparationAPI:
                 unloaded = self.server._unload_carousel()
                 progress('old_removed')
                 if not place_by_robot:
-                    # Robot placement is off. The session stays usable, and the
-                    # operator's Replace Carousel (Reset) records the load.
+                    # Robot placement is off. The arm parks clear of the mixer, the
+                    # session stays usable, and the operator's Replace Carousel (Reset)
+                    # records the load once a carousel is seated by hand.
+                    progress('parking')
+                    park(unloaded)
                     progress('waiting_for_carousel', error=WAITING_FOR_CAROUSEL_MESSAGE)
-                    outcome = '%s; %s' % (unloaded, WAITING_FOR_CAROUSEL_MESSAGE)
-                else:
-                    progress('placing')
-                    placing = True
+                    return '%s; arm parked; %s' % (unloaded, WAITING_FOR_CAROUSEL_MESSAGE)
+                progress('placing')
+                try:
                     placed, load = self.server._place_and_record_load(replacement_id)
-                    progress('committed', load=load)
-                    outcome = '%s; %s; every slot cleared (carousel load %d)' % (
-                        unloaded, placed, load['sequence'])
-            except Exception as error:
-                if placing and no_carousel is not None and isinstance(error, no_carousel):
-                    # The old carousel is already on the used stack. Leave the
-                    # session usable so PALsystem can end it; the operator loads
-                    # stock and presses Place New Carousel, which records the load.
-                    # `detail` keeps what placement said: after a carousel that did
-                    # not land was taken back, it names that carousel.
+                except Exception as error:
+                    if no_carousel is None or not isinstance(error, no_carousel):
+                        raise
+                    # The stock seat is empty -- or emptied by a take-back, which the
+                    # error then names -- and the old carousel is on the used stack.
+                    # The gripper is empty, so the arm parks as after a clean finish.
+                    # The session stays usable so PALsystem can end it; the operator
+                    # loads stock and presses Place New Carousel, which records the
+                    # load. The result ends with that instruction: the session error
+                    # stays empty, so PALmixer's result line is where it is read.
+                    progress('parking', detail=str(error))
+                    park(str(error))
                     progress('waiting_for_stock', error=NO_STOCK_MESSAGE, detail=str(error))
-                    outcome = '%s (%s)' % (NO_STOCK_MESSAGE, error)
-                else:
-                    with self.lock:
-                        # failed_phase keeps "unload failed" apart from "old carousel
-                        # removed, placement failed" -- they need different recovery.
-                        saved.update(state='failed', failed_phase=saved['state'],
-                                     error=str(error))
-                        self.record['error'] = str(error)
-                        self._save()
-                        self.coordinator.invalidate(str(error))
-                    raise
-            # The swap ended without a failure: park at the transfer point, which
-            # reports the arm parked -- the worker action cleared that when it
-            # started, and PALsystem waits for it before its run goes on.
-            self.server.workflows._park()
-            return outcome
+                    return '%s; %s; arm parked; %s' % (unloaded, error, NO_STOCK_MESSAGE)
+                done = '%s; every slot cleared (carousel load %d)' % (placed, load['sequence'])
+                progress('parking', load=load)
+                park(done)
+                progress('committed', load=load)
+                return '%s; %s; arm parked' % (unloaded, done)
+            except Exception as error:
+                with self.lock:
+                    # failed_phase keeps "unload failed", "old carousel removed,
+                    # placement failed" and "park failed" apart -- they need
+                    # different recovery.
+                    saved.update(state='failed', failed_phase=saved['state'], error=str(error))
+                    self.record['error'] = str(error)
+                    self._save()
+                    self.coordinator.invalidate(str(error))
+                raise
         label = 'preparation_replace_carousel'
         with self.server._busy_lock:
             if self.server._busy:

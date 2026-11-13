@@ -1512,8 +1512,20 @@ class PALmixerServer:
             state.get_last_unloaded_carousel(), pose)
 
     def _place_new_carousel(self):
+        """The Place New Carousel button: place, record the load, then park.
+
+        Ends with the standard workflow park, as a coordinated swap does, so
+        cleanup.parked is set again after this worker action cleared it. A
+        placement that fails raises as before, without parking. A park that
+        fails comes after the load was recorded, so its error gives what the
+        placement did, including any carousel taken back, and the load."""
         detail, load = self._place_and_record_load()
-        return "%s; every slot cleared (carousel load %d)" % (detail, load["sequence"])
+        detail = "%s; every slot cleared (carousel load %d)" % (detail, load["sequence"])
+        try:
+            self.workflows._park()
+        except Exception as e:
+            raise RuntimeError("%s; parking the arm failed: %s" % (detail, e)) from e
+        return "%s; arm parked" % detail
 
     def _place_and_record_load(self, replacement_id=None):
         """Place a new carousel, then record the load and free every slot.

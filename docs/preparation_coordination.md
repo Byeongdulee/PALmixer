@@ -11,7 +11,10 @@ When the carousel is exhausted, the owning run sends:
 
 It runs the **Unload Current Carousel** code path and then the
 **Place New Carousel** code path as one worker action labelled
-`preparation_replace_carousel`. Placement saves the carousel-load record, with
+`preparation_replace_carousel`. With robot placement on, the table first turns to
+`carousel.place_alignment_slot`, with the old carousel still on it. A swap that
+ends without a failure parks the arm with the standard workflow park
+(`park_at_transfer_point`) before it reports that state. Placement saves the carousel-load record, with
 this `replacement_id`, and frees every slot, as the button does. The carousel ID
 label and taught positions are unchanged, and `mount_carousel` is not called.
 
@@ -26,16 +29,22 @@ these hold:
 - The mixer head and the flowcell in use are at their cleaning stations.
 - With robot placement on (`carousel.auto_place_new_carousel`), the carousel
   table can be turned to `carousel.place_alignment_slot`: the slot positions
-  are taught.
+  are taught, and every flowcell, not only the one in use, is at its cleaning
+  station or the beam. A flowcell PALmixer has never tracked reads `unknown` and
+  is refused too; declare it with `set_location` (for example
+  `set_location flowcell_2 cleaning_station`) while no session is open.
 - Carousel on Mixer, Used Carousel Stack and Carousel in Stock are taught.
 
 The record is kept in `replacements[replacement_id]` and returned by `status`:
-`{replacement_id, action_id, request, state, error}`, plus `load` once
-committed, `failed_phase` on failure, and `detail` (placement's own message) on
-`waiting_for_stock`. It is persisted when the
-request is accepted and again before each physical phase. A repeated identical
-request returns the record and never starts a second swap. A different request
-under the same identity is refused.
+`{replacement_id, action_id, request, state, error}`, plus `load` once placed,
+`detail` (placement's own message) when the stock seat was empty, and
+`failed_phase` on failure. It is persisted when the request is accepted and again
+before each physical phase. A repeated identical request returns the record and
+never starts a second swap. A different request under the same identity is refused.
+
+The states run `accepted`, `unloading`, `old_removed`, `placing`, `parking`, then
+`committed` or `waiting_for_stock`. With robot placement off they run `accepted`,
+`unloading`, `old_removed`, `parking`, `waiting_for_carousel`.
 
 | `state` | Meaning |
 | --- | --- |
@@ -43,9 +52,22 @@ under the same identity is refused.
 | `unloading` | Unload running; with robot placement on, the table first turns to the alignment slot |
 | `old_removed` | Old carousel is on the used stack |
 | `placing` | Placement running: the arm places, and the height check confirms the carousel landed (a carousel felt too high is taken back to the used stack once and a fresh one placed) |
-| `committed` | Placed; `load` holds the carousel-load record and every slot is free |
-| `waiting_for_stock` | Stock seat empty after the unload, or after a placed carousel that did not land was taken back to the used stack (`detail`, placement's own message, then names it). The session stays usable so PALsystem can end it. The operator loads a carousel and presses **Place New Carousel** on PALmixer, which records the load. |
-| `failed` | Any other error. `failed_phase` says whether unloading or placing failed. The session error is latched and the coordinator is invalidated, as for other motion operations, with no replay. |
+| `parking` | The standard park is moving the arm to the transfer point: after a placement (`load` is already recorded), after finding the stock seat empty (`detail`), or, with robot placement off, after the unload |
+| `committed` | Placed; `load` holds the carousel-load record and every slot is free. The arm is parked, also after a hand placement that **Replace Carousel (Reset)** commits (`placed_by` `operator`): the swap parked before it waited, and Reset moves nothing |
+| `waiting_for_stock` | Stock seat empty after the unload, or after a placed carousel that did not land was taken back to the used stack. The arm is parked. `error` tells the operator what to do; `detail` is the placement's own message, which names a carousel that was taken back. The session stays usable so PALsystem can end it. The operator loads a carousel and presses **Place New Carousel** on PALmixer, which records the load. |
+| `waiting_for_carousel` | Robot placement is off (`carousel.auto_place_new_carousel` `false`). The arm is parked. The operator seats a new carousel by hand and presses **Replace Carousel (Reset)**, which records the load and marks the replacement `committed`. |
+| `failed` | Any other error. `failed_phase` says whether unloading, placing or parking failed; a park that fails after a placement keeps `load`, because the carousel load is already recorded. A failed park's `error` first says what the swap had done, the placement (including any carousel taken back) or the empty stock seat, then gives the cause. A failure is never followed by a park. The session error is latched and the coordinator is invalidated, as for other motion operations, with no replay. |
+
+Every worker action clears `cleanup.parked` when it starts, and only the standard
+park sets it again. A swap that ends without a failure (`committed`,
+`waiting_for_stock` or `waiting_for_carousel`) therefore parks before it reports
+that state: by the time PALsystem sees the final state and PALmixer idle,
+`cleanup.parked` is true, and the last sample's unload, which waits for
+`wash_complete` and `parked`, can finish. The preparation snapshot in `get_state`
+advertises this as `replace_parks_version: 1`. The action's `last_result.detail`
+says what happened: the unload and placement details, including any carousel taken
+back, then `arm parked`. On `waiting_for_stock` and `waiting_for_carousel` it ends
+with the operator's instruction, because the session error stays empty.
 
 ## Update: version-1 live test endpoint
 

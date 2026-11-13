@@ -916,8 +916,15 @@ slot ends up at the mixing position; turning first makes every mount land the
 same way, so the taught slot positions hold for each new carousel. The command is
 refused before anything moves unless the mixer head is at its cleaning station,
 every flowcell is at its cleaning station or the beam, and the slot positions
-are taught; a coordinated swap checks the same before it unloads. A
-turn that fails stops the placement with the new carousel still in stock.
+are taught; a coordinated swap checks the same before it unloads. Every
+flowcell means both: on a station that uses only flowcell 1, `flowcell_2` may
+never have been tracked and reads `unknown`, as in the `get_state` example
+above, and then every automatic swap and **Place New Carousel** is refused.
+Before relying on automatic swaps, check that `get_state` shows `flowcell_1` and
+`flowcell_2` at `cleaning_station` or `sample_table`. Declare one that is not,
+once it is physically there, with `set_location flowcell_2 cleaning_station`
+before the campaign starts; the command is refused while a coordinated run owns
+PALmixer. A turn that fails stops the placement with the new carousel still in stock.
 Without the setting (absent or `null`) the table stays where it is.
 
 **Placement ends on a pose recorded by hand.** Seat a carousel on the mixer at
@@ -952,15 +959,16 @@ is felt down to 20 mm below the seat (where the carousel went is unknown), when
 taking it back off fails or
 leaves anything on the seat, when the fresh carousel misses too, or when there
 is no fresh carousel in stock: then load one and press **Place New Carousel**.
-A coordinated swap waits in `waiting_for_stock` for the last case (its `detail`
-names the rejected carousel) and ends `failed` in `placing` for the others.
+A coordinated swap parks the arm and waits in `waiting_for_stock` for the last
+case (its `detail` names the rejected carousel), and ends `failed` in `placing`,
+with the arm left where it stopped, for the others.
 **Place New Carousel** needs Used Carousel Stack taught, for the take-back.
 Take a carousel a stopped placement left behind off by hand: **Unload Current
 Carousel** would record it as the spent carousel in the next load record.
 (`PAL12idb.CAROUSEL_SEAT_CHECK_*`.)
 
-**Robot placement in a coordinated swap is a setting.** With
-`carousel.auto_place_new_carousel` `true` in `json/palmixer_config.json`, a
+**Robot placement in a coordinated swap is a setting.** It is on:
+`carousel.auto_place_new_carousel` is `true` in `json/palmixer_config.json`, so a
 coordinated `replace_carousel` unloads the old carousel and places the new one
 by robot. With it `false` (also the default when absent), the swap unloads the
 old carousel and stops in state `waiting_for_carousel`, without latching the
@@ -969,7 +977,19 @@ session. A swap that ends without a failure (`committed`, `waiting_for_stock` or
 parked, which PALsystem waits for before its run goes on. The operator seats a new
 carousel by hand and presses **Replace Carousel (Reset)**, which is accepted during
 the coordinated session while that replacement waits; it records the load with the
-replacement's ID and marks the replacement `committed`.
+replacement's ID and marks the replacement `committed`. Reset moves nothing, so
+the arm stays parked where the swap left it.
+
+**A swap and Place New Carousel end parked.** A coordinated swap that ends
+without a failure, and **Place New Carousel**, finish with the
+standard park (`park_at_transfer_point`), like every workflow. Every worker
+action clears `cleanup.parked` when it starts, and only that park sets it again;
+PALsystem waits for it, with the wash, before it finishes the last sample on the
+old carousel. The preparation snapshot in `get_state` advertises this as
+`replace_parks_version: 1`. A failed swap or placement never parks. A park
+that fails after the carousel is seated leaves the load recorded and every slot
+free. Its error gives what the placement did, including any carousel taken back,
+and the load; a swap ends `failed` in `parking`.
 
 ## Automation workflows
 

@@ -153,24 +153,31 @@ def test_no_load_is_reported_before_any_placement_and_reset_writes_none(tracked)
 
 # -- server: Place New Carousel and the mixing record ----------------------------
 class FakePAL:
-    """Stands in for PAL12idb: unload/place only update tracked state."""
+    """Stands in for PAL12idb: unload/place only update tracked state, and the
+    workflow park (goto_transfer_point) is counted in `parks`, apart from the log."""
 
     class NoCarouselError(RuntimeError):
+        pass
+
+    class CarouselNotSeatedError(RuntimeError):
         pass
 
     def __init__(self):
         self.log = []
         self.missing = []
-        self.unload_error = self.place_error = None
+        self.unload_error = self.place_error = self.park_error = None
         self.place_notes = []
         self.parks = 0
-        self.during_unload = self.during_place = lambda: None
+        self.during_unload = self.during_place = self.during_park = lambda: None
 
     def check_positions_defined(self, keys):
         return [k for k in keys if k in self.missing]
 
     def goto_transfer_point(self, robot):
         self.parks += 1
+        self.during_park()
+        if self.park_error:
+            raise self.park_error
         return [0.2, -0.19, 0.08]
 
     def unload_current_carousel(self, robot):
@@ -194,6 +201,7 @@ class FakePAL:
         return [0.4, 0.5, 0.6]
 
 
+
 @pytest.fixture
 def server(tracked, journal, monkeypatch):
     # No table turn unless a test configures one (never the bench's config file).
@@ -208,7 +216,8 @@ def server(tracked, journal, monkeypatch):
     instance._last_result = None
     instance._beamline = "test"
     instance._mqtt = SimpleNamespace(publish=lambda *a, **k: None)
-    instance.workflows = Workflows(None, None, None, None)
+    # Workflows._park drives the fake PAL's goto_transfer_point.
+    instance.workflows = Workflows(instance.PAL12idb, instance.rob, None, None)
     instance._mixing_journal = journal
     return instance
 
@@ -254,6 +263,42 @@ def test_failed_placement_clears_nothing(server, error):
     assert after["carousel_sample_uids"] == before["carousel_sample_uids"]
     assert after["carousel_load"] == {"sequence": 0, "record": None}
     assert state.get_last_unloaded_carousel() == "32"   # still owed to the next load
+    assert server.PAL12idb.log == ["place"]
+    assert server.PAL12idb.parks == 0                   # and no park
+
+
+def test_place_button_ends_with_the_standard_park(server):
+    # An earlier workflow parked; this worker action clears that, and the park sets it again.
+    server.workflows._step("park_at_transfer_point", lambda: "parked")
+    server._run_action(server._place_new_carousel, cmd.PLACE_NEW_CAROUSEL, "trace-1")
+    assert server._last_result["ok"] is True, server._last_result
+    assert server._last_result["detail"].endswith(
+        "; every slot cleared (carousel load 1); arm parked")
+    assert server.PAL12idb.log == ["place"]
+    assert server.PAL12idb.parks == 1
+    assert server.workflows.cleanup_snapshot()["parked"] is True
+
+
+TAKEN_BACK = ("carousel 35 did not land (its top is 6.0 mm above the seat) and was moved to the "
+              "used stack, unused; carousel 37 placed instead")
+
+
+@pytest.mark.parametrize("notes", [[], [TAKEN_BACK]], ids=["placed", "placed_after_a_take_back"])
+def test_a_failed_park_after_the_button_placement_names_the_recorded_load(server, notes):
+    server.PAL12idb.place_notes = notes
+    server.PAL12idb.park_error = RuntimeError("protective stop")
+    with pytest.raises(RuntimeError) as failure:
+        server._place_new_carousel()
+    # What the placement did, a carousel taken back included, then the load and the cause.
+    assert str(failure.value) == "; ".join(
+        ["new carousel placed on the mixer (tag 37, arm at [0.4, 0.5, 0.6])"] + notes
+        + ["every slot cleared (carousel load 1)", "parking the arm failed: protective stop"])
+    assert failure.value.__cause__ is server.PAL12idb.park_error
+    # The placement stands: the load is recorded and every slot is free.
+    assert state.carousel_load()["sequence"] == 1 and state.carousel_samples() == {}
+    assert server.PAL12idb.log == ["place"]
+    assert server.PAL12idb.parks == 1
+    assert server.workflows.cleanup_snapshot()["parked"] is False
 
 
 def test_simulated_unload_and_place_record_unknown_tags(server, monkeypatch):
@@ -311,6 +356,7 @@ def aligned(server, monkeypatch):
 def test_place_turns_the_table_to_the_alignment_slot_before_the_arm_moves(aligned):
     reply = aligned._place_new_carousel()
     assert aligned.PAL12idb.log == [("turn", pytest.approx(SLOT_4)), "place"]
+    assert aligned.PAL12idb.parks == 1
     assert state.get_carousel_slot() == 4
     assert "table turned to slot 4" in reply and "every slot cleared (carousel load 1)" in reply
 
@@ -319,6 +365,7 @@ def test_without_an_alignment_slot_the_table_stays_put(server):
     server.motor = FakeMotor(server.PAL12idb.log)
     server._place_new_carousel()
     assert server.PAL12idb.log == ["place"]
+    assert server.PAL12idb.parks == 1
     assert state.get_carousel_slot() == 3
 
 
@@ -358,6 +405,7 @@ def test_place_with_the_flowcell_at_the_beam_still_turns(aligned):
     aligned._resolve(cmd.PLACE_NEW_CAROUSEL, [])
     aligned._place_new_carousel()
     assert aligned.PAL12idb.log == [("turn", pytest.approx(SLOT_4)), "place"]
+    assert aligned.PAL12idb.parks == 1
 
 
 def test_a_failed_turn_leaves_the_new_carousel_in_stock(aligned):
@@ -373,6 +421,7 @@ def test_simulated_place_records_the_alignment_slot(aligned, monkeypatch):
     import palmixer.server as server_module
     monkeypatch.setattr(server_module.time, "sleep", lambda s: None)
     aligned.simulate = True
+    aligned.workflows.simulate = True    # the real server gives its workflows the same flag
     aligned.motor.error = RuntimeError("a simulated place must not touch the motor")
     aligned._place_new_carousel()
     assert aligned.PAL12idb.log == []
@@ -508,6 +557,7 @@ def test_replace_unloads_places_and_commits_the_load_while_washing(coordinated, 
     assert observed == {"unload": "unloading", "busy": True,
                         "action": "preparation_replace_carousel", "place": "placing"}
     assert c.pal.log == ["unload", "place"]
+    assert c.pal.parks == 1
     final = status(c)["replacements"][rid]
     assert final["state"] == "committed" and final["error"] == ""
     assert final["action_id"] == accepted["action_id"] == c.server._last_result["action_id"]
@@ -533,7 +583,7 @@ def test_duplicate_replace_never_starts_a_second_swap(coordinated):
     assert in_flight[0]["action_id"] == first["action_id"]
     again = c.api.request(dict(message))
     assert again["state"] == "committed" and again["action_id"] == first["action_id"]
-    assert len(c.started) == 1 and c.pal.log == ["unload", "place"]
+    assert len(c.started) == 1 and c.pal.log == ["unload", "place"] and c.pal.parks == 1
     with pytest.raises(ValueError, match="different contents"):
         c.api.request(dict(message, note="changed"))
     assert state.carousel_load()["sequence"] == 1
@@ -541,6 +591,7 @@ def test_duplicate_replace_never_starts_a_second_swap(coordinated):
     c.api.request(replace_message())
     c.finish()
     assert c.pal.log == ["unload", "place", "unload", "place"]
+    assert c.pal.parks == 2
     assert state.carousel_load()["sequence"] == 2
     assert set(status(c)["replacements"]) >= {rid}
 
@@ -576,6 +627,7 @@ def test_empty_stock_seat_waits_for_the_operator_without_failing_the_session(coo
     assert state.carousel_load()["sequence"] == 0
     assert c.api.request(dict(message))["state"] == "waiting_for_stock"   # still no replay
     assert c.pal.log == ["unload", "place"]
+    assert c.pal.parks == 1
     # PALsystem can end the session; the operator's Place New Carousel finishes the job.
     assert c.api.request({"version": 1, "run_id": RUN, "op": "end"})["active"] is False
     c.pal.place_error = None
@@ -667,6 +719,7 @@ def test_replace_turns_the_table_before_the_unload(coordinated, monkeypatch):
     c.finish()
     turn = ("turn", pytest.approx(SLOT_4))
     assert c.pal.log == [turn, "unload", turn, "place"]   # the second turn is already there
+    assert c.pal.parks == 1
     assert status(c)["replacements"][rid]["state"] == "committed"
     assert state.get_carousel_slot() == 4
 
@@ -727,11 +780,234 @@ def test_replace_is_refused_before_the_unload_when_the_table_cannot_turn(coordin
     assert c.api.record.get("replacements", {}) == {}
 
 
+def test_replace_is_refused_while_a_flowcell_was_never_tracked(coordinated, monkeypatch):
+    # A station that uses only flowcell 1 never tracks flowcell 2, which reads unknown:
+    # every swap is refused until the operator declares where it is (the README says so).
+    c = coordinated
+    monkeypatch.setattr(state, "get_carousel_place_alignment_slot", lambda: 4)
+    c.server.motor = FakeMotor(c.pal.log)
+    assert state.get_flowcell_location(2) == state.UNKNOWN
+    with pytest.raises(ValueError, match=r"flowcell 2 must be at its cleaning station or the "
+                                         r"beam .*\(flowcell 2: unknown\)"):
+        c.api.request(replace_message())
+    assert c.started == [] and c.pal.log == []
+    assert c.api.record.get("replacements", {}) == {}
+    # PALmixer refuses set_location during a session, so it is declared before one opens.
+    assert c.server.fast_dispatch("set_location flowcell_2 cleaning_station").startswith("ERROR")
+    state.set_location(state.WHAT_FLOWCELL_2, state.FC_AT_CLEANING)   # what that command does
+    rid = replace_message()["replacement_id"]
+    c.api.request(replace_message(rid))
+    c.finish()
+    assert status(c)["replacements"][rid]["state"] == "committed"
+
+
+# -- a swap ends with the standard park, which sets cleanup.parked again ---------------
+def test_replace_parks_the_arm_before_reporting_committed(coordinated):
+    c = coordinated
+    # The last sample's unload parked; the swap's worker action clears that.
+    c.server.workflows._step("park_at_transfer_point", lambda: "parked")
+    message = replace_message()
+    rid = message["replacement_id"]
+    during = {}
+    c.pal.during_park = lambda: during.update(
+        record=persisted(c, rid), parked=c.server.workflows.cleanup_snapshot()["parked"])
+    c.api.request(message)
+    c.finish()
+    assert c.pal.log == ["unload", "place"]
+    assert c.pal.parks == 1
+    # The park comes after the load is recorded, and before committed is reported.
+    assert during["record"]["state"] == "parking" and during["record"]["load"]["sequence"] == 1
+    assert during["parked"] is False
+    final = status(c)["replacements"][rid]
+    assert final["state"] == "committed" and final["load"] == during["record"]["load"]
+    assert c.server.workflows.cleanup_snapshot()["parked"] is True
+    assert c.server._last_result["ok"] is True
+    assert c.server._last_result["detail"].endswith(
+        "; every slot cleared (carousel load 1); arm parked")
+
+
+def test_a_carousel_taken_back_during_the_swap_is_named_in_its_result(coordinated):
+    c = coordinated
+    note = ("carousel 35 did not land (its top is 6.0 mm above the seat) and was moved to the "
+            "used stack, unused; carousel 37 placed instead")
+    c.pal.place_notes = [note]
+    rid = replace_message()["replacement_id"]
+    c.api.request(replace_message(rid))
+    c.finish()
+    assert status(c)["replacements"][rid]["state"] == "committed"
+    assert note in c.server._last_result["detail"]
+    assert c.pal.log == ["unload", "place"]
+    assert c.pal.parks == 1
+    assert c.server.workflows.cleanup_snapshot()["parked"] is True
+
+
+EMPTY_STOCK = "no carousel at carousel_in_stock: looked for tag(s) [32], tags in view []"
+EMPTY_AFTER_A_TAKE_BACK = EMPTY_STOCK + (". Carousel 35 did not land and was moved to the used "
+                                         "stack, unused; load a fresh carousel and press Place "
+                                         "New Carousel.")
+
+
+@pytest.mark.parametrize("text", [EMPTY_STOCK, EMPTY_AFTER_A_TAKE_BACK],
+                         ids=["empty", "empty_after_a_take_back"])
+def test_empty_stock_seat_parks_and_keeps_the_placement_error(coordinated, text):
+    c = coordinated
+    c.pal.place_error = FakePAL.NoCarouselError(text)
+    message = replace_message()
+    rid = message["replacement_id"]
+    during = []
+    c.pal.during_park = lambda: during.append(persisted(c, rid))
+    c.api.request(message)
+    c.finish()
+    assert c.pal.log == ["unload", "place"]
+    assert c.pal.parks == 1
+    assert [(r["state"], r["detail"]) for r in during] == [("parking", text)]
+    record = status(c)["replacements"][rid]
+    assert (record["state"], record["error"], record["detail"]) == (
+        "waiting_for_stock", NO_STOCK_MESSAGE, text)
+    assert "load" not in record
+    assert c.server.workflows.cleanup_snapshot()["parked"] is True
+    result = c.server._last_result
+    assert result["ok"] is True
+    assert result["detail"].startswith("carousel unloaded to the used stack (tag 33")
+    # Then what to do: the session error stays empty, so PALmixer's result line is
+    # where an operator at PALmixer reads it.
+    assert result["detail"].endswith("; %s; arm parked; %s" % (text, NO_STOCK_MESSAGE))
+    # Nothing was cleared, and the session stays usable: PALsystem can end it.
+    assert sorted(state.carousel_samples()) == [1, 2, 5] and state.carousel_load()["sequence"] == 0
+    assert c.api.record["error"] == "" and c.api.coordinator.snapshot()["error"] == ""
+    assert c.api.request({"version": 1, "run_id": RUN, "op": "end"})["active"] is False
+
+
+def test_a_failed_seat_check_fails_in_placing_without_parking(coordinated):
+    c = coordinated
+    # The last sample's unload parked; a failed swap must not leave that standing.
+    c.server.workflows._step("park_at_transfer_point", lambda: "parked")
+    error = FakePAL.CarouselNotSeatedError(
+        "the carousel did not land: nothing felt down to 20 mm below the seat")
+    c.pal.place_error = error
+    rid = replace_message()["replacement_id"]
+    c.api.request(replace_message(rid))
+    c.finish()
+    record = status(c)["replacements"][rid]
+    assert (record["state"], record["failed_phase"], record["error"]) == (
+        "failed", "placing", str(error))
+    # The arm stays where the check left it, for the operator to inspect the mixer.
+    assert c.pal.log == ["unload", "place"]
+    assert c.server.workflows.cleanup_snapshot()["parked"] is False
+    assert c.api.record["error"] == str(error)
+    assert c.api.coordinator.snapshot()["error"] == str(error)
+    assert c.server._last_result["ok"] is False
+    assert sorted(state.carousel_samples()) == [1, 2, 5] and state.carousel_load()["sequence"] == 0
+    with pytest.raises(ValueError, match="did not land"):
+        c.api.request(replace_message())               # no further motion until reconciled
+
+
+@pytest.mark.parametrize("stock", ["fresh", "empty"])
+def test_a_failed_park_fails_the_swap_in_parking(coordinated, stock):
+    c = coordinated
+    # The last sample's unload parked; a failed swap must not leave that standing.
+    c.server.workflows._step("park_at_transfer_point", lambda: "parked")
+    if stock == "empty":
+        c.pal.place_error = FakePAL.NoCarouselError(EMPTY_STOCK)
+    c.pal.park_error = RuntimeError("protective stop on the way to the transfer point")
+    rid = replace_message()["replacement_id"]
+    c.api.request(replace_message(rid))
+    c.finish()
+    # The error says what the swap had done before the park, then why the park failed.
+    done = (EMPTY_STOCK if stock == "empty" else
+            "new carousel placed on the mixer (tag 37, arm at [0.4, 0.5, 0.6]); "
+            "every slot cleared (carousel load 1)")
+    error = "%s; parking the arm failed: protective stop on the way to the transfer point" % done
+    record = status(c)["replacements"][rid]
+    assert (record["state"], record["failed_phase"], record["error"]) == (
+        "failed", "parking", error)
+    assert c.pal.log == ["unload", "place"]
+    assert c.pal.parks == 1
+    assert c.server.workflows.cleanup_snapshot()["parked"] is False
+    assert c.api.record["error"] == error
+    assert c.api.coordinator.snapshot()["error"] == error
+    assert c.server._last_result["ok"] is False and c.server._last_result["detail"] == error
+    with pytest.raises(ValueError, match="protective stop"):
+        c.api.request(replace_message())               # no further motion until reconciled
+    if stock == "fresh":
+        # Seated and recorded before the park: the load stands and every slot is free.
+        assert record["load"]["sequence"] == 1
+        assert state.carousel_load()["record"] == record["load"]
+        assert state.carousel_samples() == {}
+    else:
+        assert record["detail"] == EMPTY_STOCK and "load" not in record
+        assert sorted(state.carousel_samples()) == [1, 2, 5]
+        assert state.carousel_load()["sequence"] == 0
+
+
+@pytest.mark.parametrize("stock", ["seated", "empty"])
+def test_a_failed_park_after_a_take_back_still_names_the_rejected_carousel(coordinated, stock):
+    c = coordinated
+    if stock == "seated":
+        placement = TAKEN_BACK
+        c.pal.place_notes = [TAKEN_BACK]
+    else:
+        placement = EMPTY_AFTER_A_TAKE_BACK
+        c.pal.place_error = FakePAL.NoCarouselError(EMPTY_AFTER_A_TAKE_BACK)
+    c.pal.park_error = RuntimeError("protective stop")
+    rid = replace_message()["replacement_id"]
+    c.api.request(replace_message(rid))
+    c.finish()
+    record = status(c)["replacements"][rid]
+    assert (record["state"], record["failed_phase"]) == ("failed", "parking")
+    # An unused carousel is on the used stack now. The record, the latched session error
+    # that PALsystem reports and the action's result line all still say so.
+    for text in (record["error"], c.api.record["error"], c.server._last_result["detail"]):
+        assert placement in text and text.endswith("; parking the arm failed: protective stop")
+
+
+def test_placement_off_parks_before_reporting_waiting_for_carousel(coordinated, monkeypatch):
+    c = coordinated
+    monkeypatch.setattr(preparation_api, "auto_place_new_carousel", lambda: False)
+    rid = replace_message()["replacement_id"]
+    during = []
+    c.pal.during_park = lambda: during.append(persisted(c, rid)["state"])
+    c.api.request(replace_message(rid))
+    c.finish()
+    assert during == ["parking"]
+    assert status(c)["replacements"][rid]["state"] == "waiting_for_carousel"
+    assert c.pal.log == ["unload"] and c.pal.parks == 1
+    assert c.server._last_result["detail"].endswith(
+        "; arm parked; " + preparation_api.WAITING_FOR_CAROUSEL_MESSAGE)
+
+
+def test_a_failed_park_with_placement_off_fails_in_parking(coordinated, monkeypatch):
+    c = coordinated
+    monkeypatch.setattr(preparation_api, "auto_place_new_carousel", lambda: False)
+    c.pal.park_error = RuntimeError("protective stop")
+    rid = replace_message()["replacement_id"]
+    c.api.request(replace_message(rid))
+    c.finish()
+    record = status(c)["replacements"][rid]
+    assert (record["state"], record["failed_phase"]) == ("failed", "parking")
+    # The error says the old carousel is already off, then why the park failed.
+    assert record["error"].startswith("carousel unloaded to the used stack (tag 33")
+    assert record["error"].endswith("; parking the arm failed: protective stop")
+    assert c.api.record["error"] == record["error"]
+    assert c.server.workflows.cleanup_snapshot()["parked"] is False
+
+
+def test_state_advertises_that_a_swap_ends_parked(coordinated):
+    c = coordinated
+    # The few attributes get_state reads that the bare test server lacks.
+    c.server.pump = SimpleNamespace(speed=800.0, min_rpm=0.0, max_rpm=3000.0)
+    c.server._pump_status = c.server._last_mixing_record = None
+    snapshot = json.loads(c.server.fast_dispatch(cmd.GET_STATE))
+    assert snapshot["preparation"]["replace_parks_version"] == 1
+
+
 # -- placement blocked: the operator seats the carousel and presses Reset --------------
 def test_blocked_placement_stops_after_unload_and_reset_finishes_it(coordinated, journal, monkeypatch):
     c = coordinated
     monkeypatch.setattr(preparation_api, "auto_place_new_carousel", lambda: False)
     save_mix(journal, "S-one", UID_ONE)
+    # The last sample's unload parked; the swap's worker action clears that.
+    c.server.workflows._step("park_at_transfer_point", lambda: "parked")
     message = replace_message()
     rid = message["replacement_id"]
     c.api.request(message)
@@ -740,12 +1016,16 @@ def test_blocked_placement_stops_after_unload_and_reset_finishes_it(coordinated,
     assert record["state"] == "waiting_for_carousel"
     assert record["error"] == preparation_api.WAITING_FOR_CAROUSEL_MESSAGE
     assert c.pal.log == ["unload"]                      # no robot placement
+    # It still parks, clear of the mixer, before waiting for the person seating one.
+    assert c.pal.parks == 1 and c.server.workflows.cleanup_snapshot()["parked"] is True
     assert sorted(state.carousel_samples()) == [1, 2, 5]  # nothing cleared yet
     assert c.api.record["error"] == "" and c.server._last_result["ok"] is True
     # The session is still open, yet Reset is accepted while the swap waits for it.
     assert c.api.active and c.server.fast_dispatch("reset_carousel") == "OK"
     record = status(c)["replacements"][rid]
     assert record["state"] == "committed" and record["placed_by"] == "operator"
+    # Reset moves nothing: the arm is still parked where the swap left it.
+    assert c.server.workflows.cleanup_snapshot()["parked"] is True
     load = record["load"]
     assert (load["old_tag"], load["new_tag"], load["replacement_id"]) == ("33", "unknown", rid)
     assert [(s["slot"], s["mixed"]) for s in load["slots"]] == [(1, True), (2, False), (5, False)]
