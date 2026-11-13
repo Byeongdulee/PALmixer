@@ -41,9 +41,9 @@ under the same identity is refused.
 | `accepted` | Persisted; no motion yet |
 | `unloading` | Unload running |
 | `old_removed` | Old carousel is on the used stack |
-| `placing` | Placement running: the table turns to the alignment slot, then the arm places |
+| `placing` | Placement running: the table turns to the alignment slot, the arm places, and the height check confirms the carousel landed (a carousel felt at the wrong height is taken back to the used stack once and a fresh one placed) |
 | `committed` | Placed; `load` holds the carousel-load record and every slot is free |
-| `waiting_for_stock` | Stock seat empty after the unload. The session stays usable so PALsystem can end it. The operator loads a carousel and presses **Place New Carousel** on PALmixer, which records the load. |
+| `waiting_for_stock` | Stock seat empty after the unload, or after a placed carousel that did not land was taken back to the used stack. The session stays usable so PALsystem can end it. The operator loads a carousel and presses **Place New Carousel** on PALmixer, which records the load. |
 | `failed` | Any other error. `failed_phase` says whether unloading or placing failed. The session error is latched and the coordinator is invalidated, as for other motion operations, with no replay. |
 
 ## Update: version-1 live test endpoint

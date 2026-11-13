@@ -1527,9 +1527,12 @@ class PALmixerServer:
             time.sleep(2)
             detail = "simulated place_new_carousel"
         else:
-            pose = self.PAL12idb.place_new_carousel(self.rob)
+            notes = []          # a carousel that did not land and was taken back, if any
+            pose = self.PAL12idb.place_new_carousel(self.rob, notes=notes)
             detail = "new carousel placed on the mixer (tag %s, arm at %s)" % (
                 state.get_carousel_on_mixer(), pose)
+            if notes:
+                detail = "%s; %s" % (detail, "; ".join(notes))
         if turned:
             detail = "%s; %s" % (turned, detail)
         load = state.record_carousel_load(state.get_carousel_on_mixer(),

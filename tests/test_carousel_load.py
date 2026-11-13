@@ -162,6 +162,7 @@ class FakePAL:
         self.log = []
         self.missing = []
         self.unload_error = self.place_error = None
+        self.place_notes = []
         self.during_unload = self.during_place = lambda: None
 
     def check_positions_defined(self, keys):
@@ -176,8 +177,10 @@ class FakePAL:
         state.set_carousel_on_mixer(None)
         return [0.1, 0.2, 0.3]
 
-    def place_new_carousel(self, robot):
+    def place_new_carousel(self, robot, notes=None):
         self.log.append("place")
+        if notes is not None:
+            notes.extend(self.place_notes)
         state.set_carousel_on_mixer(None)
         self.during_place()
         if self.place_error:
@@ -215,6 +218,15 @@ def test_place_button_frees_every_slot_and_reports_the_load(server, journal):
     assert (record["old_tag"], record["new_tag"], record["replacement_id"]) == ("32", "37", None)
     assert [s["mixed"] for s in record["slots"]] == [True, False, False]
     assert state.get_carousel_id() == "tray-A"
+
+
+def test_a_rejected_carousel_is_named_in_the_reply(server):
+    server.PAL12idb.place_notes = ["carousel 35 did not land (its top is 6.0 mm above the "
+                                   "seat) and was moved to the used stack, unused; carousel "
+                                   "37 placed instead"]
+    reply = server._place_new_carousel()
+    assert "tag 37" in reply and "carousel 35 did not land" in reply
+    assert "every slot cleared (carousel load 1)" in reply
 
 
 @pytest.mark.parametrize("error", [RuntimeError("protective stop"),

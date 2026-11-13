@@ -929,6 +929,24 @@ Mixer position it was recorded against and moves with it when that is
 re-taught; its angle stays as recorded. Until one is recorded, placement bumps
 down to seat instead.
 
+**Placement checks that the carousel landed.** After the release, **Place New
+Carousel** lifts the open gripper clear, closes it and bumps straight down onto
+the carousel top -- the same contact **Unload Current Carousel** measures the
+seat with. The top has to be within 2 mm of where a seated carousel's top is:
+the taught **Carousel on Mixer** Z less the 60 mm the teach backs off. A pass is
+saved as the measured seat. A carousel felt at the wrong height -- there, but
+not down on the platform -- is taken back off onto the used stack and one fresh
+carousel from stock is placed and checked the same way; the reply names the
+rejected, unused carousel, the load record keeps the spent carousel as
+`old_tag`, and the bump on the rejected one is not kept as the seat. The
+placement stops for the operator -- the mixer's carousel `unknown`, no carousel
+load recorded -- when nothing is felt down to 20 mm below the seat (where the
+carousel went is unknown), when taking it back off fails, when the fresh
+carousel misses too, or when there is no fresh carousel in stock: then load one
+and press **Place New Carousel**. A coordinated swap waits in
+`waiting_for_stock` for the last case and ends `failed` in `placing` for the
+others. (`PAL12idb.CAROUSEL_SEAT_CHECK_*`.)
+
 **Robot placement in a coordinated swap is a setting.** With
 `carousel.auto_place_new_carousel` `true` in `json/palmixer_config.json`, a
 coordinated `replace_carousel` unloads the old carousel and places the new one

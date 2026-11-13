@@ -3900,6 +3900,17 @@ CAROUSEL_PLACE_STANDOFF = 0.010
 # the carousel slides in under the retainer already lined up; turning after the
 # slide-in is too late, it jams on the way in.
 CAROUSEL_PLACE_RZ_DEG = 19.0
+# After the release the place checks the carousel really is down on the platform:
+# _check_carousel_seated lifts the open gripper clear, closes it and bumps straight
+# down onto the carousel top -- the contact the unload measures the seat with --
+# and wants it within CAROUSEL_SEAT_CHECK_TOL of where a seated carousel's top is:
+# the taught Carousel on Mixer Z less CAROUSEL_TEACH_BACKOFF (the teach bumps that
+# top, then backs off). The bump starts CAROUSEL_SEAT_CHECK_ABOVE over it and goes
+# at most CAROUSEL_SEAT_CHECK_BELOW under it, so a missing carousel is felt as no
+# contact rather than a long dive.
+CAROUSEL_SEAT_CHECK_ABOVE = 0.020    # m
+CAROUSEL_SEAT_CHECK_BELOW = 0.020    # m
+CAROUSEL_SEAT_CHECK_TOL = 0.002      # m
 # The carousel acquire spends longer than the default on centring: the arm
 # arrives right after a move with the camera still refocusing, and a mis-centred
 # grab is costly. Longer detect/centre settle (seconds the camera keeps
@@ -4255,8 +4266,129 @@ def unload_current_carousel(robot):
     return list(robot.get_pos())
 
 
-def place_new_carousel(robot):
-    """Bring a fresh carousel from the stock position onto the mixer.
+class CarouselNotSeatedError(RuntimeError):
+    """The height check after a placement did not find the carousel down on the
+    platform. A RuntimeError like every other placement failure, so callers treat
+    it the same; its own type names the cause. `felt` is False when nothing was
+    felt at all -- the carousel is not where it was put, and where it went is
+    unknown."""
+
+    def __init__(self, message, felt=True):
+        super().__init__(message)
+        self.felt = felt
+
+
+def _check_carousel_seated(robot, expected_top):
+    """Feel for the placed carousel's top after the release; refuse unless it is
+    down on the platform.
+
+    Lifts the open gripper straight up clear of the carousel, closes it fully and
+    bumps straight down -- the closed-fingertip contact _grab_carousel measures the
+    mixer seat with -- from CAROUSEL_SEAT_CHECK_ABOVE over `expected_top` (where a
+    seated carousel's top is: the taught Carousel on Mixer Z less
+    CAROUSEL_TEACH_BACKOFF) to at most CAROUSEL_SEAT_CHECK_BELOW under it.
+    Within CAROUSEL_SEAT_CHECK_TOL the contact is recorded as the measured mixer
+    seat and its Z returned. Otherwise the arm lifts CAROUSEL_CLEAR_LIFT and
+    CarouselNotSeatedError is raised: carousel_on_mixer stays unknown, and the
+    server records no carousel load.
+    """
+    now = robot.get_pos()[2]
+    start = max(now, expected_top + CAROUSEL_SEAT_CHECK_ABOVE)
+    if start > now:
+        robot.mvr2z(start - now)                        # straight up, open fingers clear of the top
+    close_gripper_fully(robot)                          # closed fingertips, as the seat is measured
+    robot.bump(z=-(start - expected_top + CAROUSEL_SEAT_CHECK_BELOW), backoff=0.0)
+    pos = robot.get_pos()
+    error = pos[2] - expected_top
+    print("place check: carousel top at Z %.4f, %+.1f mm from the seat (%.4f)"
+          % (pos[2], error * 1000, expected_top))
+    if abs(error) <= CAROUSEL_SEAT_CHECK_TOL:
+        state.set_carousel_mixer_seat(pos[:3])
+        return pos[2]
+    robot.mvr2z(CAROUSEL_CLEAR_LIFT)                    # lift clear before reporting
+    felt = error >= -CAROUSEL_SEAT_CHECK_BELOW + 0.0005
+    if not felt:
+        what = ("nothing was felt down to %.0f mm below the seat -- the carousel is "
+                "not there" % (CAROUSEL_SEAT_CHECK_BELOW * 1000))
+    elif error > 0:
+        what = ("its top is %.1f mm above the seat -- it is not down on the platform"
+                % (error * 1000))
+    else:
+        what = "its top is %.1f mm below the seat" % (-error * 1000)
+    raise CarouselNotSeatedError(
+        "the new carousel did not land on the platform: %s (seat Z %.4f, felt %.4f, "
+        "tolerance %.1f mm). The arm has lifted clear; check the mixer by eye before "
+        "going on." % (what, expected_top, pos[2], CAROUSEL_SEAT_CHECK_TOL * 1000),
+        felt=felt)
+
+
+def _unload_misplaced_carousel(robot, why):
+    """Take a carousel that did not land back off the mixer, onto the used stack.
+
+    The normal unload (camera, grab, slide out, stack on top), with two records put
+    back afterwards, since this carousel was never seated or used: the next
+    carousel-load record's old tag stays the spent carousel's, and the bump on the
+    misplaced carousel is not kept as the measured mixer seat. Returns the tag the
+    unload read. Any failure is raised as a plain RuntimeError -- never
+    NoCarouselError, which callers read as an empty stock seat.
+    """
+    spent = state.get_last_unloaded_carousel()
+    seat = state.get_carousel_mixer_seat()
+    try:
+        unload_current_carousel(robot)
+        return state.get_last_unloaded_carousel()
+    except Exception as e:                              # noqa: BLE001 -- reported, not swallowed
+        raise RuntimeError(
+            "the new carousel did not land (%s), and taking it back off failed: %s. "
+            "Stopping for the operator." % (why, e)) from e
+    finally:
+        state.set_last_unloaded_carousel(spent)
+        state.set_carousel_mixer_seat(seat)
+
+
+def place_new_carousel(robot, notes=None):
+    """Bring a fresh carousel from the stock position onto the mixer, and make sure
+    it landed.
+
+    One placement (_place_carousel_once), checked by feel after the release
+    (_check_carousel_seated). A carousel felt at the wrong height -- there, but not
+    down on the platform -- is taken back off onto the used stack
+    (_unload_misplaced_carousel) and one fresh carousel is placed instead, checked
+    the same way. That placement starts with the usual stock check, which stops it
+    with NoCarouselError when there is no fresh carousel, so a person loads one.
+    Anything else stops for the operator: nothing felt at all (where the carousel
+    went is unknown), the take-back failing, or the fresh carousel missing too.
+    `notes`, a list, receives a line for the reply when a carousel was rejected.
+    MOVES the robot. Returns the arm's final position.
+    """
+    try:
+        return _place_carousel_once(robot)
+    except CarouselNotSeatedError as miss:
+        if not miss.felt:
+            raise
+        first = str(miss)
+    print("place: %s -- taking it back off and placing a fresh one" % first)
+    rejected = _unload_misplaced_carousel(robot, first)
+    try:
+        pose = _place_carousel_once(robot)
+    except NoCarouselError as e:
+        raise NoCarouselError(
+            "%s. Carousel %s did not land and was moved to the used stack, unused; "
+            "load a fresh carousel and press Place New Carousel." % (e, rejected)) from e
+    except CarouselNotSeatedError as again:
+        raise CarouselNotSeatedError(
+            "the fresh carousel did not land either: %s Carousel %s, the first one, is "
+            "on the used stack, unused." % (again, rejected), felt=again.felt) from again
+    note = ("carousel %s did not land (%s) and was moved to the used stack, unused; "
+            "carousel %s placed instead" % (rejected, first, state.get_carousel_on_mixer()))
+    print("place: " + note)
+    if notes is not None:
+        notes.append(note)
+    return pose
+
+
+def _place_carousel_once(robot):
+    """One placement: bring a fresh carousel from the stock position onto the mixer.
 
     Carry clear, swing the camera over the stock seat, grab the new carousel,
     carry it to 120 mm above the mixer, and set it down onto the mixer seat --
@@ -4264,7 +4396,9 @@ def place_new_carousel(robot):
     With a carousel place pose recorded, it comes down beside the seat to that
     pose's height, turns to its angle there, slides straight in along table +X
     onto it and lets go. Without one, it slides in along the reverse (+X / -Z)
-    of the unload lift and bumps to the seat.
+    of the unload lift and bumps to the seat. Either way, after the release it
+    feels for the carousel top (_check_carousel_seated) and stops with
+    CarouselNotSeatedError unless the carousel is down on the platform.
     MOVES the robot. Requires carousel_in_stock and carousel_on_mixer taught.
 
     Not @_tracks-decorated like the transports: the tracked value is the tag id
@@ -4352,7 +4486,12 @@ def place_new_carousel(robot):
         print("place seating: after bump %s" % _pose_str(robot))
     robot.release()
     print("place seating: after release %s" % _pose_str(robot))
+    # Height check against the taught Carousel on Mixer pose: is the carousel down
+    # on the platform? Raises -- arm lifted clear, carousel_on_mixer still unknown --
+    # when it is not.
+    _check_carousel_seated(robot, mixer[2] - CAROUSEL_TEACH_BACKOFF)
     robot.mvr2z(CAROUSEL_CLEAR_LIFT)                     # retract clear
+    robot.release()                                      # open again: the check closed the fingers
     print("place seating: after retract %s" % _pose_str(robot))
     # Record which carousel is now on the mixer (overrides the @_tracks default).
     state.set_carousel_on_mixer(tag)
