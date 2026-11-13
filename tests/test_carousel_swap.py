@@ -44,7 +44,7 @@ class FakeRobot:
         self.tcp_sets = []
         self.camera = types.SimpleNamespace(QRdistance=0.20)
         self.gripper = FakeGripper(self.log)
-        self.floor = None           # Z a bump stops at (contact); None: bumps do not move
+        self.floor = None           # Z a bump stops at, or f(x, y) -> Z; None: bumps do not move
     def set_tcp(self, tcp):
         which = ("gripper" if list(tcp) == list(self.tcp) else
                  "camera" if list(tcp) == list(self.camtcp) else "other")
@@ -72,8 +72,9 @@ class FakeRobot:
                          [round(self.pos[0], 6), round(self.pos[1], 6)]))
     def bump(self, z=-1, backoff=0.0, **k):
         self.log.append(("bump", z, backoff))
-        if self.floor is not None and self.pos[2] > self.floor:
-            self.pos[2] = max(self.floor, self.pos[2] + z)  # contact, or the end of its travel
+        floor = self.floor(self.pos[0], self.pos[1]) if callable(self.floor) else self.floor
+        if floor is not None and self.pos[2] > floor:
+            self.pos[2] = max(floor, self.pos[2] + z)       # contact, or the end of its travel
     def release(self):
         self.log.append(("release",))
     def grab(self):
@@ -377,20 +378,131 @@ def test_seat_check_feels_the_top_and_records_the_seat(tmp_state):
     assert state.get_carousel_mixer_seat() == pytest.approx([0.512, -0.050, SEAT_TOP + 0.0005])
 
 
-@pytest.mark.parametrize("floor,match,felt", [
-    (SEAT_TOP + 0.006, "6.0 mm above the seat", True),
-    (SEAT_TOP - 0.006, "6.0 mm below the seat", True),
-    (SEAT_TOP - 0.100, "not there", False),
+@pytest.mark.parametrize("floor,match,kind", [
+    (SEAT_TOP + 0.006, "6.0 mm above the seat", "high"),
+    (SEAT_TOP - 0.006, "6.0 mm below the seat -- it has shifted or tipped", "low"),
+    (SEAT_TOP - 0.100, "not there", "missing"),
 ])
-def test_seat_check_refuses_a_carousel_that_did_not_land(tmp_state, floor, match, felt):
+def test_seat_check_refuses_a_carousel_that_did_not_land(tmp_state, floor, match, kind):
     rob = FakeRobot(pos=(0.512, -0.050, SEAT_TOP - 0.002))
     rob.floor = floor
     with pytest.raises(PAL12idb.CarouselNotSeatedError, match=match) as err:
         _REAL_SEAT_CHECK(rob, SEAT_TOP)
-    assert err.value.felt is felt              # only a carousel that was felt is taken back
+    assert err.value.kind == kind              # only a 'high' one is taken back
     assert rob.log[-1] == ("mvr2z", round(PAL12idb.CAROUSEL_CLEAR_LIFT, 6))   # lifted clear first
     assert state.get_carousel_mixer_seat() is None                            # nothing recorded
     assert issubclass(PAL12idb.CarouselNotSeatedError, RuntimeError)
+
+
+@pytest.mark.parametrize("offset,passes", [(0.0029, True), (-0.0019, True),
+                                            (0.0031, False), (-0.0021, False)])
+def test_seat_check_window_is_plus_3_minus_2_mm(tmp_state, offset, passes):
+    assert (PAL12idb.CAROUSEL_SEAT_CHECK_TOL_HIGH, PAL12idb.CAROUSEL_SEAT_CHECK_TOL_LOW,
+            PAL12idb.CAROUSEL_SEAT_CHECK_ABOVE,
+            PAL12idb.CAROUSEL_SEAT_CHECK_BELOW) == (0.003, 0.002, 0.020, 0.020)   # as agreed
+    rob = FakeRobot(pos=(0.512, -0.050, SEAT_TOP - 0.002))
+    rob.floor = SEAT_TOP + offset
+    if passes:
+        _REAL_SEAT_CHECK(rob, SEAT_TOP)
+    else:
+        with pytest.raises(PAL12idb.CarouselNotSeatedError):
+            _REAL_SEAT_CHECK(rob, SEAT_TOP)
+
+
+def test_seat_clear_check_feels_the_empty_seat_twice(stations, tmp_state):
+    over = stations["carousel_on_mixer"]
+    top = over[2] - PAL12idb.CAROUSEL_TEACH_BACKOFF
+    rob = FakeRobot()
+    rob.floor = top - 0.100                                   # nothing near the seat
+    PAL12idb._check_mixer_seat_clear(rob, "35")
+    log = rob.log
+    bumps = [i for i, e in enumerate(log) if e[0] == "bump"]
+    assert len(bumps) == 2
+    depth = -(PAL12idb.CAROUSEL_TEACH_BACKOFF + PAL12idb.CAROUSEL_SEAT_CHECK_BELOW)
+    assert all(log[i][1] == pytest.approx(depth) for i in bumps)
+    # The first probe is made from the taught Carousel on Mixer pose itself ...
+    first = [e for e in log[:bumps[0]] if e[0] == "moveto"][-1]
+    assert first[1] == pytest.approx(over, abs=1e-6)
+    assert log[bumps[0] - 1][0] == "close"
+    # ... the second over the slide-in start, at the same probe height.
+    second = [e for e in log[:bumps[1]] if e[0] == "moveto"][-1]
+    assert second[1][:2] == pytest.approx(list(PAL12idb._place_start_xy(over)), abs=1e-6)
+    assert second[1][2] == pytest.approx(over[2])
+    assert log[-1] == ("mvr2z", round(PAL12idb.CAROUSEL_CLEAR_LIFT, 6))   # lifted clear
+
+
+def test_seat_clear_check_feels_a_carousel_lost_at_the_slide_in_start(stations, tmp_state):
+    over = stations["carousel_on_mixer"]
+    top = over[2] - PAL12idb.CAROUSEL_TEACH_BACKOFF
+    sx, sy = PAL12idb._place_start_xy(over)
+    rob = FakeRobot()
+    rob.floor = lambda x, y: top if abs(x - sx) < 1e-6 and abs(y - sy) < 1e-6 else top - 0.1
+    with pytest.raises(PAL12idb.MixerSeatNotClearError, match="X %.4f Y %.4f" % (sx, sy)):
+        PAL12idb._check_mixer_seat_clear(rob, "35")
+    assert len([e for e in rob.log if e[0] == "bump"]) == 2
+    assert rob.log[-1] == ("mvr2z", round(PAL12idb.CAROUSEL_CLEAR_LIFT, 6))
+
+
+@pytest.mark.parametrize("floor_below_top,clear", [(0.019, False), (0.0205, True)])
+def test_seat_clear_check_threshold_is_just_above_the_bottom(stations, tmp_state,
+                                                             floor_below_top, clear):
+    top = stations["carousel_on_mixer"][2] - PAL12idb.CAROUSEL_TEACH_BACKOFF
+    rob = FakeRobot()
+    rob.floor = top - floor_below_top
+    if clear:
+        PAL12idb._check_mixer_seat_clear(rob, "35")
+    else:
+        with pytest.raises(PAL12idb.MixerSeatNotClearError):
+            PAL12idb._check_mixer_seat_clear(rob, "35")
+
+
+@pytest.mark.parametrize("left", [0.0, 0.006, -0.015])
+def test_seat_clear_check_stops_on_anything_left(stations, tmp_state, left):
+    top = stations["carousel_on_mixer"][2] - PAL12idb.CAROUSEL_TEACH_BACKOFF
+    rob = FakeRobot()
+    rob.floor = top + left                                    # seated, high, or shifted low
+    with pytest.raises(PAL12idb.MixerSeatNotClearError, match="carousel 35 did not land") as err:
+        PAL12idb._check_mixer_seat_clear(rob, "35")
+    assert "look at the gripper first" in str(err.value)
+    assert "used stack" not in str(err.value)
+    assert rob.log[-1] == ("mvr2z", round(PAL12idb.CAROUSEL_CLEAR_LIFT, 6))   # lifted first
+    assert issubclass(PAL12idb.MixerSeatNotClearError, RuntimeError)
+    assert not issubclass(PAL12idb.MixerSeatNotClearError, PAL12idb.NoCarouselError)
+
+
+@pytest.mark.parametrize("case", ["taught", "measured_seat", "recorded_pose"])
+def test_place_start_xy_is_where_the_landing_starts(stations, quiet_camera, tmp_state,
+                                                    monkeypatch, case):
+    monkeypatch.setattr(PAL12idb, "_acquire_carousel", lambda r, s, **k: (37, 0.20))
+    monkeypatch.setattr(PAL12idb, "_grab_carousel",
+                        lambda r, station, dist: r.log.append(("grab",)))
+    if case == "measured_seat":
+        state.set_carousel_mixer_seat([0.412, 0.097, 0.264])
+    elif case == "recorded_pose":
+        monkeypatch.setattr(PAL12idb, "get_carousel_place_pose", lambda: list(PLACE))
+    rob = FakeRobot()
+    PAL12idb.place_new_carousel(rob)
+    movetos = [e[1] for e in rob.log if e[0] == "moveto"]
+    start = movetos[-4] if case == "recorded_pose" else movetos[-2]   # the down-to-start
+    want = PAL12idb._place_start_xy(stations["carousel_on_mixer"])
+    assert start[:2] == pytest.approx(list(want), abs=1e-6)
+
+
+def test_place_with_the_real_check_saves_the_seat_and_marks_the_carousel(
+        stations, quiet_camera, tmp_state, monkeypatch):
+    monkeypatch.setattr(PAL12idb, "_check_carousel_seated", _REAL_SEAT_CHECK)
+    monkeypatch.setattr(PAL12idb, "_acquire_carousel", lambda r, s, **k: (37, 0.20))
+    monkeypatch.setattr(PAL12idb, "_grab_carousel",
+                        lambda r, station, dist: r.log.append(("grab",)))
+    top = stations["carousel_on_mixer"][2] - PAL12idb.CAROUSEL_TEACH_BACKOFF
+    rob = FakeRobot()
+    rob.floor = top + 0.0011                                  # a seated carousel reads +1.1 mm
+    PAL12idb.place_new_carousel(rob)
+    kinds = [e[0] for e in rob.log]
+    i = kinds.index("release")
+    assert kinds[i:] == ["release", "mvr2z", "close", "bump", "mvr2z", "release", "moveto"]
+    assert state.get_carousel_on_mixer() == "37"
+    assert state.get_carousel_mixer_seat()[2] == pytest.approx(top + 0.0011)
 
 
 def test_seat_check_never_moves_down_to_start(tmp_state):
@@ -406,12 +518,16 @@ def test_seat_check_never_moves_down_to_start(tmp_state):
 def recovery(stations, quiet_camera, tmp_state, monkeypatch):
     """place_new_carousel with scripted stock tags, height checks and take-backs."""
     script = types.SimpleNamespace(tags=[35, 36], checks=[], unload_error=None,
-                                   rob=FakeRobot())
+                                   unload_fails_late=None, seat_clear_error=None,
+                                   after_unload=None, rob=FakeRobot())
 
     def acquire(r, station, **k):
         if not script.tags:
             raise PAL12idb.NoCarouselError("no carousel at carousel_in_stock")
-        return script.tags.pop(0), 0.20
+        tag = script.tags.pop(0)
+        if isinstance(tag, Exception):
+            raise tag
+        return tag, 0.20
 
     def check(robot, expected):
         robot.log.append(("seat_check", round(expected, 6)))
@@ -425,52 +541,80 @@ def recovery(stations, quiet_camera, tmp_state, monkeypatch):
             raise script.unload_error
         state.set_last_unloaded_carousel(35)                # the tag the take-back reads
         state.set_carousel_mixer_seat([9.0, 9.0, 9.0])      # its bump on the misplaced one
+        if script.unload_fails_late:
+            raise script.unload_fails_late                  # after both records were written
         state.set_carousel_on_mixer(None)
+        if script.after_unload:
+            script.after_unload()
+
+    def seat_clear(robot, rejected):
+        robot.log.append(("seat_clear", rejected))
+        if script.seat_clear_error:
+            raise script.seat_clear_error
 
     monkeypatch.setattr(PAL12idb, "_acquire_carousel", acquire)
     monkeypatch.setattr(PAL12idb, "_grab_carousel",
                         lambda r, station, dist: r.log.append(("grab",)))
     monkeypatch.setattr(PAL12idb, "_check_carousel_seated", check)
     monkeypatch.setattr(PAL12idb, "unload_current_carousel", unload)
+    monkeypatch.setattr(PAL12idb, "_check_mixer_seat_clear", seat_clear)
     state.set_last_unloaded_carousel(32)                    # the spent carousel, owed to the load
     state.set_carousel_mixer_seat([0.512, -0.050, -0.2707])
     return script
 
 
 def _high():
-    return PAL12idb.CarouselNotSeatedError("its top is 6.0 mm above the seat")
+    return PAL12idb.CarouselNotSeatedError("its top is 6.0 mm above the seat", kind="high")
 
 
 def _milestones(rob):
-    return [e[0] for e in rob.log if e[0] in ("grab", "seat_check", "unload")]
+    return [e[0] for e in rob.log if e[0] in ("grab", "seat_check", "unload", "seat_clear")]
 
 
 def test_a_carousel_that_did_not_land_is_taken_back_and_a_fresh_one_placed(recovery):
     recovery.checks = [_high(), None]
     notes = []
     PAL12idb.place_new_carousel(recovery.rob, notes=notes)
-    assert _milestones(recovery.rob) == ["grab", "seat_check", "unload", "grab", "seat_check"]
+    assert _milestones(recovery.rob) == ["grab", "seat_check", "unload", "seat_clear",
+                                         "grab", "seat_check"]
+    assert ("seat_clear", "35") in recovery.rob.log
     assert state.get_carousel_on_mixer() == "36"
     assert state.get_last_unloaded_carousel() == "32"       # the load's old tag: still the spent one
     assert state.get_carousel_mixer_seat() == pytest.approx([0.512, -0.050, -0.2707])  # not its bump
     assert len(notes) == 1
     assert "carousel 35 did not land" in notes[0] and "used stack, unused" in notes[0]
     assert "carousel 36 placed instead" in notes[0]
+    assert "check the mixer by eye" not in notes[0]          # the short reason, not the stop advice
 
 
 def test_nothing_felt_stops_for_the_operator_without_a_take_back(recovery):
-    recovery.checks = [PAL12idb.CarouselNotSeatedError("nothing was felt", felt=False)]
+    recovery.checks = [PAL12idb.CarouselNotSeatedError("nothing was felt", kind="missing")]
     with pytest.raises(PAL12idb.CarouselNotSeatedError, match="nothing was felt"):
         PAL12idb.place_new_carousel(recovery.rob)
     assert _milestones(recovery.rob) == ["grab", "seat_check"]
     assert state.get_carousel_on_mixer() == state.UNKNOWN
 
 
+def test_a_carousel_felt_too_low_is_not_taken_back(recovery):
+    recovery.checks = [PAL12idb.CarouselNotSeatedError(
+        "its top is 4.0 mm below the seat -- it has shifted or tipped", kind="low")]
+    with pytest.raises(PAL12idb.CarouselNotSeatedError, match="shifted or tipped"):
+        PAL12idb.place_new_carousel(recovery.rob)
+    assert _milestones(recovery.rob) == ["grab", "seat_check"]   # no blind take-back
+    assert state.get_carousel_on_mixer() == state.UNKNOWN
+
+
+def test_the_error_kind_must_be_named():
+    with pytest.raises(ValueError):
+        PAL12idb.CarouselNotSeatedError("?", kind="wrong")
+
+
 def test_a_second_miss_stops_for_the_operator(recovery):
     recovery.checks = [_high(), _high()]
     with pytest.raises(PAL12idb.CarouselNotSeatedError, match="did not land either") as err:
         PAL12idb.place_new_carousel(recovery.rob)
-    assert "Carousel 35, the first one, is on the used stack" in str(err.value)
+    assert "Carousel 35, the first one, did not land" in str(err.value)
+    assert "is on the used stack, unused" in str(err.value)
     assert _milestones(recovery.rob).count("unload") == 1     # never a second take-back
     assert state.get_carousel_on_mixer() == state.UNKNOWN
 
@@ -478,11 +622,63 @@ def test_a_second_miss_stops_for_the_operator(recovery):
 def test_no_fresh_carousel_after_the_take_back_waits_for_a_person(recovery):
     recovery.tags = [35]                                       # only the one that missed
     recovery.checks = [_high()]
-    with pytest.raises(PAL12idb.NoCarouselError, match="moved to the used stack") as err:
+    with pytest.raises(PAL12idb.NoCarouselError, match="is on the used stack, unused") as err:
         PAL12idb.place_new_carousel(recovery.rob)
     assert "press Place New Carousel" in str(err.value)
-    assert _milestones(recovery.rob) == ["grab", "seat_check", "unload"]
+    assert _milestones(recovery.rob) == ["grab", "seat_check", "unload", "seat_clear"]
     assert state.get_last_unloaded_carousel() == "32"
+
+
+def test_a_take_back_that_left_the_carousel_stops_before_another_comes_down(recovery):
+    recovery.checks = [_high()]
+    recovery.seat_clear_error = PAL12idb.MixerSeatNotClearError("something is still on the seat")
+    with pytest.raises(PAL12idb.MixerSeatNotClearError) as err:
+        PAL12idb.place_new_carousel(recovery.rob)
+    assert "used stack" not in str(err.value)                 # not claimed while it may be there
+    assert _milestones(recovery.rob) == ["grab", "seat_check", "unload", "seat_clear"]
+    assert state.get_carousel_on_mixer() == state.UNKNOWN
+
+
+def test_a_faulted_seat_feel_says_the_seat_is_not_confirmed_clear(recovery):
+    recovery.checks = [_high()]
+    recovery.seat_clear_error = RuntimeError("Protective stopped")
+    with pytest.raises(RuntimeError, match="Protective stopped") as err:
+        PAL12idb.place_new_carousel(recovery.rob)
+    assert "not confirmed clear" in str(err.value)
+    assert "is on the used stack" not in str(err.value)
+    assert _milestones(recovery.rob) == ["grab", "seat_check", "unload", "seat_clear"]
+
+
+def test_the_success_note_carries_the_short_reason_from_the_real_check(recovery, stations,
+                                                                       monkeypatch):
+    monkeypatch.setattr(PAL12idb, "_check_carousel_seated", _REAL_SEAT_CHECK)
+    top = stations["carousel_on_mixer"][2] - PAL12idb.CAROUSEL_TEACH_BACKOFF
+    recovery.rob.floor = top + 0.006                          # the first one sits 6 mm high
+    recovery.after_unload = lambda: setattr(recovery.rob, "floor", top + 0.0011)
+    notes = []
+    PAL12idb.place_new_carousel(recovery.rob, notes=notes)
+    assert state.get_carousel_on_mixer() == "36"
+    assert len(notes) == 1 and "6.0 mm above the seat" in notes[0]
+    assert "check the mixer by eye" not in notes[0] and "window" not in notes[0]
+
+
+def test_take_back_records_are_put_back_even_when_it_fails_late(recovery):
+    recovery.checks = [_high()]
+    recovery.unload_fails_late = RuntimeError("protective stop in the slide-out")
+    with pytest.raises(RuntimeError, match="taking it back off failed"):
+        PAL12idb.place_new_carousel(recovery.rob)
+    assert state.get_last_unloaded_carousel() == "32"
+    assert state.get_carousel_mixer_seat() == pytest.approx([0.512, -0.050, -0.2707])
+    assert ("seat_clear", "35") not in recovery.rob.log
+
+
+def test_other_second_attempt_failures_name_the_rejected_carousel(recovery):
+    recovery.tags = [35, RuntimeError("could not centre the camera on the carousel")]
+    recovery.checks = [_high()]
+    with pytest.raises(RuntimeError, match="could not centre") as err:
+        PAL12idb.place_new_carousel(recovery.rob)
+    assert "Carousel 35, the first one, did not land" in str(err.value)
+    assert not isinstance(err.value, PAL12idb.NoCarouselError)
 
 
 def test_a_failed_take_back_is_not_read_as_an_empty_stock(recovery):

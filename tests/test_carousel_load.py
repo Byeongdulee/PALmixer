@@ -163,10 +163,15 @@ class FakePAL:
         self.missing = []
         self.unload_error = self.place_error = None
         self.place_notes = []
+        self.parks = 0
         self.during_unload = self.during_place = lambda: None
 
     def check_positions_defined(self, keys):
         return [k for k in keys if k in self.missing]
+
+    def goto_transfer_point(self, robot):
+        self.parks += 1
+        return [0.2, -0.19, 0.08]
 
     def unload_current_carousel(self, robot):
         self.log.append("unload")
@@ -218,6 +223,13 @@ def test_place_button_frees_every_slot_and_reports_the_load(server, journal):
     assert (record["old_tag"], record["new_tag"], record["replacement_id"]) == ("32", "37", None)
     assert [s["mixed"] for s in record["slots"]] == [True, False, False]
     assert state.get_carousel_id() == "tray-A"
+
+
+def test_place_button_needs_the_used_stack_for_a_take_back(server):
+    server.PAL12idb.missing = ["carousel_used_stack"]
+    with pytest.raises(ValueError, match="Used Carousel Stack"):
+        server._resolve(cmd.PLACE_NEW_CAROUSEL, [])
+    assert server.PAL12idb.log == []
 
 
 def test_a_rejected_carousel_is_named_in_the_reply(server):
@@ -291,6 +303,7 @@ SLOT_4 = 15.5 + 2 * 4.2
 @pytest.fixture
 def aligned(server, monkeypatch):
     monkeypatch.setattr(state, "get_carousel_place_alignment_slot", lambda: 4)
+    state.set_flowcell_location(2, state.FC_AT_CLEANING)
     server.motor = FakeMotor(server.PAL12idb.log)
     return server
 
@@ -313,6 +326,7 @@ def test_without_an_alignment_slot_the_table_stays_put(server):
     ("mixer_head", "mixer head must be at its cleaning station"),
     ("flowcell_in_gripper", "flowcell 1 must be at its cleaning station or the beam"),
     ("flowcell_unknown", "flowcell 1 must be at its cleaning station or the beam"),
+    ("other_flowcell_in_gripper", "flowcell 2 must be at its cleaning station or the beam"),
     ("untaught", "has not been taught"),
     ("slot_off_the_carousel", "slot"),
 ])
@@ -324,6 +338,8 @@ def test_place_is_refused_before_anything_moves_when_the_table_cannot_turn(
         state.set_flowcell_location(1, state.FC_IN_GRIPPER)
     elif obstacle == "flowcell_unknown":
         state.set_flowcell_location(1, state.UNKNOWN)
+    elif obstacle == "other_flowcell_in_gripper":
+        state.set_flowcell_location(2, state.FC_IN_GRIPPER)     # flowcell 1 is in use
     elif obstacle == "untaught":
         monkeypatch.setattr(state, "carousel_reference", lambda: None)
     else:
@@ -439,6 +455,8 @@ def coordinated(server, tracked, monkeypatch):
     monkeypatch.setattr(preparation_api, "auto_place_new_carousel", lambda: True)
     api = PreparationAPI(server, tracked / "session.json")
     server.preparation_api = api
+    server.workflows.pal = server.PAL12idb          # a finished swap parks the arm
+    server.workflows.robot = server.rob
     api.request({"version": 1, "run_id": RUN, "op": "begin"})
 
     def finish():
@@ -525,6 +543,20 @@ def test_duplicate_replace_never_starts_a_second_swap(coordinated):
     assert c.pal.log == ["unload", "place", "unload", "place"]
     assert state.carousel_load()["sequence"] == 2
     assert set(status(c)["replacements"]) >= {rid}
+
+
+def test_waiting_for_stock_after_a_take_back_names_the_rejected_carousel(coordinated):
+    c = coordinated
+    c.pal.place_error = FakePAL.NoCarouselError(
+        "no carousel at carousel_in_stock. Carousel 35, the first one, did not land (its "
+        "top is 6.0 mm above the seat) and is on the used stack, unused.")
+    rid = replace_message()["replacement_id"]
+    c.api.request(replace_message(rid))
+    c.finish()
+    record = status(c)["replacements"][rid]
+    assert record["state"] == "waiting_for_stock" and record["error"] == NO_STOCK_MESSAGE
+    assert "Carousel 35, the first one, did not land" in record["detail"]
+    assert "Carousel 35, the first one, did not land" in c.server._last_result["detail"]
 
 
 def test_empty_stock_seat_waits_for_the_operator_without_failing_the_session(coordinated):
@@ -625,21 +657,68 @@ def test_preconditions_refuse_before_accepting(coordinated, obstacle, match):
     assert sorted(state.carousel_samples()) == [1, 2, 5]
 
 
-def test_replace_turns_the_table_between_the_unload_and_the_placement(coordinated, monkeypatch):
+def test_replace_turns_the_table_before_the_unload(coordinated, monkeypatch):
     c = coordinated
     monkeypatch.setattr(state, "get_carousel_place_alignment_slot", lambda: 4)
+    state.set_flowcell_location(2, state.FC_AT_CLEANING)
     c.server.motor = FakeMotor(c.pal.log)
     rid = replace_message()["replacement_id"]
     c.api.request(replace_message(rid))
     c.finish()
-    assert c.pal.log == ["unload", ("turn", pytest.approx(SLOT_4)), "place"]
+    turn = ("turn", pytest.approx(SLOT_4))
+    assert c.pal.log == [turn, "unload", turn, "place"]   # the second turn is already there
     assert status(c)["replacements"][rid]["state"] == "committed"
     assert state.get_carousel_slot() == 4
+
+
+def test_replace_stops_before_the_unload_when_the_table_does_not_turn(coordinated, monkeypatch):
+    c = coordinated
+    monkeypatch.setattr(state, "get_carousel_place_alignment_slot", lambda: 4)
+    state.set_flowcell_location(2, state.FC_AT_CLEANING)
+    c.server.motor = FakeMotor(c.pal.log)
+    c.server.motor.error = RuntimeError("Galil did not answer")
+    rid = replace_message()["replacement_id"]
+    c.api.request(replace_message(rid))
+    c.finish()
+    record = status(c)["replacements"][rid]
+    assert (record["state"], record["failed_phase"]) == ("failed", "unloading")
+    assert "did not turn" in record["error"] and "Galil did not answer" in record["error"]
+    assert "nothing else moved" in record["error"]
+    assert c.pal.log == []                                   # the old carousel was not touched
+    assert sorted(state.carousel_samples()) == [1, 2, 5]
+    assert c.pal.parks == 0
+
+
+@pytest.mark.parametrize("ending", ["committed", "waiting_for_stock", "waiting_for_carousel"])
+def test_a_swap_that_ends_without_a_failure_parks_the_arm(coordinated, monkeypatch, ending):
+    c = coordinated
+    if ending == "waiting_for_stock":
+        c.pal.place_error = FakePAL.NoCarouselError("no carousel at carousel_in_stock")
+    elif ending == "waiting_for_carousel":
+        monkeypatch.setattr(preparation_api, "auto_place_new_carousel", lambda: False)
+    rid = replace_message()["replacement_id"]
+    c.api.request(replace_message(rid))
+    c.finish()
+    assert status(c)["replacements"][rid]["state"] == ending
+    assert c.pal.parks == 1
+    assert c.server.workflows.cleanup_snapshot()["parked"] is True
+
+
+def test_a_failed_swap_does_not_claim_the_arm_parked(coordinated):
+    c = coordinated
+    c.pal.place_error = RuntimeError("protective stop")
+    rid = replace_message()["replacement_id"]
+    c.api.request(replace_message(rid))
+    c.finish()
+    assert status(c)["replacements"][rid]["state"] == "failed"
+    assert c.pal.parks == 0
+    assert c.server.workflows.cleanup_snapshot()["parked"] is False
 
 
 def test_replace_is_refused_before_the_unload_when_the_table_cannot_turn(coordinated, monkeypatch):
     c = coordinated
     monkeypatch.setattr(state, "get_carousel_place_alignment_slot", lambda: 4)
+    state.set_flowcell_location(2, state.FC_AT_CLEANING)
     monkeypatch.setattr(state, "carousel_reference", lambda: None)
     c.server.motor = FakeMotor(c.pal.log)
     with pytest.raises(ValueError, match="has not been taught"):

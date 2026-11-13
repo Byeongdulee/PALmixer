@@ -31,7 +31,8 @@ these hold:
 
 The record is kept in `replacements[replacement_id]` and returned by `status`:
 `{replacement_id, action_id, request, state, error}`, plus `load` once
-committed and `failed_phase` on failure. It is persisted when the
+committed, `failed_phase` on failure, and `detail` (placement's own message) on
+`waiting_for_stock`. It is persisted when the
 request is accepted and again before each physical phase. A repeated identical
 request returns the record and never starts a second swap. A different request
 under the same identity is refused.
@@ -39,11 +40,11 @@ under the same identity is refused.
 | `state` | Meaning |
 | --- | --- |
 | `accepted` | Persisted; no motion yet |
-| `unloading` | Unload running |
+| `unloading` | Unload running; with robot placement on, the table first turns to the alignment slot |
 | `old_removed` | Old carousel is on the used stack |
-| `placing` | Placement running: the table turns to the alignment slot, the arm places, and the height check confirms the carousel landed (a carousel felt at the wrong height is taken back to the used stack once and a fresh one placed) |
+| `placing` | Placement running: the arm places, and the height check confirms the carousel landed (a carousel felt too high is taken back to the used stack once and a fresh one placed) |
 | `committed` | Placed; `load` holds the carousel-load record and every slot is free |
-| `waiting_for_stock` | Stock seat empty after the unload, or after a placed carousel that did not land was taken back to the used stack. The session stays usable so PALsystem can end it. The operator loads a carousel and presses **Place New Carousel** on PALmixer, which records the load. |
+| `waiting_for_stock` | Stock seat empty after the unload, or after a placed carousel that did not land was taken back to the used stack (`detail`, placement's own message, then names it). The session stays usable so PALsystem can end it. The operator loads a carousel and presses **Place New Carousel** on PALmixer, which records the load. |
 | `failed` | Any other error. `failed_phase` says whether unloading or placing failed. The session error is latched and the coordinator is invalidated, as for other motion operations, with no replay. |
 
 ## Update: version-1 live test endpoint

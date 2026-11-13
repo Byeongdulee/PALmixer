@@ -731,7 +731,9 @@ class PALmixerServer:
         if name == cmd.PLACE_NEW_CAROUSEL:
             if args:
                 raise ValueError("%s takes no arguments" % cmd.PLACE_NEW_CAROUSEL)
-            self._require_positions(('carousel_in_stock', 'carousel_on_mixer'))
+            # The used stack too: a carousel that does not land is taken back there.
+            self._require_positions(('carousel_in_stock', 'carousel_on_mixer',
+                                     'carousel_used_stack'))
             self._place_alignment()
             return self._place_new_carousel, cmd.PLACE_NEW_CAROUSEL
 
@@ -1547,8 +1549,8 @@ class PALmixerServer:
         (state.get_carousel_place_alignment_slot); None leaves the table alone.
         The turn sweeps the table under whatever is in the carousel, so this
         refuses -- ValueError, the synchronous ERROR reply -- unless the mixer
-        head is at its cleaning station, the flowcell in use is at its cleaning
-        station or the beam, and the slot positions are taught. Pure state reads:
+        head is at its cleaning station, every flowcell is at its cleaning station
+        or the beam, and the slot positions are taught. Pure state reads:
         safe on the reply path, and run again when the placement starts.
         """
         slot = state.get_carousel_place_alignment_slot()
@@ -1560,12 +1562,12 @@ class PALmixerServer:
             raise ValueError("the mixer head must be at its cleaning station to place a "
                              "carousel: the table turns to slot %d first (mixer head: %s)"
                              % (slot, mixer))
-        fc = state.get_flowcell_in_use()
-        where = state.get_flowcell_location(fc)
-        if where not in (state.FC_AT_CLEANING, state.FC_AT_BEAM):
-            raise ValueError("flowcell %d must be at its cleaning station or the beam to "
-                             "place a carousel: the table turns to slot %d first "
-                             "(flowcell %d: %s)" % (fc, slot, fc, where))
+        for fc in state.FLOWCELL_IDS:
+            where = state.get_flowcell_location(fc)
+            if where not in (state.FC_AT_CLEANING, state.FC_AT_BEAM):
+                raise ValueError("flowcell %d must be at its cleaning station or the beam "
+                                 "to place a carousel: the table turns to slot %d first "
+                                 "(flowcell %d: %s)" % (fc, slot, fc, where))
         try:
             return slot, state.slot_position(slot)
         except KeyError as e:

@@ -92,9 +92,12 @@ class ExperimentTab(QWidget):
             "Once it is seated, every slot is freed: all sample IDs and UUIDs "
             "are cleared and a carousel-load record of what the old carousel "
             "held is saved. Taught positions and the carousel ID are kept.\n\n"
-            "Needs Carousel in Stock and Carousel on Mixer taught. The arm "
-            "looks for a carousel in stock first and stops with an error if "
-            "none is there; a failed placement clears nothing.")
+            "Needs Carousel in Stock, Carousel on Mixer and Used Carousel Stack "
+            "taught. The table turns to its alignment slot first; the arm looks "
+            "for a carousel in stock and stops with an error if none is there. "
+            "After letting go it feels that the carousel is down on the platform; "
+            "one that is not is taken back to the used stack and one fresh "
+            "carousel placed instead. A failed placement clears nothing.")
         self.place_carousel_btn.clicked.connect(self._on_place_new_carousel)
         layout.addWidget(self.place_carousel_btn)
 

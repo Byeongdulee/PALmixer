@@ -298,9 +298,11 @@ class PreparationAPI:
         if state.get_flowcell_location(flowcell) != state.FC_AT_CLEANING:
             raise ValueError('Flowcell %d must be at its cleaning station to replace the carousel' % flowcell)
         self.server._require_positions(('carousel_on_mixer', 'carousel_used_stack', 'carousel_in_stock'))
-        if auto_place_new_carousel():
-            # The placement turns the table first; refused now, not once the old
-            # carousel is already off.
+        # Read once, so a change to the setting mid-swap cannot split the decision.
+        place_by_robot = auto_place_new_carousel()
+        if place_by_robot:
+            # The swap turns the table first; refused now, not once the old carousel
+            # is already off.
             self.server._place_alignment()
         no_carousel = getattr(self.server.PAL12idb, 'NoCarouselError', None)
         trace = uuid4().hex
@@ -316,34 +318,55 @@ class PreparationAPI:
             placing = False
             try:
                 progress('unloading')
+                if place_by_robot:
+                    # Turn the table to the alignment slot first, with the old
+                    # carousel still on it: a motor fault then stops the swap before
+                    # anything is unloaded. The unload copes with any table angle.
+                    try:
+                        self.server._turn_table_for_place()
+                    except Exception as e:
+                        raise RuntimeError(
+                            "the carousel table did not turn to the alignment slot before "
+                            "the unload (nothing else moved; the old carousel is still on "
+                            "the mixer): %s" % e) from e
                 unloaded = self.server._unload_carousel()
                 progress('old_removed')
-                if not auto_place_new_carousel():
-                    # Placement is blocked for now. The session stays usable, and the
+                if not place_by_robot:
+                    # Robot placement is off. The session stays usable, and the
                     # operator's Replace Carousel (Reset) records the load.
                     progress('waiting_for_carousel', error=WAITING_FOR_CAROUSEL_MESSAGE)
-                    return '%s; %s' % (unloaded, WAITING_FOR_CAROUSEL_MESSAGE)
-                progress('placing')
-                placing = True
-                placed, load = self.server._place_and_record_load(replacement_id)
-                progress('committed', load=load)
-                return '%s; %s; every slot cleared (carousel load %d)' % (
-                    unloaded, placed, load['sequence'])
+                    outcome = '%s; %s' % (unloaded, WAITING_FOR_CAROUSEL_MESSAGE)
+                else:
+                    progress('placing')
+                    placing = True
+                    placed, load = self.server._place_and_record_load(replacement_id)
+                    progress('committed', load=load)
+                    outcome = '%s; %s; every slot cleared (carousel load %d)' % (
+                        unloaded, placed, load['sequence'])
             except Exception as error:
                 if placing and no_carousel is not None and isinstance(error, no_carousel):
                     # The old carousel is already on the used stack. Leave the
                     # session usable so PALsystem can end it; the operator loads
                     # stock and presses Place New Carousel, which records the load.
-                    progress('waiting_for_stock', error=NO_STOCK_MESSAGE)
-                    return NO_STOCK_MESSAGE
-                with self.lock:
-                    # failed_phase keeps "unload failed" apart from "old carousel
-                    # removed, placement failed" -- they need different recovery.
-                    saved.update(state='failed', failed_phase=saved['state'], error=str(error))
-                    self.record['error'] = str(error)
-                    self._save()
-                    self.coordinator.invalidate(str(error))
-                raise
+                    # `detail` keeps what placement said: after a carousel that did
+                    # not land was taken back, it names that carousel.
+                    progress('waiting_for_stock', error=NO_STOCK_MESSAGE, detail=str(error))
+                    outcome = '%s (%s)' % (NO_STOCK_MESSAGE, error)
+                else:
+                    with self.lock:
+                        # failed_phase keeps "unload failed" apart from "old carousel
+                        # removed, placement failed" -- they need different recovery.
+                        saved.update(state='failed', failed_phase=saved['state'],
+                                     error=str(error))
+                        self.record['error'] = str(error)
+                        self._save()
+                        self.coordinator.invalidate(str(error))
+                    raise
+            # The swap ended without a failure: park at the transfer point, which
+            # reports the arm parked -- the worker action cleared that when it
+            # started, and PALsystem waits for it before its run goes on.
+            self.server.workflows._park()
+            return outcome
         label = 'preparation_replace_carousel'
         with self.server._busy_lock:
             if self.server._busy:

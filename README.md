@@ -900,21 +900,23 @@ camera-centred X/Y and the bumped surface Z, a millimetre or two truer than the
 taught pose), or on the taught **Carousel on Mixer** pose when nothing has been
 measured. A new Carousel on Mixer position -- a teach, an AprilTag search or a
 pull from EPICS -- discards that measurement, so the next placement lands on the
-new position until an unload measures the seat again. A re-teach that changes
+new position until an unload, or a placement that passes its height check,
+measures the seat again. A re-teach that changes
 only the heading keeps it. The carousel on the mixer moves with the mixer side,
 unlike the fixed stock and used-stack positions, which is why its measured seat
 cannot outlive a re-teach.
 
 **Placement turns the table first.** Before the arm moves, **Place New
-Carousel** -- and the placement in a coordinated `replace_carousel` -- turns the
-carousel table so `carousel.place_alignment_slot` (11) stands at the mixing
-position, and waits for it to stop. The robot always sets a carousel down at the
+Carousel** turns the carousel table so `carousel.place_alignment_slot` (11)
+stands at the mixing position, and waits for it to stop; a coordinated
+`replace_carousel` with robot placement turns it before it unloads the old
+carousel, so a motor fault stops the swap with nothing else moved. The robot always sets a carousel down at the
 same heading, so the table's angle decides whether the carousel fits and which
 slot ends up at the mixing position; turning first makes every mount land the
 same way, so the taught slot positions hold for each new carousel. The command is
 refused before anything moves unless the mixer head is at its cleaning station,
-the flowcell in use is at its cleaning station or the beam, and the slot
-positions are taught; a coordinated swap checks the same before it unloads. A
+every flowcell is at its cleaning station or the beam, and the slot positions
+are taught; a coordinated swap checks the same before it unloads. A
 turn that fails stops the placement with the new carousel still in stock.
 Without the setting (absent or `null`) the table stays where it is.
 
@@ -932,27 +934,39 @@ down to seat instead.
 **Placement checks that the carousel landed.** After the release, **Place New
 Carousel** lifts the open gripper clear, closes it and bumps straight down onto
 the carousel top -- the same contact **Unload Current Carousel** measures the
-seat with. The top has to be within 2 mm of where a seated carousel's top is:
-the taught **Carousel on Mixer** Z less the 60 mm the teach backs off. A pass is
-saved as the measured seat. A carousel felt at the wrong height -- there, but
-not down on the platform -- is taken back off onto the used stack and one fresh
-carousel from stock is placed and checked the same way; the reply names the
-rejected, unused carousel, the load record keeps the spent carousel as
-`old_tag`, and the bump on the rejected one is not kept as the seat. The
-placement stops for the operator -- the mixer's carousel `unknown`, no carousel
-load recorded -- when nothing is felt down to 20 mm below the seat (where the
-carousel went is unknown), when taking it back off fails, when the fresh
-carousel misses too, or when there is no fresh carousel in stock: then load one
-and press **Place New Carousel**. A coordinated swap waits in
-`waiting_for_stock` for the last case and ends `failed` in `placing` for the
-others. (`PAL12idb.CAROUSEL_SEAT_CHECK_*`.)
+seat with. The top has to be within +3 / -2 mm of where a seated carousel's top
+is: the taught **Carousel on Mixer** Z less the 60 mm the teach backs off (a
+seated carousel reads about 1 mm high against it, hence the wider high side). A
+pass is saved as the measured seat. A carousel felt too high -- there, but not
+down on the platform -- is taken back off onto the used stack; the arm then
+feels the empty seat from the taught pose, over the seat and where the next
+carousel comes down (the gripper cannot tell whether the take-back actually held
+the carousel), and only then is one fresh carousel from
+stock placed and checked the same way. The reply names the rejected, unused
+carousel, the load record keeps the spent carousel as `old_tag`, and the bump on
+the rejected one is not kept as the seat. The placement stops for the operator
+-- the mixer's carousel `unknown`, no carousel load recorded, and every message
+after a take-back naming the rejected carousel -- when it is felt too low (it has
+shifted or tipped, where a blind take-back grab could misgrab it), when nothing
+is felt down to 20 mm below the seat (where the carousel went is unknown), when
+taking it back off fails or
+leaves anything on the seat, when the fresh carousel misses too, or when there
+is no fresh carousel in stock: then load one and press **Place New Carousel**.
+A coordinated swap waits in `waiting_for_stock` for the last case (its `detail`
+names the rejected carousel) and ends `failed` in `placing` for the others.
+**Place New Carousel** needs Used Carousel Stack taught, for the take-back.
+Take a carousel a stopped placement left behind off by hand: **Unload Current
+Carousel** would record it as the spent carousel in the next load record.
+(`PAL12idb.CAROUSEL_SEAT_CHECK_*`.)
 
 **Robot placement in a coordinated swap is a setting.** With
 `carousel.auto_place_new_carousel` `true` in `json/palmixer_config.json`, a
 coordinated `replace_carousel` unloads the old carousel and places the new one
 by robot. With it `false` (also the default when absent), the swap unloads the
 old carousel and stops in state `waiting_for_carousel`, without latching the
-session. The operator seats a new
+session. A swap that ends without a failure (`committed`, `waiting_for_stock` or
+`waiting_for_carousel`) parks the arm at the transfer point and reports it
+parked, which PALsystem waits for before its run goes on. The operator seats a new
 carousel by hand and presses **Replace Carousel (Reset)**, which is accepted during
 the coordinated session while that replacement waits; it records the load with the
 replacement's ID and marks the replacement `committed`.
